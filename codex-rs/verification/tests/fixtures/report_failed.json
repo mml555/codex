@@ -1,0 +1,22 @@
+{
+  "status": "failed",
+  "plan_risk": "low",
+  "commands": [
+    {
+      "command": "cargo test -p codex-context-harness",
+      "reason": "changed file `context-harness/src/metrics.rs` belongs to `context-harness`",
+      "exit_code": 101,
+      "duration_ms": 8421,
+      "stdout": "",
+      "stderr": "error: test failed\n",
+      "error": null
+    }
+  ],
+  "skipped_not_run": ["cargo test --workspace"],
+  "failure_packet": {
+    "stage": "post_failure",
+    "summary": "cargo test -p codex-context-harness failed",
+    "relevant_output": "error: test failed"
+  },
+  "changed_files": ["context-harness/src/metrics.rs"]
+}

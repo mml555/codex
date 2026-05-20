@@ -1,0 +1,73 @@
+//! Harness-native context packet pipeline.
+//!
+//! Consumes [`codex_repo_index::RepoMap`] and produces [`ContextPacket`] with a
+//! mandatory [`ContextDecisionLog`]. Does not depend on how the map was built.
+
+mod assembler;
+mod budgeter;
+mod classifier;
+mod decision_log;
+mod eval;
+mod metrics;
+mod normalize;
+pub mod ownership;
+mod packet;
+mod pipeline;
+mod post_failure;
+mod prompt_paths;
+mod prompt_visibility;
+mod render_level;
+mod renderer;
+mod repair_hint;
+mod run_memory;
+mod selection;
+mod task_scope;
+mod task_terms;
+mod test_select;
+
+pub use assembler::ContextAssembler;
+pub use budgeter::ContextBudgeter;
+pub use budgeter::TokenBudget;
+pub use classifier::TaskClassifier;
+pub use classifier::TaskType;
+pub use decision_log::ContextDecisionLog;
+pub use decision_log::DecisionEntry;
+pub use eval::EvalReport;
+pub use eval::EvalTaskFixture;
+pub use eval::load_eval_fixtures;
+pub use eval::render_eval_human;
+pub use eval::render_eval_summary;
+pub use eval::run_eval;
+pub use metrics::ContextMetrics;
+pub use metrics::EvalDiagnostics;
+pub use metrics::EvalLabels;
+pub use metrics::Metrics;
+pub use normalize::normalize_packet;
+pub use packet::ContextItem;
+pub use packet::ContextItemKind;
+pub use packet::ContextItemState;
+pub use packet::ContextPacket;
+pub use packet::ContextStage;
+pub use packet::RenderLevel;
+pub use packet::SelectedTest;
+pub use packet::TaskInfo;
+pub use pipeline::BuildPacketOptions;
+pub use pipeline::build_context_packet;
+pub use post_failure::MAX_POST_FAILURE_PROMPT_OUTPUT_CHARS;
+pub use post_failure::PostFailureContext;
+pub use post_failure::build_post_failure_context_packet;
+pub use post_failure::render_post_failure_prompt_fragment;
+pub use post_failure::render_post_failure_prompt_fragment_with_caps;
+pub use prompt_paths::estimate_tokens_from_prompt_json;
+pub use prompt_paths::extract_paths_from_prompt_json;
+pub use prompt_visibility::model_prompt_contains_harness_context;
+pub use prompt_visibility::user_message_texts;
+pub use renderer::ContextPacketRenderer;
+pub use repair_hint::FailureType;
+pub use repair_hint::RepairHint;
+pub use repair_hint::infer_repair_hint;
+pub use run_memory::RunMemory;
+pub use selection::SelectionCaps;
+pub use task_scope::TaskScope;
+pub use task_scope::infer_task_scope;
+pub use task_terms::build_task_terms;

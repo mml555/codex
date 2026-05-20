@@ -1,0 +1,10 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "verification",
+    crate_name = "codex_verification",
+    deps = [
+        "//codex-rs/context-harness",
+        "//codex-rs/repo-index",
+    ],
+)

@@ -31,7 +31,10 @@ codex-chatgpt = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
 codex-utils-cli = { workspace = true }
 codex-config = { workspace = true }
+codex-context-harness = { workspace = true }
 codex-core = { workspace = true }
+codex-repo-index = { workspace = true }
+codex-utils-home-dir = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-exec = { workspace = true }
 codex-exec-server = { workspace = true }
@@ -55,6 +58,7 @@ codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-tui = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-verification = { workspace = true }
 codex-utils-path = { workspace = true }
 crossterm = { workspace = true }
 http = { workspace = true }

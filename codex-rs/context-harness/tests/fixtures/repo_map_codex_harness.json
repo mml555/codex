@@ -1,0 +1,204 @@
+{
+  "version": 2,
+  "repo_id": "fixture-codex-harness",
+  "root": "/fixture",
+  "files": [
+    {
+      "path": "cli/src/context_cmd.rs",
+      "signals": {
+        "confidence": 0.7,
+        "tags": ["cli"],
+        "summary": "context CLI commands",
+        "evidence": ["path:cli", "path:context"]
+      }
+    },
+    {
+      "path": "context-harness/src/eval.rs",
+      "signals": {
+        "confidence": 0.75,
+        "tags": ["services"],
+        "summary": "eval harness",
+        "evidence": ["path:context-harness", "path:eval"]
+      }
+    },
+    {
+      "path": "context-harness/src/metrics.rs",
+      "signals": {
+        "confidence": 0.72,
+        "tags": ["services"],
+        "summary": "harness metrics",
+        "evidence": ["path:context-harness", "path:metrics"]
+      }
+    },
+    {
+      "path": "context-harness/src/prompt_paths.rs",
+      "signals": {
+        "confidence": 0.74,
+        "tags": ["services"],
+        "summary": "prompt path extraction",
+        "evidence": ["path:context-harness", "path:prompt"]
+      }
+    },
+    {
+      "path": "context-harness/src/renderer.rs",
+      "signals": {
+        "confidence": 0.73,
+        "tags": ["services"],
+        "summary": "packet renderer",
+        "evidence": ["path:context-harness", "path:renderer"]
+      }
+    },
+    {
+      "path": "core/src/prompt_debug.rs",
+      "signals": {
+        "confidence": 0.76,
+        "tags": ["core"],
+        "summary": "vanilla prompt debug",
+        "evidence": ["path:core", "path:prompt", "path:debug"]
+      }
+    },
+    {
+      "path": "context-harness/tests/fixtures/tasks_codex_live.json",
+      "signals": {
+        "confidence": 0.55,
+        "tags": ["test"],
+        "summary": "eval fixture",
+        "evidence": ["path:fixtures"]
+      }
+    },
+    {
+      "path": "docs/old-design.md",
+      "signals": {
+        "confidence": 0.4,
+        "tags": [],
+        "summary": "legacy doc",
+        "evidence": ["path:docs"]
+      }
+    },
+    {
+      "path": "tui/src/context_harness_panel.rs",
+      "signals": {
+        "confidence": 0.5,
+        "tags": ["frontend"],
+        "summary": "TUI panel",
+        "evidence": ["path:tui"]
+      }
+    },
+    {
+      "path": "vendor/generated/schema.json",
+      "signals": {
+        "confidence": 0.3,
+        "tags": [],
+        "summary": "generated vendor",
+        "evidence": ["path:vendor", "path:generated"]
+      }
+    },
+    {
+      "path": "examples/demo.rs",
+      "signals": {
+        "confidence": 0.35,
+        "tags": [],
+        "summary": "example",
+        "evidence": ["path:examples"]
+      }
+    }
+  ],
+  "tests": [
+    {
+      "path": "context-harness/tests/eval_fixtures.rs",
+      "confidence": 0.82,
+      "related_paths": ["context-harness/src/eval.rs"],
+      "reason": "covers eval fixtures"
+    },
+    {
+      "path": "context-harness/tests/packet_golden.rs",
+      "confidence": 0.6,
+      "related_paths": ["context-harness/src/renderer.rs"],
+      "reason": "golden packet tests"
+    }
+  ],
+  "areas": [
+    {
+      "name": "context-harness",
+      "paths": [
+        "context-harness/src/eval.rs",
+        "context-harness/src/metrics.rs"
+      ],
+      "confidence": 0.8
+    }
+  ],
+  "packages": [],
+  "area_maps": [
+    {
+      "area_id": "context-harness",
+      "root_paths": ["context-harness/"],
+      "owned_files": [
+        "context-harness/src/eval.rs",
+        "context-harness/src/metrics.rs",
+        "context-harness/src/prompt_paths.rs",
+        "context-harness/src/renderer.rs"
+      ],
+      "test_paths": [
+        "context-harness/tests/eval_fixtures.rs",
+        "context-harness/tests/packet_golden.rs"
+      ],
+      "related_cli_paths": ["cli/src/context_cmd.rs"],
+      "negative_paths": ["tui/", "vendor/", "examples/", "core/"],
+      "confidence": 0.9
+    },
+    {
+      "area_id": "cli",
+      "root_paths": ["cli/"],
+      "owned_files": ["cli/src/context_cmd.rs"],
+      "test_paths": [],
+      "related_cli_paths": [],
+      "negative_paths": ["context-harness/", "tui/", "vendor/"],
+      "confidence": 0.75
+    }
+  ],
+  "commands": [
+    {
+      "command": "context eval",
+      "entrypoint": "cli/src/context_cmd.rs",
+      "implementation_area": "context-harness",
+      "related_files": [
+        "context-harness/src/eval.rs",
+        "context-harness/src/metrics.rs"
+      ]
+    },
+    {
+      "command": "context build",
+      "entrypoint": "cli/src/context_cmd.rs",
+      "implementation_area": "context-harness",
+      "related_files": [
+        "context-harness/src/eval.rs",
+        "context-harness/src/metrics.rs"
+      ]
+    },
+    {
+      "command": "context diff-prompt",
+      "entrypoint": "cli/src/context_cmd.rs",
+      "implementation_area": "context-harness",
+      "related_files": [
+        "context-harness/src/prompt_paths.rs",
+        "core/src/prompt_debug.rs"
+      ]
+    }
+  ],
+  "test_map": [
+    {
+      "source_path": "context-harness/src/eval.rs",
+      "test_paths": ["context-harness/tests/eval_fixtures.rs"],
+      "confidence": 0.82,
+      "evidence": ["covers eval fixtures"]
+    },
+    {
+      "source_path": "context-harness/src/metrics.rs",
+      "test_paths": ["context-harness/tests/eval_fixtures.rs"],
+      "confidence": 0.7,
+      "evidence": ["same crate"]
+    }
+  ],
+  "agents_md": null,
+  "warnings": []
+}

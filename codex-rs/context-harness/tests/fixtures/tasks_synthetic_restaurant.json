@@ -1,0 +1,11 @@
+[
+  {
+    "task": "fix restaurant search pagination",
+    "gold_files": [
+      "backend/routes/restaurants.py",
+      "backend/services/restaurant_search.py"
+    ],
+    "gold_tests": ["tests/api/test_restaurants.py"],
+    "danger_zones": ["legacy v4 routes", "ranking logic"]
+  }
+]

@@ -2230,6 +2230,7 @@ dependencies = [
  "codex-chatgpt",
  "codex-cloud-tasks",
  "codex-config",
+ "codex-context-harness",
  "codex-core",
  "codex-core-plugins",
  "codex-exec",
@@ -2245,6 +2246,7 @@ dependencies = [
  "codex-models-manager",
  "codex-plugin",
  "codex-protocol",
+ "codex-repo-index",
  "codex-responses-api-proxy",
  "codex-rmcp-client",
  "codex-rollout-trace",
@@ -2256,7 +2258,9 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-cargo-bin",
  "codex-utils-cli",
+ "codex-utils-home-dir",
  "codex-utils-path",
+ "codex-verification",
  "codex-windows-sandbox",
  "crossterm",
  "http 1.4.0",
@@ -2472,6 +2476,18 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+]
+
+[[package]]
+name = "codex-context-harness"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-protocol",
+ "codex-repo-index",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3474,6 +3490,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-repo-index"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-git-utils",
+ "ignore",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "codex-response-debug-context"
 version = "0.0.0"
 dependencies = [
@@ -4115,6 +4146,18 @@ version = "0.0.0"
 dependencies = [
  "pretty_assertions",
  "v8",
+]
+
+[[package]]
+name = "codex-verification"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-context-harness",
+ "codex-repo-index",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

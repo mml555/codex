@@ -46,6 +46,7 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod context_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -54,6 +55,7 @@ mod mcp_cmd;
 mod plugin_cmd;
 mod remote_control_cmd;
 mod state_db_recovery;
+mod verification_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -196,6 +198,12 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// Harness-native repo context tools.
+    Context(context_cmd::ContextCli),
+
+    /// Deterministic post-edit verification planning (no test execution).
+    Verification(verification_cmd::VerificationCli),
 }
 
 #[derive(Debug, Parser)]
@@ -1384,6 +1392,22 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             )
             .await?;
         }
+        Some(Subcommand::Context(cmd)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "context",
+            )?;
+            context_cmd::run_context_command(cmd).await?;
+        }
+        Some(Subcommand::Verification(cmd)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "verification",
+            )?;
+            verification_cmd::run_verification_command(cmd).await?;
+        }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 reject_remote_mode_for_subcommand(
@@ -1894,6 +1918,8 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::ExecServer(_)) => Some("exec-server"),
         Some(Subcommand::Features(_)) => Some("features"),
+        Some(Subcommand::Context(_)) => Some("context"),
+        Some(Subcommand::Verification(_)) => Some("verification"),
     }
 }
 
