@@ -1,0 +1,10 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "repo-intelligence",
+    crate_name = "codex_repo_intelligence_extension",
+    deps = [
+        "//codex-rs/context-harness",
+        "//codex-rs/repo-index",
+    ],
+)
