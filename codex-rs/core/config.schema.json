@@ -686,7 +686,7 @@
           "$ref": "#/definitions/SandboxMode"
         },
         "service_tier": {
-          "description": "Optional explicit service tier request id for new turns (for example `priority` or `flex`; legacy `fast` also works).",
+          "description": "Optional explicit service tier request id for new turns (for example `default`, `priority`, or `flex`; legacy `fast` also works).",
           "type": "string"
         },
         "tools": {
@@ -1123,6 +1123,13 @@
           "type": "array"
         },
         "SubagentStart": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/MatcherGroup"
+          },
+          "type": "array"
+        },
+        "SubagentStop": {
           "default": [],
           "items": {
             "$ref": "#/definitions/MatcherGroup"
@@ -2003,6 +2010,9 @@
       "additionalProperties": false,
       "properties": {
         "description": {
+          "type": "string"
+        },
+        "extends": {
           "type": "string"
         },
         "filesystem": {
@@ -4773,7 +4783,7 @@
       "description": "Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`."
     },
     "service_tier": {
-      "description": "Optional explicit service tier request id for new turns (for example `priority` or `flex`; legacy `fast` also works).",
+      "description": "Optional explicit service tier request id for new turns (for example `default`, `priority`, or `flex`; legacy `fast` also works).",
       "type": "string"
     },
     "shell_environment_policy": {
