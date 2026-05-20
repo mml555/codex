@@ -44,6 +44,8 @@ pub enum ContextSubcommand {
     DiffPrompt(ContextDiffPromptCommand),
     /// Run fixture-based harness metrics (recall, waste, test accuracy).
     Eval(ContextEvalCommand),
+    /// Score vanilla vs harness-context agent runs from offline artifacts.
+    AgentEval(crate::context_agent_eval_cmd::ContextAgentEvalCli),
 }
 
 #[derive(Debug, Parser)]
@@ -121,6 +123,9 @@ pub async fn run_context_command(command: ContextCli) -> Result<()> {
         ContextSubcommand::Build(cmd) => run_context_build(cmd).await,
         ContextSubcommand::DiffPrompt(cmd) => run_context_diff_prompt(cmd).await,
         ContextSubcommand::Eval(cmd) => run_context_eval(cmd).await,
+        ContextSubcommand::AgentEval(cmd) => {
+            crate::context_agent_eval_cmd::run_context_agent_eval(cmd).await
+        }
     }
 }
 

@@ -46,6 +46,7 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod context_agent_eval_cmd;
 mod context_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
