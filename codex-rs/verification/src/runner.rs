@@ -1,11 +1,11 @@
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::command_exec::spawn_narrow_command;
 use crate::output::DEFAULT_MAX_RELEVANT_OUTPUT_CHARS;
 use crate::output::summarize_failure_output;
 use crate::output::truncate_text;
@@ -88,17 +88,7 @@ pub fn runnable_narrow_commands(plan: &VerificationPlan) -> Vec<&PlannedCommand>
 }
 
 pub fn is_safe_to_run(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    if lower.contains("--workspace") {
-        return false;
-    }
-    if lower.contains("cargo test") && lower.contains(" --all") {
-        return false;
-    }
-    if lower.starts_with("python -m pytest") || lower.starts_with("pytest") {
-        return crate::python_rules::is_narrow_pytest_command(command);
-    }
-    true
+    crate::command_exec::is_safe_to_run(command)
 }
 
 pub fn run_verification_plan(
@@ -197,7 +187,7 @@ fn execute_command(command: &str, cwd: &Path, timeout: Duration) -> RawRunOutput
         };
     }
 
-    let mut child = match spawn_shell_command(command, cwd) {
+    let mut child = match spawn_narrow_command(command, cwd) {
         Ok(child) => child,
         Err(err) => {
             return RawRunOutput {
@@ -253,30 +243,6 @@ fn execute_command(command: &str, cwd: &Path, timeout: Duration) -> RawRunOutput
         }
 
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn spawn_shell_command(command: &str, cwd: &Path) -> std::io::Result<std::process::Child> {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    }
-    #[cfg(windows)]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
     }
 }
 
@@ -385,10 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn echo_command_run_succeeds() {
+    fn narrow_cargo_command_run_succeeds() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let plan = VerificationPlan {
             commands: vec![PlannedCommand {
-                command: "echo ok".to_string(),
+                command: "cargo test -p codex-repo-index".to_string(),
                 reason: "test".to_string(),
                 scope: PlanScope::Narrow,
                 confidence: 1.0,
@@ -396,16 +363,24 @@ mod tests {
             skipped: Vec::new(),
             risk: VerificationRisk::Low,
         };
-        let report = run_verification_plan(&plan, &RunOptions::default());
+        let report = run_verification_plan(
+            &plan,
+            &RunOptions {
+                cwd: workspace_root,
+                ..RunOptions::default()
+            },
+        );
         assert_eq!(report.status, VerificationRunStatus::Passed);
         assert_eq!(report.commands[0].exit_code, Some(0));
     }
 
     #[test]
-    fn failing_command_produces_failure_packet() {
+    fn failing_pytest_produces_failure_packet() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../context-harness/tests/fixtures/e2e_python_calculator");
         let plan = VerificationPlan {
             commands: vec![PlannedCommand {
-                command: "printf err >&2; exit 7".to_string(),
+                command: "python -m pytest tests/test_calculator.py".to_string(),
                 reason: "test".to_string(),
                 scope: PlanScope::Narrow,
                 confidence: 1.0,
@@ -413,9 +388,15 @@ mod tests {
             skipped: Vec::new(),
             risk: VerificationRisk::Low,
         };
-        let report = run_verification_plan(&plan, &RunOptions::default());
+        let report = run_verification_plan(
+            &plan,
+            &RunOptions {
+                cwd: fixture,
+                ..RunOptions::default()
+            },
+        );
         assert_eq!(report.status, VerificationRunStatus::Failed);
-        assert_eq!(report.commands[0].exit_code, Some(7));
+        assert_eq!(report.commands[0].exit_code, Some(1));
         assert!(report.failure_packet.is_some());
     }
 }

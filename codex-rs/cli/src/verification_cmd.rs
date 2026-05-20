@@ -245,8 +245,12 @@ fn load_map_fixture(path: &Path) -> Result<codex_repo_index::RepoMap> {
 }
 
 fn load_or_build_map(cwd: &Path, refresh: bool) -> Result<codex_repo_index::RepoMap> {
-    let map = RepoMapBuilder::build_with_options(cwd, RepoMapBuilderOptions { refresh })?;
     let cache = RepoIndexCache::new(find_codex_home()?.as_path());
-    let _ = cache.store(&map);
-    Ok(map)
+    RepoMapBuilder::build_with_options(
+        cwd,
+        RepoMapBuilderOptions {
+            refresh,
+            cache: Some(cache),
+        },
+    )
 }

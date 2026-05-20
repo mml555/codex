@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use crate::repo_map::RepoMap;
 
+#[derive(Debug, Clone)]
 pub struct RepoIndexCache {
     codex_home: PathBuf,
 }

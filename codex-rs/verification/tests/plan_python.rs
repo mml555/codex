@@ -1,5 +1,7 @@
 use codex_verification::VerificationPlanner;
 use codex_verification::load_plan_fixtures;
+use codex_verification::python_rules::build_python_verification;
+use codex_verification::python_rules::is_python_repo;
 use codex_verification::run_plan_eval;
 
 fn python_calculator_map() -> codex_repo_index::RepoMap {
@@ -40,6 +42,35 @@ fn python_calculator_map() -> codex_repo_index::RepoMap {
         agents_md: Some("Run pytest for verification.".to_string()),
         warnings: vec![],
     }
+}
+
+#[test]
+fn nested_pyproject_classifies_python_repo_for_manifest_only_change() {
+    let map = codex_repo_index::RepoMap {
+        version: 2,
+        repo_id: "mono".to_string(),
+        root: "/mono".to_string(),
+        files: vec![],
+        tests: vec![],
+        areas: vec![],
+        packages: vec![codex_repo_index::RepoPackage {
+            path: "services/foo/pyproject.toml".to_string(),
+            kind: "python".to_string(),
+            confidence: 0.95,
+        }],
+        area_maps: vec![],
+        commands: vec![],
+        test_map: vec![],
+        agents_md: None,
+        warnings: vec![],
+    };
+    let changed = vec!["services/foo/pyproject.toml".to_string()];
+    assert!(is_python_repo(&map, &changed));
+    let partial = build_python_verification(&map, &changed);
+    assert!(
+        partial.commands.is_empty(),
+        "manifest-only change must not invent a pytest target"
+    );
 }
 
 #[test]

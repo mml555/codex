@@ -1,9 +1,10 @@
 //! Deterministic verification planning and guarded narrow test execution.
 
+mod command_exec;
 mod eval;
 mod output;
 mod planner;
-mod python_rules;
+pub mod python_rules;
 mod report_integration;
 mod rules;
 mod runner;

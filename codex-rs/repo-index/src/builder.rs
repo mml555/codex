@@ -7,6 +7,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::area_map::build_area_maps;
+use crate::cache::RepoIndexCache;
 use crate::churn::git_churn_by_path;
 use crate::command_map::build_command_maps;
 use crate::repo_map::REPO_MAP_VERSION;
@@ -30,14 +31,20 @@ use crate::walk::read_file_snippet;
 const AGENTS_MD: &str = "AGENTS.md";
 const AGENTS_OVERRIDE_MD: &str = "AGENTS.override.md";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RepoMapBuilderOptions {
+    /// When false and `cache` is set, return a cached map when available.
     pub refresh: bool,
+    /// Optional on-disk cache (typically under `~/.codex/repo-index`).
+    pub cache: Option<RepoIndexCache>,
 }
 
-impl Default for RepoMapBuilderOptions {
-    fn default() -> Self {
-        Self { refresh: false }
+impl RepoMapBuilderOptions {
+    pub fn with_cache(cache: RepoIndexCache) -> Self {
+        Self {
+            refresh: false,
+            cache: Some(cache),
+        }
     }
 }
 
@@ -48,14 +55,34 @@ impl RepoMapBuilder {
         Self::build_with_options(root, RepoMapBuilderOptions::default())
     }
 
-    pub fn build_with_options(root: &Path, _options: RepoMapBuilderOptions) -> Result<RepoMap> {
+    pub fn build_with_options(root: &Path, options: RepoMapBuilderOptions) -> Result<RepoMap> {
         let root = root
             .canonicalize()
             .with_context(|| format!("canonicalize {}", root.display()))?;
         let repo_id = compute_repo_id(&root)?;
-        let paths = collect_repo_files(&root)?;
-        let churn = git_churn_by_path(&root, 30);
-        let agents_md = load_agents_md_ladder(&root);
+        let root_str = root.to_string_lossy().into_owned();
+
+        if !options.refresh {
+            if let Some(cache) = &options.cache {
+                if let Some(map) = cache.load(&repo_id)? {
+                    if map.root == root_str {
+                        return Ok(map);
+                    }
+                }
+            }
+        }
+
+        let map = Self::build_fresh(&root, &root_str, repo_id)?;
+        if let Some(cache) = options.cache {
+            let _ = cache.store(&map);
+        }
+        Ok(map)
+    }
+
+    fn build_fresh(root: &Path, root_str: &str, repo_id: String) -> Result<RepoMap> {
+        let paths = collect_repo_files(root)?;
+        let churn = git_churn_by_path(root, 30);
+        let agents_md = load_agents_md_ladder(root);
 
         let mut files = Vec::new();
         let mut tests = Vec::new();
@@ -97,7 +124,7 @@ impl RepoMapBuilder {
                 signals.evidence.push(format!("git_churn:{count}"));
             }
 
-            if let Some(snippet) = read_file_snippet(&root, path, 80) {
+            if let Some(snippet) = read_file_snippet(root, path, 80) {
                 for import in extract_import_targets(&snippet) {
                     signals.evidence.push(format!("import:{import}"));
                 }
@@ -122,14 +149,14 @@ impl RepoMapBuilder {
             .collect();
 
         let area_maps = build_area_maps(&paths);
-        let commands = build_command_maps(&root, &area_maps);
-        let test_map = build_test_map(&root, &files, &tests);
+        let commands = build_command_maps(root, &area_maps);
+        let test_map = build_test_map(root, &files, &tests);
         enhance_test_entries(&mut tests, &test_map);
 
         let mut map = RepoMap {
             version: REPO_MAP_VERSION,
             repo_id,
-            root: root.to_string_lossy().into_owned(),
+            root: root_str.to_string(),
             files,
             tests,
             areas,

@@ -12,18 +12,21 @@ pub struct PythonPlanPartial {
     pub skipped: Vec<SkippedCommand>,
 }
 
+pub fn is_python_manifest_path(path: &str) -> bool {
+    path.ends_with("pyproject.toml") || path.ends_with("pytest.ini") || path.ends_with("setup.py")
+}
+
 pub fn is_python_repo(map: &RepoMap, changed: &[String]) -> bool {
     map.packages.iter().any(|pkg| pkg.kind == "python")
-        || changed.iter().any(|path| path.ends_with(".py"))
+        || changed
+            .iter()
+            .any(|path| path.ends_with(".py") || is_python_manifest_path(path))
 }
 
 pub fn changed_paths_are_python_only(changed: &[String]) -> bool {
-    changed.iter().all(|path| {
-        path.ends_with(".py")
-            || path.ends_with("pyproject.toml")
-            || path.ends_with("pytest.ini")
-            || path.ends_with("setup.py")
-    })
+    changed
+        .iter()
+        .all(|path| path.ends_with(".py") || is_python_manifest_path(path))
 }
 
 pub fn build_python_verification(map: &RepoMap, changed: &[String]) -> PythonPlanPartial {
@@ -117,7 +120,15 @@ fn repo_has_path(map: &RepoMap, path: &str) -> bool {
 }
 
 fn is_narrow_pytest_target(path: &str) -> bool {
-    path.ends_with(".py") && !path.contains("__pycache__")
+    path.ends_with(".py")
+        && !path.contains("__pycache__")
+        && !path.contains("..")
+        && !path.chars().any(|c| {
+            matches!(
+                c,
+                '$' | '(' | ')' | ';' | '|' | '&' | '>' | '<' | '`' | '"' | '\''
+            )
+        })
 }
 
 /// Returns true when the command is a narrow `python -m pytest <file>` invocation.

@@ -86,12 +86,30 @@ pub fn detect_area_name(path: &str) -> Option<&'static str> {
 }
 
 pub fn detect_package_manifest(path: &str) -> Option<&'static str> {
-    match path {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    match file_name {
         "Cargo.toml" => Some("cargo"),
         "package.json" => Some("npm"),
-        "pyproject.toml" => Some("python"),
+        "pyproject.toml" | "pytest.ini" | "setup.py" => Some("python"),
         "go.mod" => Some("go"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_nested_python_manifest() {
+        assert_eq!(
+            detect_package_manifest("services/foo/pyproject.toml"),
+            Some("python")
+        );
+        assert_eq!(detect_package_manifest("Cargo.toml"), Some("cargo"));
+        assert_eq!(detect_package_manifest("not-a-manifest.txt"), None);
     }
 }
 
