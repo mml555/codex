@@ -196,6 +196,81 @@ print("true" if visible_in_events() or visible_in_rollout() else "false")
 PY
 }
 
+classify_run_validity() {
+  local events="$1"
+  local exec_exit="$2"
+  python3 - "${events}" "${exec_exit}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events_path = Path(sys.argv[1])
+exec_exit = int(sys.argv[2])
+
+def classify_provider_error(message: str):
+    m = (message or "").lower()
+    if any(token in m for token in ["usage limit", "quota", "rate limit"]):
+        return "provider_usage_limit"
+    if any(token in m for token in ["unauthorized", "forbidden", "invalid api key", "authentication", "auth"]):
+        return "provider_auth_error"
+    if any(token in m for token in ["network", "connection", "timeout", "timed out", "dns", "tls", "socket"]):
+        return "provider_network_error"
+    return None
+
+if not events_path.exists():
+    print("false\tmissing_events")
+    raise SystemExit(0)
+
+has_turn_completed = False
+has_turn_failed = False
+error_messages = []
+has_thread_started = False
+has_turn_started = False
+
+for raw in events_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    line = raw.strip()
+    if not line:
+        continue
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    kind = event.get("type")
+    if kind == "thread.started":
+        has_thread_started = True
+    elif kind == "turn.started":
+        has_turn_started = True
+    elif kind == "turn.completed":
+        has_turn_completed = True
+    elif kind == "turn.failed":
+        has_turn_failed = True
+        message = ((event.get("error") or {}).get("message")) or ""
+        if message:
+            error_messages.append(message)
+    elif kind == "error":
+        message = event.get("message") or ""
+        if message:
+            error_messages.append(message)
+
+for message in error_messages:
+    reason = classify_provider_error(message)
+    if reason:
+        print(f"false\t{reason}")
+        raise SystemExit(0)
+
+if has_turn_failed:
+    print("false\tturn_failed")
+elif not has_thread_started or not has_turn_started:
+    print("false\tmissing_events")
+elif not has_turn_completed:
+    print("false\tmissing_events")
+elif exec_exit != 0:
+    print("false\trunner_error")
+else:
+    print("true\t")
+PY
+}
+
 write_record() {
   local out="$1"
   local arm="$2"
@@ -206,6 +281,8 @@ write_record() {
   local used_post_failure="$7"
   local exec_exit="$8"
   local events="$9"
+  local run_valid="${10}"
+  local invalid_reason="${11}"
   local repo_intel_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
@@ -213,9 +290,9 @@ write_record() {
     repo_intel_enabled=true
   fi
   mkdir -p "$(dirname "${out}")"
-  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${used_post_failure}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" <<'PY'
+  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${used_post_failure}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" <<'PY'
 import json, sys
-out, arm, task_id, changed_json, tests_passed, turn_count, used_pf, exec_exit, repo_intel, harness_visible = sys.argv[1:11]
+out, arm, task_id, changed_json, tests_passed, turn_count, used_pf, exec_exit, repo_intel, harness_visible, run_valid, invalid_reason = sys.argv[1:13]
 record = {
     "arm": arm,
     "task_id": task_id,
@@ -226,6 +303,8 @@ record = {
     "exec_exit_code": int(exec_exit) if exec_exit not in ("", "null") else None,
     "repo_intelligence_enabled": repo_intel == "true",
     "harness_context_visible": harness_visible == "true",
+    "run_valid": run_valid == "true",
+    "invalid_reason": (invalid_reason or None),
 }
 with open(out, "w", encoding="utf-8") as f:
     json.dump(record, f, indent=2)
@@ -337,8 +416,17 @@ ${task_text}"
   fi
   local turns
   turns="$(count_turns "${events}")"
+  local validity
+  validity="$(classify_run_validity "${events}" "${exec_exit}")"
+  local run_valid
+  run_valid="${validity%%$'\t'*}"
+  local invalid_reason
+  invalid_reason="${validity#*$'\t'}"
+  if [[ "${run_valid}" == "true" ]]; then
+    invalid_reason=""
+  fi
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
-    "${changed_json}" "${tests_passed}" "${turns}" "${used_post_failure}" "${exec_exit}" "${events}"
+    "${changed_json}" "${tests_passed}" "${turns}" "${used_post_failure}" "${exec_exit}" "${events}" "${run_valid}" "${invalid_reason}"
   log "arm=${arm} task=${task_id} workdir=${workdir} exit=${exec_exit}"
 }
 

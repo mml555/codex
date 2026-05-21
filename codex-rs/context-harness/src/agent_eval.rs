@@ -3,6 +3,7 @@
 //! Consumes per-run artifacts (git diff, test exit code, optional exec JSONL) and
 //! fixture gold labels. Does not invoke models.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -55,6 +56,14 @@ pub struct AgentRunRecord {
     pub repo_intelligence_enabled: bool,
     #[serde(default)]
     pub harness_context_visible: bool,
+    #[serde(default = "default_true")]
+    pub run_valid: bool,
+    #[serde(default)]
+    pub invalid_reason: Option<AgentRunInvalidReason>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -71,6 +80,18 @@ pub enum AgentArm {
     Vanilla,
     Harness,
     RepoIntelligence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunInvalidReason {
+    ProviderUsageLimit,
+    ProviderAuthError,
+    ProviderNetworkError,
+    TurnFailed,
+    RunnerError,
+    MissingEvents,
+    UnknownFailure,
 }
 
 impl AgentArm {
@@ -98,6 +119,8 @@ pub struct AgentRunScore {
     pub failure_recovery_quality: FailureRecoveryQuality,
     pub harness_context_visible: bool,
     pub bridge_files_touched: Vec<String>,
+    pub run_valid: bool,
+    pub invalid_reason: Option<AgentRunInvalidReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,12 +141,26 @@ pub struct AgentEvalComparison {
     #[serde(alias = "harness")]
     pub treatment: AgentRunScore,
     pub treatment_arm: AgentArm,
+    #[serde(default = "default_true")]
+    pub valid_for_comparison: bool,
+    #[serde(default)]
+    pub excluded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEvalSummary {
+    pub total_pairs: usize,
+    pub valid_pairs: usize,
+    pub invalid_pairs: usize,
+    pub invalid_reason_counts: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEvalReport {
     pub comparisons: Vec<AgentEvalComparison>,
+    pub summary: AgentEvalSummary,
 }
 
 pub fn load_agent_eval_tasks(path: &Path) -> anyhow::Result<Vec<AgentEvalTask>> {
@@ -224,12 +261,14 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
 
     AgentRunScore {
         correct_file_touched,
-        tests_passed: record.tests_passed,
+        tests_passed: record.tests_passed && record.run_valid,
         turn_count: record.turn_count,
         unnecessary_files_changed,
         failure_recovery_quality,
         harness_context_visible: record.harness_context_visible,
         bridge_files_touched,
+        run_valid: record.run_valid,
+        invalid_reason: record.invalid_reason,
     }
 }
 
@@ -239,6 +278,9 @@ fn score_failure_recovery(
     correct_file_touched: bool,
     unnecessary: &[String],
 ) -> FailureRecoveryQuality {
+    if !record.run_valid {
+        return FailureRecoveryQuality::NotApplicable;
+    }
     if !task.requires_post_failure {
         return FailureRecoveryQuality::NotApplicable;
     }
@@ -262,17 +304,68 @@ pub fn compare_task(
     vanilla: &AgentRunRecord,
     treatment: &AgentRunRecord,
 ) -> AgentEvalComparison {
+    let excluded_reason = pair_excluded_reason(vanilla, treatment);
+    let valid_for_comparison = excluded_reason.is_none();
     AgentEvalComparison {
         task_id: task.id.clone(),
         task: task.task.clone(),
         vanilla: score_run(vanilla, task),
         treatment: score_run(treatment, task),
         treatment_arm: treatment.arm,
+        valid_for_comparison,
+        excluded_reason,
     }
 }
 
 pub fn build_report(comparisons: Vec<AgentEvalComparison>) -> AgentEvalReport {
-    AgentEvalReport { comparisons }
+    let mut invalid_reason_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let total_pairs = comparisons.len();
+    let mut invalid_pairs = 0usize;
+    for row in &comparisons {
+        if !row.valid_for_comparison {
+            invalid_pairs += 1;
+            if let Some(reason) = &row.excluded_reason {
+                *invalid_reason_counts.entry(reason.clone()).or_default() += 1;
+            }
+        }
+    }
+    let valid_pairs = total_pairs.saturating_sub(invalid_pairs);
+    AgentEvalReport {
+        comparisons,
+        summary: AgentEvalSummary {
+            total_pairs,
+            valid_pairs,
+            invalid_pairs,
+            invalid_reason_counts,
+        },
+    }
+}
+
+fn pair_excluded_reason(vanilla: &AgentRunRecord, treatment: &AgentRunRecord) -> Option<String> {
+    if vanilla.run_valid && treatment.run_valid {
+        return None;
+    }
+    let left = vanilla
+        .invalid_reason
+        .map(invalid_reason_slug)
+        .unwrap_or("invalid");
+    let right = treatment
+        .invalid_reason
+        .map(invalid_reason_slug)
+        .unwrap_or("invalid");
+    Some(format!("pair_invalid:{left}|{right}"))
+}
+
+fn invalid_reason_slug(reason: AgentRunInvalidReason) -> &'static str {
+    match reason {
+        AgentRunInvalidReason::ProviderUsageLimit => "provider_usage_limit",
+        AgentRunInvalidReason::ProviderAuthError => "provider_auth_error",
+        AgentRunInvalidReason::ProviderNetworkError => "provider_network_error",
+        AgentRunInvalidReason::TurnFailed => "turn_failed",
+        AgentRunInvalidReason::RunnerError => "runner_error",
+        AgentRunInvalidReason::MissingEvents => "missing_events",
+        AgentRunInvalidReason::UnknownFailure => "unknown_failure",
+    }
 }
 
 /// Count model turns from `codex exec --json` JSONL (`turn.completed` / `turn.failed`).
@@ -330,6 +423,24 @@ impl AgentEvalTask {
 
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
     let mut lines = Vec::new();
+    lines.push(format!(
+        "Valid comparisons: {}/{}",
+        report.summary.valid_pairs, report.summary.total_pairs
+    ));
+    lines.push(format!(
+        "Invalid comparisons: {}/{}",
+        report.summary.invalid_pairs, report.summary.total_pairs
+    ));
+    if !report.summary.invalid_reason_counts.is_empty() {
+        let reasons: Vec<String> = report
+            .summary
+            .invalid_reason_counts
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect();
+        lines.push(format!("Invalid reasons: {}", reasons.join(", ")));
+    }
+    lines.push(String::new());
     for row in &report.comparisons {
         let treatment = row.treatment_arm.display_label();
         lines.push(format!("Task: {} ({})", row.task_id, row.task));
@@ -337,6 +448,13 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
             "  treatment_arm: {}",
             row.treatment_arm.display_label()
         ));
+        lines.push(format!(
+            "  valid_for_comparison: {}",
+            row.valid_for_comparison
+        ));
+        if let Some(reason) = &row.excluded_reason {
+            lines.push(format!("  excluded_reason: {reason}"));
+        }
         lines.push(format_dimension_row(
             "correct_file_touched",
             row.vanilla.correct_file_touched,
@@ -366,6 +484,14 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         lines.push(format!(
             "  bridge_files_touched: vanilla {:?} | {treatment} {:?}",
             row.vanilla.bridge_files_touched, row.treatment.bridge_files_touched
+        ));
+        lines.push(format!(
+            "  run_valid: vanilla {} | {treatment} {}",
+            row.vanilla.run_valid, row.treatment.run_valid
+        ));
+        lines.push(format!(
+            "  invalid_reason: vanilla {:?} | {treatment} {:?}",
+            row.vanilla.invalid_reason, row.treatment.invalid_reason
         ));
         lines.push(format!(
             "  failure_recovery: vanilla {:?} | {treatment} {:?}",
@@ -417,6 +543,8 @@ mod tests {
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(
@@ -429,6 +557,8 @@ mod tests {
                 failure_recovery_quality: FailureRecoveryQuality::NotApplicable,
                 harness_context_visible: false,
                 bridge_files_touched: Vec::new(),
+                run_valid: true,
+                invalid_reason: None,
             }
         );
     }
@@ -450,6 +580,8 @@ mod tests {
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.correct_file_touched, false);
@@ -469,6 +601,8 @@ mod tests {
             exec_exit_code: Some(1),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.correct_file_touched, false);
@@ -502,6 +636,8 @@ mod tests {
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
         };
         assert_eq!(
             score_run(&record, &task).failure_recovery_quality,
@@ -515,6 +651,8 @@ mod tests {
         let record: AgentRunRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.arm, AgentArm::RepoIntelligence);
         assert!(record.harness_context_visible);
+        assert!(record.run_valid);
+        assert_eq!(record.invalid_reason, None);
     }
 
     #[test]
@@ -556,6 +694,8 @@ mod tests {
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
         };
         let score = score_run(&record, &task);
         assert!(score.correct_file_touched);
@@ -585,6 +725,8 @@ mod tests {
             exec_exit_code: Some(0),
             repo_intelligence_enabled: true,
             harness_context_visible: true,
+            run_valid: true,
+            invalid_reason: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(
@@ -595,5 +737,44 @@ mod tests {
             score.unnecessary_files_changed,
             vec!["cli/src/main.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn invalid_pairs_are_excluded_from_behavioral_comparison() {
+        let task = calculator_task();
+        let vanilla = AgentRunRecord {
+            arm: AgentArm::Vanilla,
+            task_id: task.id.clone(),
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            used_post_failure: false,
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
+            run_valid: false,
+            invalid_reason: Some(AgentRunInvalidReason::ProviderUsageLimit),
+        };
+        let treatment = AgentRunRecord {
+            arm: AgentArm::RepoIntelligence,
+            task_id: task.id.clone(),
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            used_post_failure: false,
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: true,
+            harness_context_visible: true,
+            run_valid: true,
+            invalid_reason: None,
+        };
+        let row = compare_task(&task, &vanilla, &treatment);
+        assert!(!row.valid_for_comparison);
+        assert_eq!(
+            row.excluded_reason.as_deref(),
+            Some("pair_invalid:provider_usage_limit|invalid")
+        );
+        // tests_passed is ignored for invalid runs
+        assert!(!row.vanilla.tests_passed);
     }
 }

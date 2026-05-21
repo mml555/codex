@@ -38,6 +38,8 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
         exec_exit_code: Some(1),
         repo_intelligence_enabled: false,
         harness_context_visible: false,
+        run_valid: true,
+        invalid_reason: None,
     };
     let harness = AgentRunRecord {
         arm: AgentArm::Harness,
@@ -49,6 +51,8 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
         exec_exit_code: Some(0),
         repo_intelligence_enabled: false,
         harness_context_visible: false,
+        run_valid: true,
+        invalid_reason: None,
     };
     let row = compare_task(task, &vanilla, &harness);
     assert_eq!(row.treatment_arm, AgentArm::Harness);
@@ -74,6 +78,8 @@ fn report_renders_human_summary() {
         exec_exit_code: Some(1),
         repo_intelligence_enabled: false,
         harness_context_visible: false,
+        run_valid: true,
+        invalid_reason: None,
     };
     let harness = AgentRunRecord {
         arm: AgentArm::Harness,
@@ -85,6 +91,8 @@ fn report_renders_human_summary() {
         exec_exit_code: Some(0),
         repo_intelligence_enabled: false,
         harness_context_visible: false,
+        run_valid: true,
+        invalid_reason: None,
     };
     let report = build_report(vec![compare_task(task, &vanilla, &harness)]);
     let text = render_agent_eval_human(&report);
