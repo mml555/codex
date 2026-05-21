@@ -116,6 +116,8 @@ fn python_plan_rejects_option_like_pytest_targets() {
         "python -m pytest tests/-opts/test_calculator.py",
         "python -m pytest tests/test_calculator.py -q",
         "python -m pytest tests/test_calculator.py::test_add",
+        "python -m pytest tests/test_*.py",
+        "python -m pytest tests/test_$USER.py",
     ] {
         assert!(
             !codex_verification::is_safe_to_run(command),
@@ -145,6 +147,8 @@ fn python_plan_rejects_option_like_pytest_targets() {
         "tests/-opts/test_calculator.py".to_string(),
         "tests/test_calculator.py -q".to_string(),
         "tests/test_calculator.py::test_add".to_string(),
+        "tests/test_*.py".to_string(),
+        "tests/test_$USER.py".to_string(),
     ];
     let plan = VerificationPlanner::plan(&["src/calculator.py".to_string()], &map);
     assert!(

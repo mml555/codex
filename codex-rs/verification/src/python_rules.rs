@@ -130,13 +130,10 @@ fn is_narrow_pytest_target(path: &str) -> bool {
         return false;
     }
 
-    if path.chars().any(|c| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '$' | '(' | ')' | ';' | '|' | '&' | '>' | '<' | '`' | '"' | '\'' | ':' | '\\'
-            )
-    }) {
+    if path
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && !matches!(c, '/' | '.' | '_' | '-'))
+    {
         return false;
     }
 
@@ -293,6 +290,9 @@ mod tests {
         assert!(!is_narrow_pytest_target("/tmp/test_calculator.py"));
         assert!(!is_narrow_pytest_target("tests/../test_calculator.py"));
         assert!(!is_narrow_pytest_target("tests/test_calculator.py -q"));
+        assert!(!is_narrow_pytest_target("tests/test_calculator*.py"));
+        assert!(!is_narrow_pytest_target("tests/test_$USER.py"));
+        assert!(!is_narrow_pytest_target("tests/test_\0calculator.py"));
         assert!(!is_narrow_pytest_target(
             "--rootdir=/tmp/test_calculator.py"
         ));

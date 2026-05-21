@@ -111,6 +111,8 @@ mod tests {
         assert!(parse_narrow_command("python -m pytest --rootdir=/tmp/test_foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest -c/tests/test_foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest tests/-opts/test_foo.py").is_none());
+        assert!(parse_narrow_command("python -m pytest tests/test_*.py").is_none());
+        assert!(parse_narrow_command("python -m pytest tests/test_$USER.py").is_none());
         assert!(parse_narrow_command("python -m pytest src/foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest /tmp/test_foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest tests/../test_foo.py").is_none());
