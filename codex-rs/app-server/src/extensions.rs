@@ -5,7 +5,6 @@ use codex_core::NewThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_features::Feature;
 use codex_extension_api::AgentSpawnFuture;
 use codex_extension_api::AgentSpawner;
 use codex_extension_api::ExtensionRegistry;
@@ -15,7 +14,7 @@ use codex_protocol::error::CodexErr;
 
 pub(crate) fn thread_extensions<S>(
     guardian_agent_spawner: S,
-    config: &Config,
+    _config: &Config,
 ) -> Arc<ExtensionRegistry<Config>>
 where
     S: AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> + 'static,
@@ -23,9 +22,8 @@ where
     let mut builder = ExtensionRegistryBuilder::<Config>::new();
     codex_guardian::install(&mut builder, guardian_agent_spawner);
     codex_memories_extension::install(&mut builder);
-    if config.features.enabled(Feature::RepoIntelligence) {
-        codex_repo_intelligence_extension::install(&mut builder);
-    }
+    // Always register; feature gating happens in extension config/contribute paths.
+    codex_repo_intelligence_extension::install(&mut builder);
     Arc::new(builder.build())
 }
 

@@ -102,6 +102,70 @@ resolve_codex_bin() {
   CODEX_BIN="${built}"
 }
 
+harness_context_visible_for_run() {
+  local events="$1"
+  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  python3 - "${events}" "${codex_home}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+needle = "Harness repo context:"
+events_path = Path(sys.argv[1])
+codex_home = Path(sys.argv[2])
+
+def visible_in_events() -> bool:
+    try:
+        with events_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if needle in json.dumps(ev, ensure_ascii=False):
+                    return True
+    except FileNotFoundError:
+        pass
+    return False
+
+def visible_in_rollout() -> bool:
+    thread_id = None
+    try:
+        with events_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "thread.started":
+                    thread_id = ev.get("thread_id")
+                    break
+    except FileNotFoundError:
+        return False
+    if not thread_id:
+        return False
+    sessions = codex_home / "sessions"
+    if not sessions.is_dir():
+        return False
+    for rollout in sessions.rglob(f"*{thread_id}*.jsonl"):
+        try:
+            text = rollout.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if needle in text:
+            return True
+    return False
+
+print("true" if visible_in_events() or visible_in_rollout() else "false")
+PY
+}
+
 write_record() {
   local out="$1"
   local arm="$2"
@@ -111,10 +175,17 @@ write_record() {
   local turn_count="$6"
   local used_post_failure="$7"
   local exec_exit="$8"
+  local events="$9"
+  local repo_intel_enabled=false
+  local harness_visible
+  harness_visible="$(harness_context_visible_for_run "${events}")"
+  if [[ "${arm}" == "repo_intelligence" ]]; then
+    repo_intel_enabled=true
+  fi
   mkdir -p "$(dirname "${out}")"
-  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${used_post_failure}" "${exec_exit}" <<'PY'
+  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${used_post_failure}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" <<'PY'
 import json, sys
-out, arm, task_id, changed_json, tests_passed, turn_count, used_pf, exec_exit = sys.argv[1:9]
+out, arm, task_id, changed_json, tests_passed, turn_count, used_pf, exec_exit, repo_intel, harness_visible = sys.argv[1:11]
 record = {
     "arm": arm,
     "task_id": task_id,
@@ -123,6 +194,8 @@ record = {
     "turn_count": int(turn_count) if turn_count not in ("", "null") else None,
     "used_post_failure": used_pf == "true",
     "exec_exit_code": int(exec_exit) if exec_exit not in ("", "null") else None,
+    "repo_intelligence_enabled": repo_intel == "true",
+    "harness_context_visible": harness_visible == "true",
 }
 with open(out, "w", encoding="utf-8") as f:
     json.dump(record, f, indent=2)
@@ -229,7 +302,7 @@ ${task_text}"
   local turns
   turns="$(count_turns "${events}")"
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
-    "${changed_json}" "${tests_passed}" "${turns}" "${used_post_failure}" "${exec_exit}"
+    "${changed_json}" "${tests_passed}" "${turns}" "${used_post_failure}" "${exec_exit}" "${events}"
   log "arm=${arm} task=${task_id} workdir=${workdir} exit=${exec_exit}"
 }
 
