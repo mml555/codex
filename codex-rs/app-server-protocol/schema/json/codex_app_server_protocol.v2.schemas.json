@@ -4113,6 +4113,15 @@
             "null"
           ]
         },
+        "allowedPermissions": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "allowedSandboxModes": {
           "items": {
             "$ref": "#/definitions/SandboxMode"
@@ -14138,6 +14147,12 @@
               "type": "string"
             },
             "mcpAppResourceUri": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pluginId": {
               "type": [
                 "string",
                 "null"
