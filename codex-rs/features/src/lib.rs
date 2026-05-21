@@ -198,6 +198,8 @@ pub enum Feature {
     RemoteCompactionV2,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
+    /// Inject harness-native repo context packets into session prompts.
+    RepoIntelligence,
 
     // Removed
     /// Removed compatibility flag retained as a no-op so old configs can
@@ -1185,6 +1187,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RemoteCompactionV2,
         key: "remote_compaction_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RepoIntelligence,
+        key: "repo_intelligence",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

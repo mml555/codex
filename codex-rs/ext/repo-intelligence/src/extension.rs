@@ -12,12 +12,15 @@ use codex_extension_api::PromptFragment;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
+use codex_extension_api::TurnInputContributor;
+use codex_protocol::user_input::UserInput;
 use codex_features::Feature;
 use codex_repo_index::RepoMap;
 use codex_repo_index::RepoMapBuilder;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::run_memory_bridge::RunMemoryBridge;
+use crate::user_input::task_text_from_user_input;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RepoIntelligenceExtension;
@@ -75,6 +78,7 @@ impl ContextContributor for RepoIntelligenceExtension {
             let task = config
                 .task_override
                 .as_deref()
+                .filter(|text| !text.is_empty())
                 .unwrap_or("continue current task");
             let packet =
                 build_context_packet(task, &map, &run_memory, BuildPacketOptions::default());
@@ -94,6 +98,23 @@ impl ThreadLifecycleContributor<Config> for RepoIntelligenceExtension {
     }
 }
 
+impl TurnInputContributor for RepoIntelligenceExtension {
+    fn prepare_turn_input(&self, thread_store: &ExtensionData, input: &[UserInput]) {
+        let Some(task) = task_text_from_user_input(input) else {
+            return;
+        };
+        let Some(config) = thread_store.get::<RepoIntelligenceExtensionConfig>() else {
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+        let mut updated = (*config).clone();
+        updated.task_override = Some(task);
+        thread_store.insert(updated);
+    }
+}
+
 impl ConfigContributor<Config> for RepoIntelligenceExtension {
     fn on_config_changed(
         &self,
@@ -110,5 +131,6 @@ pub fn install(registry: &mut ExtensionRegistryBuilder<Config>) {
     let extension = Arc::new(RepoIntelligenceExtension);
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
+    registry.turn_input_contributor(extension.clone());
     registry.prompt_contributor(extension);
 }

@@ -49,6 +49,7 @@ members = [
     "ext/goal",
     "ext/guardian",
     "ext/memories",
+    "ext/repo-intelligence",
     "external-agent-migration",
     "external-agent-sessions",
     "keyring-store",
@@ -187,6 +188,7 @@ codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
 codex-message-history = { path = "message-history" }
 codex-memories-extension = { path = "ext/memories" }
+codex-repo-intelligence-extension = { path = "ext/repo-intelligence" }
 codex-memories-read = { path = "memories/read" }
 codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }

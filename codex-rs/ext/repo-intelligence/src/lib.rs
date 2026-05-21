@@ -2,6 +2,7 @@
 
 mod extension;
 mod run_memory_bridge;
+mod user_input;
 
 pub use extension::RepoIntelligenceExtension;
 pub use extension::RepoIntelligenceExtensionConfig;

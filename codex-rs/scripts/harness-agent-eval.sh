@@ -10,12 +10,13 @@ TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks.j
 CODEX_BIN=""
 ARTIFACTS_DIR=""
 RUN_AGENT=0
+SESSION_INJECTION=0
 VERBOSE=0
 OSS_ARGS=()
 
 usage() {
   cat <<'EOF'
-Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH] [--run] [--verbose] [--oss ...]
+Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH] [--run] [--session-injection] [--verbose] [--oss ...]
 
 Compares vanilla Codex vs harness-context Codex on the same tasks (see agent_eval_tasks.json).
 
@@ -49,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       RUN_AGENT=1
       shift
       ;;
+    --session-injection)
+      SESSION_INJECTION=1
+      shift
+      ;;
     --verbose)
       VERBOSE=1
       shift
@@ -58,7 +63,7 @@ while [[ $# -gt 0 ]]; do
       shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --codex-bin | --artifacts-dir | --fixture | --run | --verbose | -h | --help) break ;;
+          --codex-bin | --artifacts-dir | --fixture | --run | --session-injection | --verbose | -h | --help) break ;;
           *)
             OSS_ARGS+=("$1")
             shift
@@ -161,7 +166,9 @@ run_arm() {
 
   local prompt="${task_text}"
   local used_post_failure=false
-  if [[ "${arm}" == "harness" ]]; then
+  if [[ "${arm}" == "repo_intelligence" ]]; then
+    prompt="${task_text}"
+  elif [[ "${arm}" == "harness" ]]; then
     if [[ "${requires_pf}" == "true" ]]; then
       set +e
       "${CODEX_BIN}" verification run --changed src/calculator.py --cwd . --yes --json-out /tmp/report.json >/dev/null 2>&1
@@ -193,10 +200,17 @@ ${task_text}"
       --json \
       "${prompt}" </dev/null >"${events}" 2>/dev/null
   else
-    "${CODEX_BIN}" exec -s workspace-write \
-      --dangerously-bypass-approvals-and-sandbox \
-      --json \
-      "${prompt}" </dev/null >"${events}" 2>/dev/null
+    if [[ "${arm}" == "repo_intelligence" ]]; then
+      "${CODEX_BIN}" exec -c features.repo_intelligence=true -s workspace-write \
+        --dangerously-bypass-approvals-and-sandbox \
+        --json \
+        "${prompt}" </dev/null >"${events}" 2>/dev/null
+    else
+      "${CODEX_BIN}" exec -s workspace-write \
+        --dangerously-bypass-approvals-and-sandbox \
+        --json \
+        "${prompt}" </dev/null >"${events}" 2>/dev/null
+    fi
   fi
   local exec_exit=$?
   set -e
@@ -234,9 +248,20 @@ for t in tasks:
 PY
     [[ -z "${id}" ]] && break
     requires_pf="${requires_pf:-false}"
-    run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
-    run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}"
+    if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
+      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}"
+    else
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
+      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}"
+    fi
   done
+fi
+
+if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
+  echo "session-injection run complete (compare vanilla vs repo_intelligence artifacts manually)"
+  echo "artifacts_dir: ${ARTIFACTS_DIR}"
+  exit 0
 fi
 
 "${CODEX_BIN}" context agent-eval score \

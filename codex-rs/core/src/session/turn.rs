@@ -163,6 +163,10 @@ pub(crate) async fn run_turn(
         client_session.reset_websocket_session();
     }
 
+    sess.services
+        .extensions
+        .prepare_turn_input(&sess.services.thread_extension_data, &input);
+
     sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 

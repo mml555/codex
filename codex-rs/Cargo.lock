@@ -1915,6 +1915,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-repo-intelligence-extension",
  "codex-rmcp-client",
  "codex-rollout",
  "codex-sandboxing",
@@ -3502,6 +3503,25 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "codex-repo-intelligence-extension"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "codex-context-harness",
+ "codex-core",
+ "codex-extension-api",
+ "codex-features",
+ "codex-protocol",
+ "codex-repo-index",
+ "codex-utils-absolute-path",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

@@ -12,8 +12,10 @@ use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
 use crate::ToolContributor;
 use crate::ToolLifecycleContributor;
+use crate::TurnInputContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
+use codex_protocol::user_input::UserInput;
 
 /// Mutable registry used while hosts register typed runtime contributions.
 pub struct ExtensionRegistryBuilder<C: Sync> {
@@ -26,6 +28,7 @@ pub struct ExtensionRegistryBuilder<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
+    turn_input_contributors: Vec<Arc<dyn TurnInputContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
@@ -42,6 +45,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             tool_contributors: Vec::new(),
             tool_lifecycle_contributors: Vec::new(),
             turn_item_contributors: Vec::new(),
+            turn_input_contributors: Vec::new(),
         }
     }
 }
@@ -113,6 +117,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.turn_item_contributors.push(contributor);
     }
 
+    /// Registers one turn-input contributor.
+    pub fn turn_input_contributor(&mut self, contributor: Arc<dyn TurnInputContributor>) {
+        self.turn_input_contributors.push(contributor);
+    }
+
     /// Finishes construction and returns the immutable registry.
     pub fn build(self) -> ExtensionRegistry<C> {
         ExtensionRegistry {
@@ -126,6 +135,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
             tool_contributors: self.tool_contributors,
             tool_lifecycle_contributors: self.tool_lifecycle_contributors,
             turn_item_contributors: self.turn_item_contributors,
+            turn_input_contributors: self.turn_input_contributors,
         }
     }
 }
@@ -141,6 +151,7 @@ pub struct ExtensionRegistry<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
+    turn_input_contributors: Vec<Arc<dyn TurnInputContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
@@ -208,6 +219,21 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered ordered turn-item contributors.
     pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
         &self.turn_item_contributors
+    }
+
+    /// Returns the registered turn-input contributors.
+    pub fn turn_input_contributors(&self) -> &[Arc<dyn TurnInputContributor>] {
+        &self.turn_input_contributors
+    }
+
+    /// Primes thread-scoped extension state from pending user input before context assembly.
+    pub fn prepare_turn_input(&self, thread_store: &ExtensionData, input: &[UserInput]) {
+        if input.is_empty() {
+            return;
+        }
+        for contributor in &self.turn_input_contributors {
+            contributor.prepare_turn_input(thread_store, input);
+        }
     }
 }
 

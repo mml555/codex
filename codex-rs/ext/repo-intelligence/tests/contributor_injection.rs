@@ -3,6 +3,8 @@ use std::sync::Arc;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::PromptSlot;
+use codex_extension_api::TurnInputContributor;
+use codex_protocol::user_input::UserInput;
 use codex_repo_index::RepoMap;
 use codex_repo_intelligence_extension::RepoIntelligenceExtension;
 use codex_repo_intelligence_extension::RepoIntelligenceExtensionConfig;
@@ -43,6 +45,50 @@ async fn contributor_returns_empty_when_disabled() {
         cwd: AbsolutePathBuf::try_from("/fixture").expect("cwd"),
         cached_map: Some(fixture_map()),
         task_override: None,
+    });
+
+    let fragments = extension.contribute(&session_store, &thread_store).await;
+    assert!(fragments.is_empty());
+}
+
+#[test]
+fn turn_input_contributor_sets_task_from_user_text() {
+    let extension = RepoIntelligenceExtension;
+    let thread_store = ExtensionData::new("thread");
+    thread_store.insert(RepoIntelligenceExtensionConfig {
+        enabled: true,
+        cwd: AbsolutePathBuf::try_from("/fixture").expect("cwd"),
+        cached_map: None,
+        task_override: None,
+    });
+
+    extension.prepare_turn_input(
+        &thread_store,
+        &[UserInput::Text {
+            text: "Fix the failing calculator test.".to_string(),
+            text_elements: Vec::new(),
+        }],
+    );
+
+    let config = thread_store
+        .get::<RepoIntelligenceExtensionConfig>()
+        .expect("config");
+    assert_eq!(
+        config.task_override.as_deref(),
+        Some("Fix the failing calculator test.")
+    );
+}
+
+#[tokio::test]
+async fn contributor_returns_empty_when_map_build_fails() {
+    let extension = RepoIntelligenceExtension;
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    thread_store.insert(RepoIntelligenceExtensionConfig {
+        enabled: true,
+        cwd: AbsolutePathBuf::try_from("/nonexistent-codex-repo-intelligence-cwd").expect("cwd"),
+        cached_map: None,
+        task_override: Some("fix restaurant search pagination".to_string()),
     });
 
     let fragments = extension.contribute(&session_store, &thread_store).await;
