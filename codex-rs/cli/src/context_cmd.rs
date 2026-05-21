@@ -20,6 +20,7 @@ use codex_context_harness::run_eval;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_repo_index::RepoIndexCache;
 use codex_repo_index::RepoMapBuilder;
@@ -206,7 +207,7 @@ pub async fn run_context_build(cmd: ContextBuildCommand) -> Result<()> {
 
 pub async fn run_context_diff_prompt(cmd: ContextDiffPromptCommand) -> Result<()> {
     let cwd = resolve_cwd(cmd.cwd)?;
-    let map = load_or_build_map(&cwd, cmd.refresh_index)?;
+    let map = load_self_contained_map(&cwd, cmd.refresh_index)?;
     let options = BuildPacketOptions {
         token_budget: TokenBudget {
             limit: cmd.token_budget.unwrap_or(12_000),
@@ -289,12 +290,17 @@ pub async fn run_context_eval(cmd: ContextEvalCommand) -> Result<()> {
 }
 
 async fn build_vanilla_prompt_json(task: &str, cwd: &Path) -> Result<String> {
+    let codex_home = tempfile::TempDir::new().context("create isolated Codex home")?;
+    write_self_contained_config(codex_home.path())?;
+
     let overrides = ConfigOverrides {
         cwd: Some(cwd.to_path_buf()),
         ephemeral: Some(true),
         ..Default::default()
     };
     let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(self_contained_loader_overrides(codex_home.path()))
         .harness_overrides(overrides)
         .build()
         .await?;
@@ -302,8 +308,40 @@ async fn build_vanilla_prompt_json(task: &str, cwd: &Path) -> Result<String> {
         text: task.replace("\r\n", "\n").replace('\r', "\n"),
         text_elements: Vec::new(),
     }];
-    let prompt_input = codex_core::build_prompt_input(config, input, None).await?;
+    let prompt_input = codex_core::build_prompt_input_self_contained(config, input, None).await?;
     Ok(serde_json::to_string(&prompt_input)?)
+}
+
+fn write_self_contained_config(codex_home: &Path) -> Result<()> {
+    let mut config = toml::map::Map::new();
+    config.insert(
+        "sqlite_home".to_string(),
+        toml::Value::String(codex_home.join("sqlite").to_string_lossy().into_owned()),
+    );
+    config.insert(
+        "log_dir".to_string(),
+        toml::Value::String(codex_home.join("log").to_string_lossy().into_owned()),
+    );
+    std::fs::write(
+        codex_home.join("config.toml"),
+        toml::to_string(&toml::Value::Table(config))?,
+    )
+    .with_context(|| format!("write isolated config in {}", codex_home.display()))?;
+    Ok(())
+}
+
+fn self_contained_loader_overrides(codex_home: &Path) -> LoaderOverrides {
+    let isolated_config_dir = codex_home.join("host-config");
+    LoaderOverrides {
+        managed_config_path: Some(isolated_config_dir.join("managed_config.toml")),
+        system_config_path: Some(isolated_config_dir.join("config.toml")),
+        system_requirements_path: Some(isolated_config_dir.join("requirements.toml")),
+        ignore_managed_requirements: true,
+        #[cfg(target_os = "macos")]
+        managed_preferences_base64: Some(String::new()),
+        macos_managed_config_requirements_base64: Some(String::new()),
+        ..Default::default()
+    }
 }
 
 fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
@@ -313,6 +351,16 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
 fn load_map_fixture(path: &Path) -> Result<codex_repo_index::RepoMap> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_self_contained_map(cwd: &Path, refresh: bool) -> Result<codex_repo_index::RepoMap> {
+    RepoMapBuilder::build_with_options(
+        cwd,
+        RepoMapBuilderOptions {
+            refresh,
+            cache: None,
+        },
+    )
 }
 
 fn load_or_build_map(cwd: &Path, refresh: bool) -> Result<codex_repo_index::RepoMap> {

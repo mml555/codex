@@ -18,14 +18,14 @@ pub fn estimate_tokens_from_prompt_json(json: &str) -> u32 {
 fn collect_paths_from_value(value: &serde_json::Value, paths: &mut BTreeSet<String>) {
     match value {
         serde_json::Value::String(s) => {
-            for token in s.split_whitespace() {
-                if looks_like_repo_path(token) {
-                    paths.insert(token.trim_matches('`').to_string());
+            for token in s.split(path_token_boundary) {
+                if let Some(path) = normalize_repo_path_token(token) {
+                    paths.insert(path.to_string());
                 }
             }
             for line in s.lines() {
-                if looks_like_repo_path(line.trim()) {
-                    paths.insert(line.trim().trim_matches('`').to_string());
+                if let Some(path) = normalize_repo_path_token(line) {
+                    paths.insert(path.to_string());
                 }
             }
         }
@@ -41,6 +41,19 @@ fn collect_paths_from_value(value: &serde_json::Value, paths: &mut BTreeSet<Stri
         }
         _ => {}
     }
+}
+
+fn path_token_boundary(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+        )
+}
+
+fn normalize_repo_path_token(token: &str) -> Option<&str> {
+    let trimmed = token.trim().trim_matches('`').trim_matches('.');
+    looks_like_repo_path(trimmed).then_some(trimmed)
 }
 
 fn looks_like_repo_path(token: &str) -> bool {

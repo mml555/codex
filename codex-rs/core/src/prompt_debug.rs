@@ -30,13 +30,40 @@ pub async fn build_prompt_input(
 ) -> CodexResult<Vec<ResponseItem>> {
     config.ephemeral = true;
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
-
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))?,
+    );
+
+    build_prompt_input_with_environment_manager(config, input, state_db, environment_manager).await
+}
+
+/// Build prompt input without reading configured execution environments or API key env vars.
+#[doc(hidden)]
+pub async fn build_prompt_input_self_contained(
+    mut config: Config,
+    input: Vec<UserInput>,
+    state_db: Option<StateDbHandle>,
+) -> CodexResult<Vec<ResponseItem>> {
+    config.ephemeral = true;
+    let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+
+    build_prompt_input_with_environment_manager(config, input, state_db, environment_manager).await
+}
+
+async fn build_prompt_input_with_environment_manager(
+    config: Config,
+    input: Vec<UserInput>,
+    state_db: Option<StateDbHandle>,
+    environment_manager: Arc<EnvironmentManager>,
+) -> CodexResult<Vec<ResponseItem>> {
+    let auth_manager =
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
 
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let installation_id = resolve_installation_id(&config.codex_home).await?;
@@ -44,14 +71,7 @@ pub async fn build_prompt_input(
         &config,
         Arc::clone(&auth_manager),
         SessionSource::Exec,
-        Arc::new(
-            EnvironmentManager::from_codex_home(
-                config.codex_home.clone(),
-                Some(local_runtime_paths),
-            )
-            .await
-            .map_err(|err| CodexErr::Fatal(err.to_string()))?,
-        ),
+        environment_manager,
         empty_extension_registry(),
         /*analytics_events_client*/ None,
         thread_store,
