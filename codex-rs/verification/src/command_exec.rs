@@ -35,13 +35,10 @@ pub fn parse_narrow_command(command: &str) -> Option<NarrowCommand> {
         return None;
     }
 
-    if let Some(path) = trimmed.strip_prefix("python -m pytest ") {
-        let path = path.trim();
-        if python_rules::is_narrow_pytest_command(trimmed) {
-            return Some(NarrowCommand::PythonPytestFile {
-                test_file: path.to_string(),
-            });
-        }
+    if let Some(path) = python_rules::narrow_pytest_file_target(trimmed) {
+        return Some(NarrowCommand::PythonPytestFile {
+            test_file: path.to_string(),
+        });
     }
 
     None
@@ -111,6 +108,9 @@ mod tests {
     #[test]
     fn rejects_pytest_extra_args_and_non_test_files() {
         assert!(parse_narrow_command("python -m pytest tests/test_foo.py -q").is_none());
+        assert!(parse_narrow_command("python -m pytest --rootdir=/tmp/test_foo.py").is_none());
+        assert!(parse_narrow_command("python -m pytest -c/tests/test_foo.py").is_none());
+        assert!(parse_narrow_command("python -m pytest tests/-opts/test_foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest src/foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest /tmp/test_foo.py").is_none());
         assert!(parse_narrow_command("python -m pytest tests/../test_foo.py").is_none());

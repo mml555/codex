@@ -20,7 +20,9 @@ impl ContextPacketRenderer {
     pub fn render_prompt_fragment_with_caps(packet: &ContextPacket, caps: SelectionCaps) -> String {
         let mut lines = vec![
             "Harness repo context:".to_string(),
+            format!("Task: {}", shorten_for_prompt(&packet.task.raw, 240)),
             format!("Task type: {}", packet.task.task_type),
+            "Guidance: Treat this as a repo map. Inspect primary files first; use also-considered paths only if the primary set is insufficient.".to_string(),
         ];
 
         if let Some(area) = packet
@@ -33,42 +35,29 @@ impl ContextPacketRenderer {
             lines.push(format!("Likely area: {area}"));
         }
 
-        let mut included: Vec<_> = packet
+        let mut repo_rules: Vec<_> = packet
             .items
             .iter()
-            .filter(|item| {
-                matches!(
-                    item.state,
-                    ContextItemState::Included | ContextItemState::Pinned
-                ) && matches!(
-                    item.kind,
-                    ContextItemKind::FileSummary | ContextItemKind::RepoRule
-                ) && item.render_level != RenderLevel::HiddenDebugOnly
-            })
+            .filter(|item| prompt_visible_item(item, ContextItemKind::RepoRule))
             .collect();
-        included.sort_by(|a, b| {
-            render_level_rank(a.render_level)
-                .cmp(&render_level_rank(b.render_level))
-                .then_with(|| {
-                    b.relevance
-                        .partial_cmp(&a.relevance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| {
-                    a.path
-                        .as_deref()
-                        .unwrap_or("")
-                        .cmp(b.path.as_deref().unwrap_or(""))
-                })
-        });
-        included.truncate(caps.max_prompt_included_files);
+        sort_prompt_items(&mut repo_rules);
 
-        let primary: Vec<_> = included
+        let mut file_items: Vec<_> = packet
+            .items
             .iter()
+            .filter(|item| prompt_visible_item(item, ContextItemKind::FileSummary))
+            .collect();
+        sort_prompt_items(&mut file_items);
+        file_items.truncate(caps.max_prompt_included_files);
+
+        let primary: Vec<_> = file_items
+            .iter()
+            .copied()
             .filter(|item| item.render_level == RenderLevel::Full)
             .collect();
-        let also: Vec<_> = included
+        let also: Vec<_> = file_items
             .iter()
+            .copied()
             .filter(|item| {
                 matches!(
                     item.render_level,
@@ -77,26 +66,44 @@ impl ContextPacketRenderer {
             })
             .collect();
 
+        if !repo_rules.is_empty() {
+            lines.push(String::new());
+            lines.push("Repo rules:".to_string());
+            for item in repo_rules {
+                lines.extend(format_prompt_lines(item));
+            }
+        }
         if !primary.is_empty() {
             lines.push(String::new());
             lines.push("Primary files:".to_string());
             for item in primary {
-                lines.push(format_prompt_line(item));
+                lines.extend(format_prompt_lines(item));
             }
         }
         if !also.is_empty() {
             lines.push(String::new());
             lines.push("Also considered:".to_string());
             for item in also {
-                lines.push(format_prompt_line(item));
+                lines.extend(format_prompt_lines(item));
             }
         }
 
-        if !packet.selected_tests.is_empty() {
+        let selected_tests: Vec<_> = packet
+            .selected_tests
+            .iter()
+            .take(caps.max_prompt_tests)
+            .collect();
+        if !selected_tests.is_empty() {
             lines.push(String::new());
             lines.push("Likely tests:".to_string());
-            for test in packet.selected_tests.iter().take(caps.max_prompt_tests) {
+            for test in selected_tests {
                 lines.push(format!("- {}", test.command));
+                lines.push(format!(
+                    "  path: {}; why: {}; confidence={:.2}",
+                    test.path,
+                    shorten_for_prompt(&test.reason, 96),
+                    test.confidence
+                ));
             }
         }
 
@@ -180,22 +187,91 @@ impl ContextPacketRenderer {
     }
 }
 
-fn format_prompt_line(item: &crate::packet::ContextItem) -> String {
-    let path = item.path.as_deref().unwrap_or("-");
+fn format_prompt_lines(item: &crate::packet::ContextItem) -> Vec<String> {
+    let label = prompt_item_label(item);
     match item.render_level {
-        RenderLevel::Full => format!("- {path} — {}", item.reason),
-        RenderLevel::Compact => format!("- {path} ({})", shorten_reason(&item.reason)),
-        RenderLevel::PathOnly => format!("- {path}"),
-        RenderLevel::HiddenDebugOnly => format!("- {path}"),
+        RenderLevel::Full => vec![
+            format!("- {label}"),
+            format!("  {}", format_signal_line(item, SignalDetail::WithEvidence)),
+        ],
+        RenderLevel::Compact => vec![format!(
+            "- {label} | {}",
+            format_signal_line(item, SignalDetail::WithoutEvidence)
+        )],
+        RenderLevel::PathOnly => vec![format!(
+            "- {label} | relevance={:.2} confidence={:.2}",
+            item.relevance, item.confidence
+        )],
+        RenderLevel::HiddenDebugOnly => vec![format!("- {label}")],
     }
 }
 
-fn shorten_reason(reason: &str) -> String {
-    if reason.len() <= 48 {
-        reason.to_string()
-    } else {
-        format!("{}…", &reason[..45])
+fn prompt_item_label(item: &crate::packet::ContextItem) -> String {
+    item.path.clone().unwrap_or_else(|| item.reason.clone())
+}
+
+fn prompt_visible_item(item: &crate::packet::ContextItem, kind: ContextItemKind) -> bool {
+    matches!(
+        item.state,
+        ContextItemState::Included | ContextItemState::Pinned
+    ) && item.kind == kind
+        && item.render_level != RenderLevel::HiddenDebugOnly
+}
+
+fn sort_prompt_items(items: &mut [&crate::packet::ContextItem]) {
+    items.sort_by(|a, b| {
+        render_level_rank(a.render_level)
+            .cmp(&render_level_rank(b.render_level))
+            .then_with(|| {
+                b.relevance
+                    .partial_cmp(&a.relevance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.path
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.path.as_deref().unwrap_or(""))
+            })
+    });
+}
+
+#[derive(Clone, Copy)]
+enum SignalDetail {
+    WithEvidence,
+    WithoutEvidence,
+}
+
+fn format_signal_line(item: &crate::packet::ContextItem, detail: SignalDetail) -> String {
+    let mut parts = vec![format!("why: {}", shorten_for_prompt(&item.reason, 96))];
+    parts.push(format!(
+        "relevance={:.2} confidence={:.2}",
+        item.relevance, item.confidence
+    ));
+    if matches!(detail, SignalDetail::WithEvidence) && !item.evidence.is_empty() {
+        let evidence = item
+            .evidence
+            .iter()
+            .take(3)
+            .map(|entry| shorten_for_prompt(entry, 48))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("evidence={evidence}"));
     }
+    parts.join("; ")
+}
+
+fn shorten_for_prompt(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text.chars().take(max_chars).collect();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let truncated = text.chars().take(keep).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn render_level_rank(level: RenderLevel) -> u8 {

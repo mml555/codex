@@ -81,6 +81,16 @@ cd codex-rs
   --artifacts-dir /tmp/harness-agent-eval-session-real
 ```
 
+Repeat run (3 mixed-positive tasks only; use a clean branch/worktree):
+
+```bash
+for run in 1 2 3; do
+  ./scripts/harness-agent-eval.sh --verbose --run --session-injection \
+    --fixture context-harness/tests/fixtures/agent_eval_tasks_codex_repeat.json \
+    --artifacts-dir "/tmp/harness-agent-eval-repeat-${run}"
+done
+```
+
 Without `--run`, the script only scores existing artifacts (same as `agent-eval score`).
 Treatment arm auto-detects `repo_intelligence` vs `harness` from artifact layout.
 

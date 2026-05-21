@@ -3,6 +3,7 @@ use codex_context_harness::ContextPacketRenderer;
 use codex_context_harness::EvalLabels;
 use codex_context_harness::Metrics;
 use codex_context_harness::RunMemory;
+use codex_context_harness::SelectionCaps;
 use codex_context_harness::TaskType;
 use codex_context_harness::build_context_packet;
 use codex_context_harness::normalize_packet;
@@ -26,7 +27,7 @@ fn golden_packet_shape_for_restaurant_search_task() {
 
     assert_eq!(packet.version, 1);
     assert_eq!(packet.task.task_type, TaskType::BugFix.as_str());
-    assert!(packet.decision_log.included.len() >= 1);
+    assert!(!packet.decision_log.included.is_empty());
     assert!(!packet.included_paths().is_empty());
     assert!(
         packet
@@ -48,9 +49,97 @@ fn renderer_outputs_non_empty_fragments() {
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
     assert!(fragment.contains("Harness repo context:"));
+    assert!(fragment.contains("Task: fix restaurant search pagination"));
+    assert!(fragment.contains("Guidance: Treat this as a repo map."));
+    assert!(fragment.contains("Repo rules:"));
+    assert!(fragment.contains("- Project AGENTS.md instructions"));
     assert!(fragment.contains("Primary files:"));
     assert!(fragment.contains("restaurants.py"));
+    assert!(fragment.contains("why: Path matches"));
+    assert!(fragment.contains("relevance="));
+    assert!(fragment.contains("evidence="));
+    assert!(fragment.contains("path: tests/api/test_restaurants.py; why:"));
     assert!(!fragment.contains("<codex-context-packet>"));
+    assert!(!fragment.contains("Primary files:\n- Project AGENTS.md instructions"));
+}
+
+#[test]
+fn repo_rules_do_not_spend_file_prompt_cap() {
+    let map = fixture_map();
+    let packet = build_context_packet(
+        "fix restaurant search pagination",
+        &map,
+        &RunMemory::default(),
+        BuildPacketOptions::default(),
+    );
+    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(
+        &packet,
+        SelectionCaps {
+            max_prompt_included_files: 1,
+            max_prompt_tests: 0,
+            max_prompt_warnings: 0,
+            ..SelectionCaps::default()
+        },
+    );
+
+    assert!(fragment.contains("Repo rules:"));
+    assert!(fragment.contains("- Project AGENTS.md instructions"));
+    assert!(fragment.contains("Primary files:"));
+    assert!(fragment.contains("restaurants.py"));
+    assert_eq!(
+        fragment
+            .lines()
+            .filter(|line| line.starts_with("- ") && line.contains('/'))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn repo_rules_do_not_spend_primary_file_slots() {
+    let map = fixture_map();
+    let caps = SelectionCaps {
+        max_prompt_full_files: 1,
+        max_prompt_compact_files: 0,
+        max_prompt_tests: 0,
+        max_prompt_warnings: 0,
+        ..SelectionCaps::default()
+    };
+    let packet = build_context_packet(
+        "fix restaurant search pagination",
+        &map,
+        &RunMemory::default(),
+        BuildPacketOptions {
+            selection: caps,
+            ..BuildPacketOptions::default()
+        },
+    );
+    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(&packet, caps);
+
+    assert!(fragment.contains("Repo rules:"));
+    assert!(fragment.contains("- Project AGENTS.md instructions"));
+    assert!(fragment.contains("Primary files:"));
+    assert!(fragment.contains("restaurants.py"));
+}
+
+#[test]
+fn zero_test_prompt_cap_omits_likely_tests_section() {
+    let map = fixture_map();
+    let packet = build_context_packet(
+        "fix restaurant search pagination",
+        &map,
+        &RunMemory::default(),
+        BuildPacketOptions::default(),
+    );
+    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(
+        &packet,
+        SelectionCaps {
+            max_prompt_tests: 0,
+            ..SelectionCaps::default()
+        },
+    );
+
+    assert!(!fragment.contains("Likely tests:"));
 }
 
 #[test]

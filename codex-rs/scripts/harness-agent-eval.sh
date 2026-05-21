@@ -23,10 +23,26 @@ Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture
 
 Compares vanilla Codex vs treatment Codex on the same tasks.
 
-Default fixture: agent_eval_tasks.json (calculator sandbox).
---session-injection: vanilla vs repo_intelligence (-c features.repo_intelligence=true)
-  with agent_eval_tasks_codex_session.json unless --fixture is set.
-Without --session-injection: vanilla vs harness (manual context build prefix).
+Modes:
+  default: vanilla vs harness, where the harness arm prepends a manual
+    `codex context build` prompt fragment.
+  --session-injection: vanilla vs repo_intelligence, where the treatment arm
+    runs `codex exec -c features.repo_intelligence=true` and relies on session
+    context injection instead of a manual prompt prefix. This mode scores
+    repo_intelligence artifacts as the treatment arm.
+
+Fixtures:
+  default: context-harness/tests/fixtures/agent_eval_tasks.json
+    Uses workdir "calculator", which copies the Python calculator fixture into
+    a fresh temporary git repo for each arm.
+  --session-injection default: context-harness/tests/fixtures/agent_eval_tasks_codex_session.json
+    unless --fixture is set.
+  Task fixtures may set "workdir": "codex_rs" to run the task directly in this
+    codex-rs checkout instead of a copied temp fixture. The script resolves the
+    checkout as ${CODEX_RS_ROOT} (scripts/..) and uses it as the cwd for both
+    arms; it does not copy or reset the worktree. This mode is intended for
+    Codex-repo tasks, so use a clean disposable checkout because agent edits and
+    git diffs are collected from the real worktree.
 
 Without --run: scores existing artifacts only (requires record.json per task/arm).
 With --run: executes both arms via `codex exec --json` (needs a working model provider).
@@ -333,7 +349,18 @@ if [[ -z "${ARTIFACTS_DIR}" ]]; then
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
-  python3 - "${TASK_FIXTURE}" <<'PY' | while IFS=$'\t' read -r id task verify requires_pf workdir_kind || [[ -n "${id:-}" ]]; do
+  while IFS=$'\t' read -r id task verify requires_pf workdir_kind || [[ -n "${id:-}" ]]; do
+    [[ -z "${id}" ]] && break
+    requires_pf="${requires_pf:-false}"
+    workdir_kind="${workdir_kind:-calculator}"
+    if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+    else
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+    fi
+  done < <(python3 - "${TASK_FIXTURE}" <<'PY'
 import json, sys
 tasks = json.load(open(sys.argv[1], encoding="utf-8"))
 for t in tasks:
@@ -346,17 +373,7 @@ for t in tasks:
         sep="\t",
     )
 PY
-    [[ -z "${id}" ]] && break
-    requires_pf="${requires_pf:-false}"
-    workdir_kind="${workdir_kind:-calculator}"
-    if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-    else
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-    fi
-  done
+)
 fi
 
 SCORE_ARGS=(--fixture "${TASK_FIXTURE}" --artifacts-dir "${ARTIFACTS_DIR}" --human)

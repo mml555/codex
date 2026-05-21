@@ -24,10 +24,7 @@ pub fn assign_render_levels(
             matches!(
                 item.state,
                 ContextItemState::Included | ContextItemState::Pinned
-            ) && matches!(
-                item.kind,
-                ContextItemKind::FileSummary | ContextItemKind::RepoRule
-            )
+            ) && item.kind == ContextItemKind::FileSummary
         })
         .map(|(idx, _)| idx)
         .collect();
@@ -74,6 +71,8 @@ pub fn assign_render_levels(
             ContextItemState::Included | ContextItemState::Pinned
         ) {
             item.render_level = RenderLevel::HiddenDebugOnly;
+        } else if item.kind == ContextItemKind::RepoRule {
+            item.render_level = RenderLevel::Full;
         }
     }
 }
@@ -100,7 +99,11 @@ fn bridge_render_level(path: &str, scope: TaskScope, command_primary: bool) -> R
 }
 
 pub fn estimate_item_render_tokens(item: &ContextItem) -> u32 {
-    let path_len = item.path.as_ref().map(|p| p.len()).unwrap_or(0) as u32;
+    let path_len = item
+        .path
+        .as_ref()
+        .map(std::string::String::len)
+        .unwrap_or(0) as u32;
     match item.render_level {
         RenderLevel::Full => 90 + path_len / 4 + item.reason.len() as u32 / 4,
         RenderLevel::Compact => 35 + path_len / 4,

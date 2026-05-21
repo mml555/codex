@@ -120,6 +120,7 @@ fn repo_has_path(map: &RepoMap, path: &str) -> bool {
 fn is_narrow_pytest_target(path: &str) -> bool {
     if path.is_empty()
         || path == "."
+        || path.starts_with('-')
         || path.starts_with('/')
         || path.ends_with('/')
         || path.ends_with('\\')
@@ -141,7 +142,11 @@ fn is_narrow_pytest_target(path: &str) -> bool {
 
     let mut components = path.split('/').peekable();
     while let Some(component) = components.next() {
-        if component.is_empty() || component == "." || component == ".." {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.starts_with('-')
+        {
             return false;
         }
         if components.peek().is_none() {
@@ -154,11 +159,16 @@ fn is_narrow_pytest_target(path: &str) -> bool {
 
 /// Returns true when the command is a narrow `python -m pytest <file>` invocation.
 pub fn is_narrow_pytest_command(command: &str) -> bool {
+    narrow_pytest_file_target(command).is_some()
+}
+
+pub(crate) fn narrow_pytest_file_target(command: &str) -> Option<&str> {
     let trimmed = command.trim();
     let Some(rest) = trimmed.strip_prefix("python -m pytest ") else {
-        return false;
+        return None;
     };
-    is_explicit_test_file(rest.trim())
+    let path = rest.trim();
+    is_explicit_test_file(path).then_some(path)
 }
 
 fn is_explicit_test_file(path: &str) -> bool {
@@ -259,6 +269,15 @@ mod tests {
         assert!(!is_narrow_pytest_command(
             "python -m pytest tests/test_calculator.py::test_add"
         ));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest --rootdir=/tmp/test_calculator.py"
+        ));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest -c/tests/test_calculator.py"
+        ));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest tests/-opts/test_calculator.py"
+        ));
         assert!(!is_narrow_pytest_command("pytest tests/test_calculator.py"));
         assert!(!is_narrow_pytest_command(
             "python -m pytest src/calculator.py"
@@ -274,6 +293,11 @@ mod tests {
         assert!(!is_narrow_pytest_target("/tmp/test_calculator.py"));
         assert!(!is_narrow_pytest_target("tests/../test_calculator.py"));
         assert!(!is_narrow_pytest_target("tests/test_calculator.py -q"));
+        assert!(!is_narrow_pytest_target(
+            "--rootdir=/tmp/test_calculator.py"
+        ));
+        assert!(!is_narrow_pytest_target("-c/tests/test_calculator.py"));
+        assert!(!is_narrow_pytest_target("tests/-opts/test_calculator.py"));
         assert!(!is_narrow_pytest_target("src/calculator.py"));
     }
 }

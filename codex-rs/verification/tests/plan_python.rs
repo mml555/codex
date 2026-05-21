@@ -109,6 +109,51 @@ fn nested_changed_pytest_file_is_a_narrow_target() {
 }
 
 #[test]
+fn python_plan_rejects_option_like_pytest_targets() {
+    for command in [
+        "python -m pytest --rootdir=/tmp/test_calculator.py",
+        "python -m pytest -c/tests/test_calculator.py",
+        "python -m pytest tests/-opts/test_calculator.py",
+        "python -m pytest tests/test_calculator.py -q",
+        "python -m pytest tests/test_calculator.py::test_add",
+    ] {
+        assert!(
+            !codex_verification::is_safe_to_run(command),
+            "{command} must not be runnable"
+        );
+    }
+
+    for target in [
+        "--rootdir=/tmp/test_calculator.py",
+        "-c/tests/test_calculator.py",
+        "tests/-opts/test_calculator.py",
+    ] {
+        let plan = VerificationPlanner::plan(&[target.to_string()], &python_calculator_map());
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .any(|cmd| cmd.command.starts_with("python -m pytest")),
+            "{target} must not produce a pytest command"
+        );
+    }
+
+    let mut map = python_calculator_map();
+    map.test_map[0].test_paths = vec![
+        "--rootdir=/tmp/test_calculator.py".to_string(),
+        "-c/tests/test_calculator.py".to_string(),
+        "tests/-opts/test_calculator.py".to_string(),
+        "tests/test_calculator.py -q".to_string(),
+        "tests/test_calculator.py::test_add".to_string(),
+    ];
+    let plan = VerificationPlanner::plan(&["src/calculator.py".to_string()], &map);
+    assert!(
+        plan.commands.is_empty(),
+        "unsafe paired pytest targets must not produce commands"
+    );
+}
+
+#[test]
 fn python_unknown_src_has_no_runnable_command() {
     let plan = VerificationPlanner::plan(&["src/unknown.py".to_string()], &python_calculator_map());
     assert!(plan.commands.is_empty());
