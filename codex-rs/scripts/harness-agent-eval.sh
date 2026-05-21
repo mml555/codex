@@ -183,10 +183,17 @@ ${task_text}"
   local events="${ARTIFACTS_DIR}/${task_id}/${arm}/events.jsonl"
   mkdir -p "$(dirname "${events}")"
   set +e
-  "${CODEX_BIN}" exec "${OSS_ARGS[@]}" -s workspace-write \
-    --dangerously-bypass-approvals-and-sandbox \
-    --json \
-    "${prompt}" </dev/null >"${events}" 2>/dev/null
+  if ((${#OSS_ARGS[@]} > 0)); then
+    "${CODEX_BIN}" exec "${OSS_ARGS[@]}" -s workspace-write \
+      --dangerously-bypass-approvals-and-sandbox \
+      --json \
+      "${prompt}" </dev/null >"${events}" 2>/dev/null
+  else
+    "${CODEX_BIN}" exec -s workspace-write \
+      --dangerously-bypass-approvals-and-sandbox \
+      --json \
+      "${prompt}" </dev/null >"${events}" 2>/dev/null
+  fi
   local exec_exit=$?
   set -e
 
