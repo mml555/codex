@@ -26,7 +26,7 @@ pub fn is_safe_to_run(command: &str) -> bool {
 pub fn parse_narrow_command(command: &str) -> Option<NarrowCommand> {
     let trimmed = command.trim();
     if let Some(package) = trimmed.strip_prefix("cargo test -p ") {
-        let package = package.split_whitespace().next()?.trim();
+        let package = package.trim();
         if is_safe_cargo_package_name(package) {
             return Some(NarrowCommand::CargoTestPackage {
                 package: package.to_string(),
@@ -36,8 +36,8 @@ pub fn parse_narrow_command(command: &str) -> Option<NarrowCommand> {
     }
 
     if let Some(path) = trimmed.strip_prefix("python -m pytest ") {
-        let path = path.split_whitespace().next()?.trim();
-        if python_rules::is_narrow_pytest_command(&format!("python -m pytest {path}")) {
+        let path = path.trim();
+        if python_rules::is_narrow_pytest_command(trimmed) {
             return Some(NarrowCommand::PythonPytestFile {
                 test_file: path.to_string(),
             });
@@ -82,6 +82,7 @@ pub fn spawn_narrow_command(command: &str, cwd: &Path) -> std::io::Result<std::p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn parses_cargo_and_pytest() {
@@ -102,7 +103,16 @@ mod tests {
     #[test]
     fn rejects_shell_metacharacters() {
         assert!(parse_narrow_command("cargo test -p foo; rm -rf /").is_none());
+        assert!(parse_narrow_command("cargo test -p foo --all-features").is_none());
         assert!(parse_narrow_command("python -m pytest tests/$(whoami).py").is_none());
         assert!(!is_safe_to_run("echo ok"));
+    }
+
+    #[test]
+    fn rejects_pytest_extra_args_and_non_test_files() {
+        assert!(parse_narrow_command("python -m pytest tests/test_foo.py -q").is_none());
+        assert!(parse_narrow_command("python -m pytest src/foo.py").is_none());
+        assert!(parse_narrow_command("python -m pytest /tmp/test_foo.py").is_none());
+        assert!(parse_narrow_command("python -m pytest tests/../test_foo.py").is_none());
     }
 }

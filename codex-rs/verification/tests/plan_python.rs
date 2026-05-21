@@ -3,6 +3,7 @@ use codex_verification::load_plan_fixtures;
 use codex_verification::python_rules::build_python_verification;
 use codex_verification::python_rules::is_python_repo;
 use codex_verification::run_plan_eval;
+use pretty_assertions::assert_eq;
 
 fn python_calculator_map() -> codex_repo_index::RepoMap {
     codex_repo_index::RepoMap {
@@ -92,6 +93,19 @@ fn python_calculator_plan_targets_explicit_pytest_file() {
     assert!(!codex_verification::is_safe_to_run(
         "python -m pytest tests/"
     ));
+}
+
+#[test]
+fn nested_changed_pytest_file_is_a_narrow_target() {
+    let plan = VerificationPlanner::plan(
+        &["services/foo/tests/calculator_test.py".to_string()],
+        &python_calculator_map(),
+    );
+    assert_eq!(plan.commands.len(), 1);
+    assert_eq!(
+        plan.commands[0].command,
+        "python -m pytest services/foo/tests/calculator_test.py"
+    );
 }
 
 #[test]

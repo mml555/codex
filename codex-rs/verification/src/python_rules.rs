@@ -39,10 +39,8 @@ pub fn build_python_verification(map: &RepoMap, changed: &[String]) -> PythonPla
             continue;
         }
 
-        let test_file = if path.starts_with("tests/") && path.contains("test_") {
+        let test_file = if is_narrow_pytest_target(path) {
             Some(path.clone())
-        } else if path.starts_with("src/") {
-            paired_test_for_source(map, path)
         } else {
             paired_test_for_source(map, path)
         };
@@ -120,30 +118,50 @@ fn repo_has_path(map: &RepoMap, path: &str) -> bool {
 }
 
 fn is_narrow_pytest_target(path: &str) -> bool {
-    path.ends_with(".py")
-        && !path.contains("__pycache__")
-        && !path.contains("..")
-        && !path.chars().any(|c| {
-            matches!(
+    if path.is_empty()
+        || path == "."
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.ends_with('\\')
+        || !path.ends_with(".py")
+        || path.contains("__pycache__")
+    {
+        return false;
+    }
+
+    if path.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
                 c,
-                '$' | '(' | ')' | ';' | '|' | '&' | '>' | '<' | '`' | '"' | '\''
+                '$' | '(' | ')' | ';' | '|' | '&' | '>' | '<' | '`' | '"' | '\'' | ':' | '\\'
             )
-        })
+    }) {
+        return false;
+    }
+
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        if component.is_empty() || component == "." || component == ".." {
+            return false;
+        }
+        if components.peek().is_none() {
+            return component.starts_with("test_") || component.ends_with("_test.py");
+        }
+    }
+
+    false
 }
 
 /// Returns true when the command is a narrow `python -m pytest <file>` invocation.
 pub fn is_narrow_pytest_command(command: &str) -> bool {
     let trimmed = command.trim();
     let Some(rest) = trimmed.strip_prefix("python -m pytest ") else {
-        return trimmed
-            .strip_prefix("pytest ")
-            .is_some_and(|path| is_explicit_test_file(path));
+        return false;
     };
     is_explicit_test_file(rest.trim())
 }
 
 fn is_explicit_test_file(path: &str) -> bool {
-    let path = path.split_whitespace().next().unwrap_or(path);
     if path.is_empty() || path == "." {
         return false;
     }
@@ -159,6 +177,7 @@ mod tests {
     use codex_repo_index::RepoMap;
     use codex_repo_index::RepoPackage;
     use codex_repo_index::RepoTestEntry;
+    use pretty_assertions::assert_eq;
 
     fn python_map() -> RepoMap {
         RepoMap {
@@ -234,5 +253,27 @@ mod tests {
         ));
         assert!(!is_narrow_pytest_command("python -m pytest"));
         assert!(!is_narrow_pytest_command("python -m pytest tests/"));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest tests/test_calculator.py -q"
+        ));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest tests/test_calculator.py::test_add"
+        ));
+        assert!(!is_narrow_pytest_command("pytest tests/test_calculator.py"));
+        assert!(!is_narrow_pytest_command(
+            "python -m pytest src/calculator.py"
+        ));
+    }
+
+    #[test]
+    fn narrow_pytest_target_requires_relative_test_file() {
+        assert!(is_narrow_pytest_target("tests/test_calculator.py"));
+        assert!(is_narrow_pytest_target(
+            "services/foo/tests/calculator_test.py"
+        ));
+        assert!(!is_narrow_pytest_target("/tmp/test_calculator.py"));
+        assert!(!is_narrow_pytest_target("tests/../test_calculator.py"));
+        assert!(!is_narrow_pytest_target("tests/test_calculator.py -q"));
+        assert!(!is_narrow_pytest_target("src/calculator.py"));
     }
 }

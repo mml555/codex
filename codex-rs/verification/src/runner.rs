@@ -148,9 +148,7 @@ pub fn run_verification_plan(
         }
     }
 
-    let status = if results.is_empty() {
-        VerificationRunStatus::Passed
-    } else if results
+    let status = if results
         .iter()
         .all(|r| r.exit_code == Some(0) && r.error.is_none())
     {

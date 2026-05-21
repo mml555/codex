@@ -72,32 +72,31 @@ pub fn build_verification_plan(map: &RepoMap, ctx: &PlanContext) -> Verification
         if path.ends_with(".py") {
             continue;
         }
-        if let Some(area_id) = area_id_for_path(path, map) {
-            if let Some(package) = package_name_for_area(&area_id) {
-                insert_package(
-                    &mut packages,
-                    &mut reasons,
-                    &mut confidences,
-                    &package,
-                    format!("changed file `{path}` belongs to `{area_id}`"),
-                    0.86,
-                );
-            }
+        if let Some(area_id) = area_id_for_path(path, map)
+            && let Some(package) = package_name_for_area(&area_id)
+        {
+            insert_package(
+                &mut packages,
+                &mut reasons,
+                &mut confidences,
+                &package,
+                format!("changed file `{path}` belongs to `{area_id}`"),
+                0.86,
+            );
         }
 
-        if is_rust_test_path(path) {
-            if let Some(area_id) = area_id_for_path(path, map) {
-                if let Some(package) = package_name_for_area(&area_id) {
-                    insert_package(
-                        &mut packages,
-                        &mut reasons,
-                        &mut confidences,
-                        &package,
-                        format!("changed test file `{path}` in `{area_id}`"),
-                        0.9,
-                    );
-                }
-            }
+        if is_rust_test_path(path)
+            && let Some(area_id) = area_id_for_path(path, map)
+            && let Some(package) = package_name_for_area(&area_id)
+        {
+            insert_package(
+                &mut packages,
+                &mut reasons,
+                &mut confidences,
+                &package,
+                format!("changed test file `{path}` in `{area_id}`"),
+                0.9,
+            );
         }
     }
 
@@ -179,22 +178,21 @@ pub fn build_verification_plan(map: &RepoMap, ctx: &PlanContext) -> Verification
 
     if let (Some(packet), Some(ownership)) = (&ctx.packet, &ownership) {
         for test in &packet.selected_tests {
-            if let Some(area_id) = ownership.primary_area.as_ref() {
-                if test.path.starts_with(area_id) {
-                    if let Some(package) = package_name_for_area(area_id) {
-                        insert_package(
-                            &mut packages,
-                            &mut reasons,
-                            &mut confidences,
-                            &package,
-                            format!(
-                                "context packet selected likely test `{}` for primary area",
-                                test.path
-                            ),
-                            test.confidence.min(0.85),
-                        );
-                    }
-                }
+            if let Some(area_id) = ownership.primary_area.as_ref()
+                && test.path.starts_with(area_id)
+                && let Some(package) = package_name_for_area(area_id)
+            {
+                insert_package(
+                    &mut packages,
+                    &mut reasons,
+                    &mut confidences,
+                    &package,
+                    format!(
+                        "context packet selected likely test `{}` for primary area",
+                        test.path
+                    ),
+                    test.confidence.min(0.85),
+                );
             }
         }
     }
@@ -222,19 +220,18 @@ pub fn build_verification_plan(map: &RepoMap, ctx: &PlanContext) -> Verification
             }
             TaskScope::CrossArea => {
                 for root in &ownership.cross_area_roots {
-                    if let Some(area_id) = root.strip_suffix('/') {
-                        if let Some(package) = package_name_for_area(area_id) {
-                            if changed.iter().any(|path| path.starts_with(root)) {
-                                insert_package(
-                                    &mut packages,
-                                    &mut reasons,
-                                    &mut confidences,
-                                    &package,
-                                    format!("cross-area task touched `{root}`"),
-                                    0.78,
-                                );
-                            }
-                        }
+                    if let Some(area_id) = root.strip_suffix('/')
+                        && let Some(package) = package_name_for_area(area_id)
+                        && changed.iter().any(|path| path.starts_with(root))
+                    {
+                        insert_package(
+                            &mut packages,
+                            &mut reasons,
+                            &mut confidences,
+                            &package,
+                            format!("cross-area task touched `{root}`"),
+                            0.78,
+                        );
                     }
                 }
             }
@@ -331,20 +328,18 @@ fn build_skipped(
             continue;
         }
         let touched = changed.iter().any(|path| path.starts_with(area_id));
-        if !touched {
-            if let Some(area) = map.area_map_for_id(area_id) {
-                if ownership.is_some_and(|o| o.primary_area.as_deref() == Some(area_id)) {
-                    continue;
-                }
-                if area.owned_files.len() > 20 {
-                    skipped.push(SkippedCommand {
-                        command: format!("cargo test -p {package}"),
-                        reason: format!(
-                            "area `{area_id}` not touched by changed files ({} owned files)",
-                            area.owned_files.len()
-                        ),
-                    });
-                }
+        if !touched && let Some(area) = map.area_map_for_id(area_id) {
+            if ownership.is_some_and(|o| o.primary_area.as_deref() == Some(area_id)) {
+                continue;
+            }
+            if area.owned_files.len() > 20 {
+                skipped.push(SkippedCommand {
+                    command: format!("cargo test -p {package}"),
+                    reason: format!(
+                        "area `{area_id}` not touched by changed files ({} owned files)",
+                        area.owned_files.len()
+                    ),
+                });
             }
         }
     }
