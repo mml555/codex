@@ -9,13 +9,11 @@ use codex_context_harness::ContextPacketRenderer;
 use codex_context_harness::RunMemory;
 use codex_context_harness::TokenBudget;
 use codex_context_harness::build_context_packet;
-use codex_context_harness::build_post_failure_context_packet;
 use codex_context_harness::estimate_tokens_from_prompt_json;
 use codex_context_harness::extract_paths_from_prompt_json;
 use codex_context_harness::load_eval_fixtures;
 use codex_context_harness::render_eval_human;
 use codex_context_harness::render_eval_summary;
-use codex_context_harness::render_post_failure_prompt_fragment;
 use codex_context_harness::run_eval;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -27,8 +25,6 @@ use codex_repo_index::RepoMapBuilderOptions;
 use codex_utils_home_dir::find_codex_home;
 use codex_verification::PlanRequest;
 use codex_verification::VerificationPlanner;
-use codex_verification::load_verification_run_report;
-use codex_verification::post_failure_context_from_report;
 
 #[derive(Debug, Parser)]
 pub struct ContextCli {
@@ -76,9 +72,6 @@ pub struct ContextBuildCommand {
     /// Include a deterministic verification plan in JSON output.
     #[arg(long)]
     pub with_verification_plan: bool,
-    /// Build a post-failure packet from a verification run report JSON file.
-    #[arg(long = "with-verification-report", alias = "failure-packet")]
-    pub verification_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -139,36 +132,12 @@ pub async fn run_context_build(cmd: ContextBuildCommand) -> Result<()> {
         ..BuildPacketOptions::default()
     };
 
-    let post_failure = cmd
-        .verification_report
-        .as_ref()
-        .map(|path| {
-            let report = load_verification_run_report(path)?;
-            post_failure_context_from_report(&report, &cmd.task, &cmd.changed)
-        })
-        .transpose()?;
-
-    let packet = if let Some(failure) = &post_failure {
-        build_post_failure_context_packet(&map, failure, build_options)
-    } else {
-        build_context_packet(&cmd.task, &map, &RunMemory::default(), build_options)
-    };
+    let packet = build_context_packet(&cmd.task, &map, &RunMemory::default(), build_options);
 
     let output = if cmd.prompt_fragment {
-        if let Some(failure) = &post_failure {
-            render_post_failure_prompt_fragment(&packet, failure)
-        } else {
-            ContextPacketRenderer::render_prompt_fragment(&packet)
-        }
+        ContextPacketRenderer::render_prompt_fragment(&packet)
     } else if cmd.human {
         ContextPacketRenderer::render_human_debug(&packet)
-    } else if post_failure.is_some() {
-        let failure = post_failure.expect("post_failure checked above");
-        serde_json::to_string_pretty(&serde_json::json!({
-            "packet": packet,
-            "post_failure_context": failure,
-            "prompt_fragment": render_post_failure_prompt_fragment(&packet, &failure),
-        }))?
     } else if cmd.with_verification_plan {
         let plan = if cmd.changed.is_empty() {
             VerificationPlanner::plan_with_request(

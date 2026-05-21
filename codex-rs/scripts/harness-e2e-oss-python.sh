@@ -16,7 +16,7 @@ usage() {
 Usage: harness-e2e-oss-python.sh [--codex-bin PATH] [--skip-run] [--verbose]
 
 Runs the deterministic harness loop on a copy of the Python calculator fixture:
-  context build -> verification plan -> (optional) verification run -> post-failure context
+  context build -> verification plan -> (optional) verification run
 
 Does not invoke codex --oss or Ollama. See .codex/skills/test-harness-e2e-oss/SKILL.md
 for the manual OSS smoke step.
@@ -142,26 +142,6 @@ python - "${REPORT_JSON}" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1]))
 assert data["status"] == "failed", data.get("status")
-PY
-
-POST_FAILURE_FRAGMENT="${TMP_ARTIFACTS}/post_failure_fragment.txt"
-"${CODEX_BIN}" context build "${PROMPT}" \
-  --with-verification-report "${REPORT_JSON}" \
-  --changed src/calculator.py \
-  --cwd . \
-  --prompt-fragment >"${POST_FAILURE_FRAGMENT}"
-
-python - "${POST_FAILURE_FRAGMENT}" <<'PY'
-import sys
-text = open(sys.argv[1]).read()
-for needle in (
-    "Verification failed:",
-    "test_assertion_failure",
-    "src/calculator.py",
-    "python -m pytest tests/test_calculator.py",
-):
-    assert needle in text, f"missing {needle!r} in post-failure fragment"
-assert "Dropped:" not in text
 PY
 
 echo "harness-e2e-oss-python: all deterministic checks passed"

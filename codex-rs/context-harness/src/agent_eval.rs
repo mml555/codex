@@ -28,9 +28,6 @@ pub struct AgentEvalTask {
     /// Shell command that must exit 0 for `tests_passed` (e.g. narrow pytest).
     #[serde(default)]
     pub verify_command: Option<String>,
-    /// When true, harness arm should attach post-failure context before the agent run.
-    #[serde(default)]
-    pub requires_post_failure: bool,
     /// Paths that connect areas (CLI ↔ core ↔ harness); scored as `bridge_files_touched`.
     #[serde(default)]
     pub bridge_files: Vec<String>,
@@ -48,8 +45,6 @@ pub struct AgentRunRecord {
     pub changed_files: Vec<String>,
     pub tests_passed: bool,
     pub turn_count: Option<u32>,
-    #[serde(default)]
-    pub used_post_failure: bool,
     #[serde(default)]
     pub exec_exit_code: Option<i32>,
     #[serde(default)]
@@ -116,20 +111,10 @@ pub struct AgentRunScore {
     pub tests_passed: bool,
     pub turn_count: Option<u32>,
     pub unnecessary_files_changed: Vec<String>,
-    pub failure_recovery_quality: FailureRecoveryQuality,
     pub harness_context_visible: bool,
     pub bridge_files_touched: Vec<String>,
     pub run_valid: bool,
     pub invalid_reason: Option<AgentRunInvalidReason>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureRecoveryQuality {
-    NotApplicable,
-    Failed,
-    Partial,
-    Good,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -245,12 +230,6 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         .iter()
         .any(|path| changed.contains(path));
     let unnecessary_files_changed: Vec<String> = changed.difference(&gold).cloned().collect();
-    let failure_recovery_quality = score_failure_recovery(
-        record,
-        task,
-        correct_file_touched,
-        &unnecessary_files_changed,
-    );
 
     let bridge_files_touched: Vec<String> = task
         .bridge_files
@@ -264,38 +243,10 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         tests_passed: record.tests_passed && record.run_valid,
         turn_count: record.turn_count,
         unnecessary_files_changed,
-        failure_recovery_quality,
         harness_context_visible: record.harness_context_visible,
         bridge_files_touched,
         run_valid: record.run_valid,
         invalid_reason: record.invalid_reason,
-    }
-}
-
-fn score_failure_recovery(
-    record: &AgentRunRecord,
-    task: &AgentEvalTask,
-    correct_file_touched: bool,
-    unnecessary: &[String],
-) -> FailureRecoveryQuality {
-    if !record.run_valid {
-        return FailureRecoveryQuality::NotApplicable;
-    }
-    if !task.requires_post_failure {
-        return FailureRecoveryQuality::NotApplicable;
-    }
-    if !record.used_post_failure {
-        return FailureRecoveryQuality::Failed;
-    }
-    if !record.tests_passed {
-        return FailureRecoveryQuality::Failed;
-    }
-    if correct_file_touched && unnecessary.is_empty() {
-        FailureRecoveryQuality::Good
-    } else if correct_file_touched {
-        FailureRecoveryQuality::Partial
-    } else {
-        FailureRecoveryQuality::Failed
     }
 }
 
@@ -414,7 +365,6 @@ impl AgentEvalTask {
             relevant_tests: fixture.relevant_tests.clone(),
             danger_zones: fixture.danger_zones.clone(),
             verify_command: None,
-            requires_post_failure: false,
             bridge_files: fixture.bridge_files.clone(),
             workdir: AgentEvalWorkdir::Calculator,
         }
@@ -493,10 +443,6 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
             "  invalid_reason: vanilla {:?} | {treatment} {:?}",
             row.vanilla.invalid_reason, row.treatment.invalid_reason
         ));
-        lines.push(format!(
-            "  failure_recovery: vanilla {:?} | {treatment} {:?}",
-            row.vanilla.failure_recovery_quality, row.treatment.failure_recovery_quality
-        ));
         lines.push(String::new());
     }
     lines.join("\n")
@@ -524,7 +470,6 @@ mod tests {
             relevant_tests: vec!["tests/test_calculator.py".to_string()],
             danger_zones: Vec::new(),
             verify_command: Some("python -m pytest tests/test_calculator.py".to_string()),
-            requires_post_failure: false,
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::Calculator,
         }
@@ -539,7 +484,6 @@ mod tests {
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(2),
-            used_post_failure: false,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
@@ -554,7 +498,6 @@ mod tests {
                 tests_passed: true,
                 turn_count: Some(2),
                 unnecessary_files_changed: Vec::new(),
-                failure_recovery_quality: FailureRecoveryQuality::NotApplicable,
                 harness_context_visible: false,
                 bridge_files_touched: Vec::new(),
                 run_valid: true,
@@ -576,7 +519,6 @@ mod tests {
             ],
             tests_passed: false,
             turn_count: Some(1),
-            used_post_failure: true,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
@@ -597,7 +539,6 @@ mod tests {
             changed_files: vec!["README.md".to_string()],
             tests_passed: false,
             turn_count: Some(5),
-            used_post_failure: false,
             exec_exit_code: Some(1),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
@@ -623,31 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_good_requires_post_failure_pass_and_minimal_diff() {
-        let mut task = calculator_task();
-        task.requires_post_failure = true;
-        let record = AgentRunRecord {
-            arm: AgentArm::Harness,
-            task_id: task.id.clone(),
-            changed_files: vec!["src/calculator.py".to_string()],
-            tests_passed: true,
-            turn_count: Some(3),
-            used_post_failure: true,
-            exec_exit_code: Some(0),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
-            run_valid: true,
-            invalid_reason: None,
-        };
-        assert_eq!(
-            score_run(&record, &task).failure_recovery_quality,
-            FailureRecoveryQuality::Good
-        );
-    }
-
-    #[test]
     fn repo_intelligence_arm_round_trips() {
-        let json = r#"{"arm":"repo_intelligence","task_id":"t","changed_files":[],"tests_passed":false,"turn_count":null,"used_post_failure":false,"exec_exit_code":null,"harness_context_visible":true}"#;
+        let json = r#"{"arm":"repo_intelligence","task_id":"t","changed_files":[],"tests_passed":false,"turn_count":null,"exec_exit_code":null,"harness_context_visible":true}"#;
         let record: AgentRunRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.arm, AgentArm::RepoIntelligence);
         assert!(record.harness_context_visible);
@@ -680,7 +598,6 @@ mod tests {
             relevant_tests: Vec::new(),
             danger_zones: Vec::new(),
             verify_command: None,
-            requires_post_failure: false,
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::CodexRs,
         };
@@ -690,7 +607,6 @@ mod tests {
             changed_files: vec!["codex-rs/cli/src/context_cmd.rs".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            used_post_failure: false,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
@@ -711,7 +627,6 @@ mod tests {
             relevant_tests: Vec::new(),
             danger_zones: Vec::new(),
             verify_command: None,
-            requires_post_failure: false,
             bridge_files: vec!["cli/src/main.rs".to_string()],
             workdir: AgentEvalWorkdir::CodexRs,
         };
@@ -721,7 +636,6 @@ mod tests {
             changed_files: vec!["codex-rs/cli/src/main.rs".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            used_post_failure: false,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: true,
             harness_context_visible: true,
@@ -748,7 +662,6 @@ mod tests {
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            used_post_failure: false,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: false,
             harness_context_visible: false,
@@ -761,7 +674,6 @@ mod tests {
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            used_post_failure: false,
             exec_exit_code: Some(0),
             repo_intelligence_enabled: true,
             harness_context_visible: true,

@@ -12,7 +12,6 @@ pub enum ContextStage {
     PostInspection,
     PreEdit,
     PostEdit,
-    PostFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

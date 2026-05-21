@@ -84,16 +84,5 @@
     "relevant_files": ["scripts/harness-agent-eval.sh"],
     "bridge_files": ["scripts/harness-agent-eval.sh", "context-harness/src/agent_eval.rs"],
     "verify_command": "cargo test -p codex-context-harness agent_eval -q"
-  },
-  {
-    "id": "post_failure_prompt_format",
-    "workdir": "codex_rs",
-    "task": "adjust post-failure prompt fragment formatting for verification reports",
-    "relevant_files": [
-      "context-harness/src/post_failure.rs",
-      "verification/tests/report_integration.rs"
-    ],
-    "bridge_files": ["context-harness/src/post_failure.rs"],
-    "verify_command": "cargo test -p codex-verification --test report_integration -q"
   }
 ]

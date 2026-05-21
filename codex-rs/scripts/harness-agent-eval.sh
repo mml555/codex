@@ -53,7 +53,7 @@ Artifacts layout:
   ARTIFACTS_DIR/<task_id>/repo_intelligence/record.json   (--session-injection)
 
 Metrics: harness_context_visible, correct file, tests pass, bridge files touched,
-turn count, unnecessary files, failure recovery (when requires_post_failure).
+turn count, unnecessary files.
 EOF
 }
 
@@ -278,11 +278,10 @@ write_record() {
   local changed_json="$4"
   local tests_passed="$5"
   local turn_count="$6"
-  local used_post_failure="$7"
-  local exec_exit="$8"
-  local events="$9"
-  local run_valid="${10}"
-  local invalid_reason="${11}"
+  local exec_exit="$7"
+  local events="$8"
+  local run_valid="$9"
+  local invalid_reason="${10}"
   local repo_intel_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
@@ -290,16 +289,15 @@ write_record() {
     repo_intel_enabled=true
   fi
   mkdir -p "$(dirname "${out}")"
-  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${used_post_failure}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" <<'PY'
+  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" <<'PY'
 import json, sys
-out, arm, task_id, changed_json, tests_passed, turn_count, used_pf, exec_exit, repo_intel, harness_visible, run_valid, invalid_reason = sys.argv[1:13]
+out, arm, task_id, changed_json, tests_passed, turn_count, exec_exit, repo_intel, harness_visible, run_valid, invalid_reason = sys.argv[1:12]
 record = {
     "arm": arm,
     "task_id": task_id,
     "changed_files": json.loads(changed_json),
     "tests_passed": tests_passed == "true",
     "turn_count": int(turn_count) if turn_count not in ("", "null") else None,
-    "used_post_failure": used_pf == "true",
     "exec_exit_code": int(exec_exit) if exec_exit not in ("", "null") else None,
     "repo_intelligence_enabled": repo_intel == "true",
     "harness_context_visible": harness_visible == "true",
@@ -337,8 +335,7 @@ run_arm() {
   local task_id="$2"
   local task_text="$3"
   local verify_cmd="$4"
-  local requires_pf="$5"
-  local workdir_kind="${6:-calculator}"
+  local workdir_kind="${5:-calculator}"
   local workdir
   if [[ "${workdir_kind}" == "codex_rs" ]]; then
     workdir="${CODEX_RS_ROOT}"
@@ -353,30 +350,13 @@ run_arm() {
   fi
 
   local prompt="${task_text}"
-  local used_post_failure=false
-  if [[ "${arm}" == "repo_intelligence" ]]; then
-    prompt="${task_text}"
-  elif [[ "${arm}" == "harness" ]]; then
-    if [[ "${requires_pf}" == "true" ]]; then
-      set +e
-      "${CODEX_BIN}" verification run --changed src/calculator.py --cwd . --yes --json-out /tmp/report.json >/dev/null 2>&1
-      set -e
-      local fragment
-      fragment="$("${CODEX_BIN}" context build "${task_text}" \
-        --with-verification-report /tmp/report.json \
-        --changed src/calculator.py --cwd . --prompt-fragment 2>/dev/null || true)"
-      prompt="${fragment}
+  if [[ "${arm}" == "harness" ]]; then
+    local fragment
+    fragment="$("${CODEX_BIN}" context build "${task_text}" \
+      --changed src/calculator.py --cwd . --prompt-fragment 2>/dev/null || true)"
+    prompt="${fragment}
 
 ${task_text}"
-      used_post_failure=true
-    else
-      local fragment
-      fragment="$("${CODEX_BIN}" context build "${task_text}" \
-        --changed src/calculator.py --cwd . --prompt-fragment 2>/dev/null || true)"
-      prompt="${fragment}
-
-${task_text}"
-    fi
   fi
 
   local events="${ARTIFACTS_DIR}/${task_id}/${arm}/events.jsonl"
@@ -426,7 +406,7 @@ ${task_text}"
     invalid_reason=""
   fi
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
-    "${changed_json}" "${tests_passed}" "${turns}" "${used_post_failure}" "${exec_exit}" "${events}" "${run_valid}" "${invalid_reason}"
+    "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" "${run_valid}" "${invalid_reason}"
   log "arm=${arm} task=${task_id} workdir=${workdir} exit=${exec_exit}"
 }
 
@@ -437,16 +417,15 @@ if [[ -z "${ARTIFACTS_DIR}" ]]; then
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
-  while IFS=$'\t' read -r id task verify requires_pf workdir_kind || [[ -n "${id:-}" ]]; do
+  while IFS=$'\t' read -r id task verify workdir_kind || [[ -n "${id:-}" ]]; do
     [[ -z "${id}" ]] && break
-    requires_pf="${requires_pf:-false}"
     workdir_kind="${workdir_kind:-calculator}"
     if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
+      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${workdir_kind}"
     else
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
-      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
+      run_arm harness "${id}" "${task}" "${verify}" "${workdir_kind}"
     fi
   done < <(python3 - "${TASK_FIXTURE}" <<'PY'
 import json, sys
@@ -456,7 +435,6 @@ for t in tasks:
         t["id"],
         t["task"],
         t.get("verify_command") or "",
-        str(t.get("requires_post_failure", False)).lower(),
         t.get("workdir", "calculator"),
         sep="\t",
     )

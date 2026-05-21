@@ -93,26 +93,4 @@ impl VerificationPlanner {
         build_verification_plan(map, &ctx)
     }
 
-    pub fn failure_retry_packet(
-        task: &str,
-        map: &codex_repo_index::RepoMap,
-        run_memory: &codex_context_harness::RunMemory,
-        failure_output: &str,
-    ) -> codex_context_harness::ContextPacket {
-        use codex_context_harness::BuildPacketOptions;
-        use codex_context_harness::ContextStage;
-        use codex_context_harness::build_context_packet;
-
-        let mut memory = run_memory.clone();
-        memory.failures.push(failure_output.to_string());
-        build_context_packet(
-            task,
-            map,
-            &memory,
-            BuildPacketOptions {
-                stage: ContextStage::PostFailure,
-                ..BuildPacketOptions::default()
-            },
-        )
-    }
 }

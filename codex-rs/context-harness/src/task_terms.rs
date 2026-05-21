@@ -446,15 +446,4 @@ mod tests {
         assert!(terms.likely_areas.iter().any(|area| area == "cli"));
     }
 
-    #[test]
-    fn post_failure_prompt_prefers_context_harness() {
-        let terms = build_task_terms(
-            "adjust post-failure prompt fragment formatting for verification reports",
-            &empty_repo_map(),
-        );
-        assert_eq!(
-            terms.likely_areas.first().map(String::as_str),
-            Some("context-harness")
-        );
-    }
 }
