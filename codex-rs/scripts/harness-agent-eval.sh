@@ -15,7 +15,7 @@ OSS_ARGS=()
 
 usage() {
   cat <<'EOF'
-Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--run] [--verbose] [--oss ...]
+Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH] [--run] [--verbose] [--oss ...]
 
 Compares vanilla Codex vs harness-context Codex on the same tasks (see agent_eval_tasks.json).
 
@@ -41,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       ARTIFACTS_DIR="$2"
       shift 2
       ;;
+    --fixture)
+      TASK_FIXTURE="$2"
+      shift 2
+      ;;
     --run)
       RUN_AGENT=1
       shift
@@ -54,7 +58,7 @@ while [[ $# -gt 0 ]]; do
       shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --codex-bin | --artifacts-dir | --run | --verbose | -h | --help) break ;;
+          --codex-bin | --artifacts-dir | --fixture | --run | --verbose | -h | --help) break ;;
           *)
             OSS_ARGS+=("$1")
             shift
