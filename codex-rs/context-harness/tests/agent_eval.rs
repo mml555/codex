@@ -10,8 +10,8 @@ use codex_context_harness::render_agent_eval_human;
 use pretty_assertions::assert_eq;
 
 fn fixture_tasks() -> Vec<codex_context_harness::AgentEvalTask> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/agent_eval_tasks.json");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_eval_tasks.json");
     load_agent_eval_tasks(&path).expect("fixture tasks")
 }
 

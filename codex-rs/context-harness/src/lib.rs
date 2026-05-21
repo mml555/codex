@@ -3,11 +3,11 @@
 //! Consumes [`codex_repo_index::RepoMap`] and produces [`ContextPacket`] with a
 //! mandatory [`ContextDecisionLog`]. Does not depend on how the map was built.
 
+mod agent_eval;
 mod assembler;
 mod budgeter;
 mod classifier;
 mod decision_log;
-mod agent_eval;
 mod eval;
 mod metrics;
 mod normalize;
@@ -26,13 +26,6 @@ mod task_scope;
 mod task_terms;
 mod test_select;
 
-pub use assembler::ContextAssembler;
-pub use budgeter::ContextBudgeter;
-pub use budgeter::TokenBudget;
-pub use classifier::TaskClassifier;
-pub use classifier::TaskType;
-pub use decision_log::ContextDecisionLog;
-pub use decision_log::DecisionEntry;
 pub use agent_eval::AgentArm;
 pub use agent_eval::AgentEvalComparison;
 pub use agent_eval::AgentEvalReport;
@@ -48,6 +41,13 @@ pub use agent_eval::count_turns_from_exec_jsonl;
 pub use agent_eval::load_agent_eval_tasks;
 pub use agent_eval::render_agent_eval_human;
 pub use agent_eval::score_run;
+pub use assembler::ContextAssembler;
+pub use budgeter::ContextBudgeter;
+pub use budgeter::TokenBudget;
+pub use classifier::TaskClassifier;
+pub use classifier::TaskType;
+pub use decision_log::ContextDecisionLog;
+pub use decision_log::DecisionEntry;
 pub use eval::EvalReport;
 pub use eval::EvalTaskFixture;
 pub use eval::load_eval_fixtures;

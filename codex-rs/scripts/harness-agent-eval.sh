@@ -52,9 +52,14 @@ while [[ $# -gt 0 ]]; do
     --oss)
       OSS_ARGS=(--oss)
       shift
-      while [[ $# -gt 0 && "$1" != --* ]]; do
-        OSS_ARGS+=("$1")
-        shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --codex-bin | --artifacts-dir | --run | --verbose | -h | --help) break ;;
+          *)
+            OSS_ARGS+=("$1")
+            shift
+            ;;
+        esac
       done
       ;;
     -h | --help)
@@ -210,12 +215,14 @@ if [[ -z "${ARTIFACTS_DIR}" ]]; then
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
-  python3 - "${TASK_FIXTURE}" <<'PY' | while IFS=$'\t' read -r id task verify requires_pf; do
+  python3 - "${TASK_FIXTURE}" <<'PY' | while IFS=$'\t' read -r id task verify requires_pf || [[ -n "${id:-}" ]]; do
 import json, sys
 tasks = json.load(open(sys.argv[1], encoding="utf-8"))
 for t in tasks:
     print(t["id"], t["task"], t.get("verify_command") or "", str(t.get("requires_post_failure", False)).lower(), sep="\t")
 PY
+    [[ -z "${id}" ]] && break
+    requires_pf="${requires_pf:-false}"
     run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
     run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}"
   done

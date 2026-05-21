@@ -100,18 +100,44 @@ pub fn load_agent_eval_tasks(path: &Path) -> anyhow::Result<Vec<AgentEvalTask>> 
     Ok(tasks)
 }
 
+/// Paths produced by verification/pytest side effects, not meaningful agent edits.
+pub fn is_agent_eval_noise_path(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return true;
+    }
+    if path.ends_with(".pyc") {
+        return true;
+    }
+    path.split('/')
+        .any(|segment| segment == "__pycache__" || segment == ".pytest_cache")
+}
+
+/// Filter `changed_files` before scoring agent-quality metrics.
+pub fn filter_scoring_changed_files(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !is_agent_eval_noise_path(path))
+        .cloned()
+        .collect()
+}
+
 pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore {
     let gold: BTreeSet<String> = task.relevant_files.iter().cloned().collect();
-    let changed: BTreeSet<String> = record.changed_files.iter().cloned().collect();
+    let changed: BTreeSet<String> = filter_scoring_changed_files(&record.changed_files)
+        .into_iter()
+        .collect();
     let correct_file_touched = task
         .relevant_files
         .iter()
         .any(|path| changed.contains(path));
-    let unnecessary_files_changed: Vec<String> = changed
-        .difference(&gold)
-        .cloned()
-        .collect();
-    let failure_recovery_quality = score_failure_recovery(record, task, correct_file_touched, &unnecessary_files_changed);
+    let unnecessary_files_changed: Vec<String> = changed.difference(&gold).cloned().collect();
+    let failure_recovery_quality = score_failure_recovery(
+        record,
+        task,
+        correct_file_touched,
+        &unnecessary_files_changed,
+    );
 
     AgentRunScore {
         correct_file_touched,
@@ -292,6 +318,27 @@ mod tests {
     }
 
     #[test]
+    fn ignores_python_cache_artifacts_in_scoring() {
+        let task = calculator_task();
+        let record = AgentRunRecord {
+            arm: AgentArm::Harness,
+            task_id: task.id.clone(),
+            changed_files: vec![
+                "src/__pycache__/calculator.cpython-313.pyc".to_string(),
+                "tests/__pycache__/test_calculator.cpython-313-pytest-9.0.0.pyc".to_string(),
+                ".pytest_cache/v/cache/nodeids".to_string(),
+            ],
+            tests_passed: false,
+            turn_count: Some(1),
+            used_post_failure: true,
+            exec_exit_code: Some(0),
+        };
+        let score = score_run(&record, &task);
+        assert_eq!(score.correct_file_touched, false);
+        assert_eq!(score.unnecessary_files_changed, Vec::<String>::new());
+    }
+
+    #[test]
     fn scores_unnecessary_files_and_no_touch() {
         let task = calculator_task();
         let record = AgentRunRecord {
@@ -305,7 +352,10 @@ mod tests {
         };
         let score = score_run(&record, &task);
         assert_eq!(score.correct_file_touched, false);
-        assert_eq!(score.unnecessary_files_changed, vec!["README.md".to_string()]);
+        assert_eq!(
+            score.unnecessary_files_changed,
+            vec!["README.md".to_string()]
+        );
     }
 
     #[test]
