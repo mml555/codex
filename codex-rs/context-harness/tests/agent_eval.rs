@@ -36,6 +36,8 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
         turn_count: Some(4),
         used_post_failure: false,
         exec_exit_code: Some(1),
+        repo_intelligence_enabled: false,
+        harness_context_visible: false,
     };
     let harness = AgentRunRecord {
         arm: AgentArm::Harness,
@@ -45,11 +47,17 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
         turn_count: Some(2),
         used_post_failure: false,
         exec_exit_code: Some(0),
+        repo_intelligence_enabled: false,
+        harness_context_visible: false,
     };
     let row = compare_task(task, &vanilla, &harness);
+    assert_eq!(row.treatment_arm, AgentArm::Harness);
     assert_eq!(row.vanilla.tests_passed, false);
-    assert_eq!(row.harness.tests_passed, true);
-    assert_eq!(row.harness.unnecessary_files_changed, Vec::<String>::new());
+    assert_eq!(row.treatment.tests_passed, true);
+    assert_eq!(
+        row.treatment.unnecessary_files_changed,
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -64,6 +72,8 @@ fn report_renders_human_summary() {
         turn_count: Some(3),
         used_post_failure: false,
         exec_exit_code: Some(1),
+        repo_intelligence_enabled: false,
+        harness_context_visible: false,
     };
     let harness = AgentRunRecord {
         arm: AgentArm::Harness,
@@ -73,12 +83,27 @@ fn report_renders_human_summary() {
         turn_count: Some(2),
         used_post_failure: true,
         exec_exit_code: Some(0),
+        repo_intelligence_enabled: false,
+        harness_context_visible: false,
     };
     let report = build_report(vec![compare_task(task, &vanilla, &harness)]);
     let text = render_agent_eval_human(&report);
     assert!(text.contains("calculator_recovery"));
     assert_eq!(
-        report.comparisons[0].harness.failure_recovery_quality,
+        report.comparisons[0].treatment.failure_recovery_quality,
         FailureRecoveryQuality::Good
+    );
+}
+
+#[test]
+fn codex_session_fixture_loads() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/agent_eval_tasks_codex_session.json");
+    let tasks = load_agent_eval_tasks(&path).expect("codex session fixture");
+    assert!(tasks.len() >= 5);
+    assert!(
+        tasks
+            .iter()
+            .all(|t| matches!(t.workdir, codex_context_harness::AgentEvalWorkdir::CodexRs))
     );
 }

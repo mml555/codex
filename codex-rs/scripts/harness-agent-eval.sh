@@ -5,7 +5,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_RS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FIXTURE_SRC="${CODEX_RS_ROOT}/context-harness/tests/fixtures/e2e_python_calculator"
-TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks.json"
+CALCULATOR_TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks.json"
+CODEX_SESSION_TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks_codex_session.json"
+TASK_FIXTURE="${CALCULATOR_TASK_FIXTURE}"
+FIXTURE_EXPLICIT=0
 
 CODEX_BIN=""
 ARTIFACTS_DIR=""
@@ -18,17 +21,23 @@ usage() {
   cat <<'EOF'
 Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH] [--run] [--session-injection] [--verbose] [--oss ...]
 
-Compares vanilla Codex vs harness-context Codex on the same tasks (see agent_eval_tasks.json).
+Compares vanilla Codex vs treatment Codex on the same tasks.
+
+Default fixture: agent_eval_tasks.json (calculator sandbox).
+--session-injection: vanilla vs repo_intelligence (-c features.repo_intelligence=true)
+  with agent_eval_tasks_codex_session.json unless --fixture is set.
+Without --session-injection: vanilla vs harness (manual context build prefix).
 
 Without --run: scores existing artifacts only (requires record.json per task/arm).
 With --run: executes both arms via `codex exec --json` (needs a working model provider).
 
 Artifacts layout:
   ARTIFACTS_DIR/<task_id>/vanilla/record.json
-  ARTIFACTS_DIR/<task_id>/harness/record.json
+  ARTIFACTS_DIR/<task_id>/harness/record.json   (manual prefix arm)
+  ARTIFACTS_DIR/<task_id>/repo_intelligence/record.json   (--session-injection)
 
-Metrics: correct file touched, tests pass, turn count, unnecessary files changed,
-failure recovery quality (when requires_post_failure).
+Metrics: harness_context_visible, correct file, tests pass, bridge files touched,
+turn count, unnecessary files, failure recovery (when requires_post_failure).
 EOF
 }
 
@@ -44,6 +53,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --fixture)
       TASK_FIXTURE="$2"
+      FIXTURE_EXPLICIT=1
       shift 2
       ;;
     --run)
@@ -82,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${SESSION_INJECTION}" -eq 1 && "${FIXTURE_EXPLICIT}" -eq 0 ]]; then
+  TASK_FIXTURE="${CODEX_SESSION_TASK_FIXTURE}"
+fi
 
 log() {
   if [[ "${VERBOSE}" -eq 1 ]]; then
@@ -229,13 +243,19 @@ run_arm() {
   local task_text="$3"
   local verify_cmd="$4"
   local requires_pf="$5"
+  local workdir_kind="${6:-calculator}"
   local workdir
-  workdir="$(mktemp -d)"
-  cp -R "${FIXTURE_SRC}/." "${workdir}/"
-  cd "${workdir}"
-  git init -q
-  git add -A
-  git commit -q -m initial
+  if [[ "${workdir_kind}" == "codex_rs" ]]; then
+    workdir="${CODEX_RS_ROOT}"
+    cd "${workdir}"
+  else
+    workdir="$(mktemp -d)"
+    cp -R "${FIXTURE_SRC}/." "${workdir}/"
+    cd "${workdir}"
+    git init -q
+    git add -A
+    git commit -q -m initial
+  fi
 
   local prompt="${task_text}"
   local used_post_failure=false
@@ -313,33 +333,37 @@ if [[ -z "${ARTIFACTS_DIR}" ]]; then
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
-  python3 - "${TASK_FIXTURE}" <<'PY' | while IFS=$'\t' read -r id task verify requires_pf || [[ -n "${id:-}" ]]; do
+  python3 - "${TASK_FIXTURE}" <<'PY' | while IFS=$'\t' read -r id task verify requires_pf workdir_kind || [[ -n "${id:-}" ]]; do
 import json, sys
 tasks = json.load(open(sys.argv[1], encoding="utf-8"))
 for t in tasks:
-    print(t["id"], t["task"], t.get("verify_command") or "", str(t.get("requires_post_failure", False)).lower(), sep="\t")
+    print(
+        t["id"],
+        t["task"],
+        t.get("verify_command") or "",
+        str(t.get("requires_post_failure", False)).lower(),
+        t.get("workdir", "calculator"),
+        sep="\t",
+    )
 PY
     [[ -z "${id}" ]] && break
     requires_pf="${requires_pf:-false}"
+    workdir_kind="${workdir_kind:-calculator}"
     if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
-      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}"
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm repo_intelligence "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
     else
-      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}"
-      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}"
+      run_arm vanilla "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
+      run_arm harness "${id}" "${task}" "${verify}" "${requires_pf}" "${workdir_kind}"
     fi
   done
 fi
 
+SCORE_ARGS=(--fixture "${TASK_FIXTURE}" --artifacts-dir "${ARTIFACTS_DIR}" --human)
 if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
-  echo "session-injection run complete (compare vanilla vs repo_intelligence artifacts manually)"
-  echo "artifacts_dir: ${ARTIFACTS_DIR}"
-  exit 0
+  SCORE_ARGS+=(--treatment-arm repo_intelligence)
 fi
 
-"${CODEX_BIN}" context agent-eval score \
-  --fixture "${TASK_FIXTURE}" \
-  --artifacts-dir "${ARTIFACTS_DIR}" \
-  --human
+"${CODEX_BIN}" context agent-eval score "${SCORE_ARGS[@]}"
 
 echo "artifacts_dir: ${ARTIFACTS_DIR}"

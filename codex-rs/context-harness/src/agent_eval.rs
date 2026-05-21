@@ -30,6 +30,12 @@ pub struct AgentEvalTask {
     /// When true, harness arm should attach post-failure context before the agent run.
     #[serde(default)]
     pub requires_post_failure: bool,
+    /// Paths that connect areas (CLI ↔ core ↔ harness); scored as `bridge_files_touched`.
+    #[serde(default)]
+    pub bridge_files: Vec<String>,
+    /// `calculator` copies the Python E2E fixture; `codex_rs` runs in the codex-rs tree.
+    #[serde(default)]
+    pub workdir: AgentEvalWorkdir,
 }
 
 /// Recorded outcome of one agent run (vanilla or harness-context).
@@ -45,6 +51,18 @@ pub struct AgentRunRecord {
     pub used_post_failure: bool,
     #[serde(default)]
     pub exec_exit_code: Option<i32>,
+    #[serde(default)]
+    pub repo_intelligence_enabled: bool,
+    #[serde(default)]
+    pub harness_context_visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEvalWorkdir {
+    #[default]
+    Calculator,
+    CodexRs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +70,21 @@ pub struct AgentRunRecord {
 pub enum AgentArm {
     Vanilla,
     Harness,
+    RepoIntelligence,
+}
+
+impl AgentArm {
+    pub fn artifact_dir(self) -> &'static str {
+        match self {
+            Self::Vanilla => "vanilla",
+            Self::Harness => "harness",
+            Self::RepoIntelligence => "repo_intelligence",
+        }
+    }
+
+    pub fn display_label(self) -> &'static str {
+        self.artifact_dir()
+    }
 }
 
 /// Per-run scores on the five comparison dimensions.
@@ -63,6 +96,8 @@ pub struct AgentRunScore {
     pub turn_count: Option<u32>,
     pub unnecessary_files_changed: Vec<String>,
     pub failure_recovery_quality: FailureRecoveryQuality,
+    pub harness_context_visible: bool,
+    pub bridge_files_touched: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +115,9 @@ pub struct AgentEvalComparison {
     pub task_id: String,
     pub task: String,
     pub vanilla: AgentRunScore,
-    pub harness: AgentRunScore,
+    #[serde(alias = "harness")]
+    pub treatment: AgentRunScore,
+    pub treatment_arm: AgentArm,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,12 +176,21 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         &unnecessary_files_changed,
     );
 
+    let bridge_files_touched: Vec<String> = task
+        .bridge_files
+        .iter()
+        .filter(|path| changed.contains(*path))
+        .cloned()
+        .collect();
+
     AgentRunScore {
         correct_file_touched,
         tests_passed: record.tests_passed,
         turn_count: record.turn_count,
         unnecessary_files_changed,
         failure_recovery_quality,
+        harness_context_visible: record.harness_context_visible,
+        bridge_files_touched,
     }
 }
 
@@ -175,13 +221,14 @@ fn score_failure_recovery(
 pub fn compare_task(
     task: &AgentEvalTask,
     vanilla: &AgentRunRecord,
-    harness: &AgentRunRecord,
+    treatment: &AgentRunRecord,
 ) -> AgentEvalComparison {
     AgentEvalComparison {
         task_id: task.id.clone(),
         task: task.task.clone(),
         vanilla: score_run(vanilla, task),
-        harness: score_run(harness, task),
+        treatment: score_run(treatment, task),
+        treatment_arm: treatment.arm,
     }
 }
 
@@ -236,6 +283,8 @@ impl AgentEvalTask {
             danger_zones: fixture.danger_zones.clone(),
             verify_command: None,
             requires_post_failure: false,
+            bridge_files: fixture.bridge_files.clone(),
+            workdir: AgentEvalWorkdir::Calculator,
         }
     }
 }
@@ -243,36 +292,58 @@ impl AgentEvalTask {
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
     let mut lines = Vec::new();
     for row in &report.comparisons {
+        let treatment = row.treatment_arm.display_label();
         lines.push(format!("Task: {} ({})", row.task_id, row.task));
+        lines.push(format!(
+            "  treatment_arm: {}",
+            row.treatment_arm.display_label()
+        ));
         lines.push(format_dimension_row(
             "correct_file_touched",
             row.vanilla.correct_file_touched,
-            row.harness.correct_file_touched,
+            row.treatment.correct_file_touched,
+            treatment,
         ));
         lines.push(format_dimension_row(
             "tests_passed",
             row.vanilla.tests_passed,
-            row.harness.tests_passed,
+            row.treatment.tests_passed,
+            treatment,
+        ));
+        lines.push(format_dimension_row(
+            "harness_context_visible",
+            row.vanilla.harness_context_visible,
+            row.treatment.harness_context_visible,
+            treatment,
         ));
         lines.push(format!(
-            "  turn_count: vanilla {:?} | harness {:?}",
-            row.vanilla.turn_count, row.harness.turn_count
+            "  turn_count: vanilla {:?} | {treatment} {:?}",
+            row.vanilla.turn_count, row.treatment.turn_count
         ));
         lines.push(format!(
-            "  unnecessary_files: vanilla {:?} | harness {:?}",
-            row.vanilla.unnecessary_files_changed, row.harness.unnecessary_files_changed
+            "  unnecessary_files: vanilla {:?} | {treatment} {:?}",
+            row.vanilla.unnecessary_files_changed, row.treatment.unnecessary_files_changed
         ));
         lines.push(format!(
-            "  failure_recovery: vanilla {:?} | harness {:?}",
-            row.vanilla.failure_recovery_quality, row.harness.failure_recovery_quality
+            "  bridge_files_touched: vanilla {:?} | {treatment} {:?}",
+            row.vanilla.bridge_files_touched, row.treatment.bridge_files_touched
+        ));
+        lines.push(format!(
+            "  failure_recovery: vanilla {:?} | {treatment} {:?}",
+            row.vanilla.failure_recovery_quality, row.treatment.failure_recovery_quality
         ));
         lines.push(String::new());
     }
     lines.join("\n")
 }
 
-fn format_dimension_row(name: &str, vanilla: bool, harness: bool) -> String {
-    format!("  {name}: vanilla {vanilla} | harness {harness}")
+fn format_dimension_row(
+    name: &str,
+    vanilla: bool,
+    treatment: bool,
+    treatment_label: &str,
+) -> String {
+    format!("  {name}: vanilla {vanilla} | {treatment_label} {treatment}")
 }
 
 #[cfg(test)]
@@ -289,6 +360,8 @@ mod tests {
             danger_zones: Vec::new(),
             verify_command: Some("python -m pytest tests/test_calculator.py".to_string()),
             requires_post_failure: false,
+            bridge_files: Vec::new(),
+            workdir: AgentEvalWorkdir::Calculator,
         }
     }
 
@@ -303,6 +376,8 @@ mod tests {
             turn_count: Some(2),
             used_post_failure: false,
             exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
         };
         let score = score_run(&record, &task);
         assert_eq!(
@@ -313,6 +388,8 @@ mod tests {
                 turn_count: Some(2),
                 unnecessary_files_changed: Vec::new(),
                 failure_recovery_quality: FailureRecoveryQuality::NotApplicable,
+                harness_context_visible: false,
+                bridge_files_touched: Vec::new(),
             }
         );
     }
@@ -332,6 +409,8 @@ mod tests {
             turn_count: Some(1),
             used_post_failure: true,
             exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.correct_file_touched, false);
@@ -349,6 +428,8 @@ mod tests {
             turn_count: Some(5),
             used_post_failure: false,
             exec_exit_code: Some(1),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.correct_file_touched, false);
@@ -380,10 +461,20 @@ mod tests {
             turn_count: Some(3),
             used_post_failure: true,
             exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
         };
         assert_eq!(
             score_run(&record, &task).failure_recovery_quality,
             FailureRecoveryQuality::Good
         );
+    }
+
+    #[test]
+    fn repo_intelligence_arm_round_trips() {
+        let json = r#"{"arm":"repo_intelligence","task_id":"t","changed_files":[],"tests_passed":false,"turn_count":null,"used_post_failure":false,"exec_exit_code":null,"harness_context_visible":true}"#;
+        let record: AgentRunRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.arm, AgentArm::RepoIntelligence);
+        assert!(record.harness_context_visible);
     }
 }

@@ -22,7 +22,8 @@ codex context agent-eval score \
 
 ```text
 {artifacts_dir}/{task_id}/vanilla/record.json
-{artifacts_dir}/{task_id}/harness/record.json
+{artifacts_dir}/{task_id}/harness/record.json          # manual context prefix arm
+{artifacts_dir}/{task_id}/repo_intelligence/record.json # session injection arm
 ```
 
 Each `record.json`:
@@ -35,7 +36,9 @@ Each `record.json`:
   "tests_passed": true,
   "turn_count": 2,
   "used_post_failure": false,
-  "exec_exit_code": 0
+  "exec_exit_code": 0,
+  "harness_context_visible": true,
+  "repo_intelligence_enabled": true
 }
 ```
 
@@ -52,8 +55,12 @@ lines in `codex exec --json` JSONL (optional `events.jsonl` beside `record.json`
 | Turn count | `turn_count` |
 | Unnecessary files changed | `changed_files` − `gold_files` |
 | Failure recovery quality | For `requires_post_failure` tasks: `not_applicable` / `failed` / `partial` / `good` |
+| Harness context visible | `harness_context_visible` (rollout probe; must be true for repo_intelligence arms) |
+| Bridge files touched | `bridge_files` from fixture ∩ `changed_files` |
 
-Tasks: `context-harness/tests/fixtures/agent_eval_tasks.json` (`calculator_fix`, `calculator_recovery`).
+Tasks:
+- Calculator sandbox: `context-harness/tests/fixtures/agent_eval_tasks.json`
+- Real codex-rs tasks: `context-harness/tests/fixtures/agent_eval_tasks_codex_session.json`
 
 ## Optional runner (manual / OSS)
 
@@ -66,7 +73,16 @@ cd codex-rs
   --oss --local-provider ollama -m qwen2.5-coder:7b
 ```
 
+Session injection (vanilla vs `repo_intelligence=true`, scores automatically):
+
+```bash
+cd codex-rs
+./scripts/harness-agent-eval.sh --verbose --run --session-injection \
+  --artifacts-dir /tmp/harness-agent-eval-session-real
+```
+
 Without `--run`, the script only scores existing artifacts (same as `agent-eval score`).
+Treatment arm auto-detects `repo_intelligence` vs `harness` from artifact layout.
 
 ## Scorecard (5–10 runs)
 

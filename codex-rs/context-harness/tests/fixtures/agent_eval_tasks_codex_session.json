@@ -1,0 +1,99 @@
+[
+  {
+    "id": "context_diff_prompt",
+    "workdir": "codex_rs",
+    "task": "make context diff-prompt self-contained without env vars",
+    "relevant_files": [
+      "cli/src/context_cmd.rs",
+      "core/src/prompt_debug.rs",
+      "context-harness/src/prompt_paths.rs"
+    ],
+    "bridge_files": [
+      "cli/src/context_cmd.rs",
+      "core/src/prompt_debug.rs"
+    ],
+    "verify_command": "cargo check -p codex-cli -q"
+  },
+  {
+    "id": "context_harness_eval_cmd",
+    "workdir": "codex_rs",
+    "task": "add codex context-harness eval command with fixture metrics",
+    "relevant_files": [
+      "cli/src/context_cmd.rs",
+      "context-harness/src/eval.rs",
+      "context-harness/src/metrics.rs"
+    ],
+    "bridge_files": ["cli/src/context_cmd.rs"],
+    "relevant_tests": ["context-harness/tests/eval_codex_fixtures.rs"],
+    "verify_command": "cargo test -p codex-context-harness eval_codex_fixtures -- --nocapture -q"
+  },
+  {
+    "id": "repo_intelligence_extension",
+    "workdir": "codex_rs",
+    "task": "wire repo intelligence extension into session prompt assembly",
+    "relevant_files": [
+      "ext/repo-intelligence/src/extension.rs",
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "bridge_files": [
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "relevant_tests": ["ext/repo-intelligence/tests/contributor_injection.rs"],
+    "verify_command": "cargo test -p codex-repo-intelligence-extension -q"
+  },
+  {
+    "id": "renderer_prompt_fragment",
+    "workdir": "codex_rs",
+    "task": "improve context packet prompt fragment rendering for models",
+    "relevant_files": [
+      "context-harness/src/renderer.rs",
+      "context-harness/tests/packet_golden.rs"
+    ],
+    "bridge_files": [],
+    "relevant_tests": ["context-harness/tests/packet_golden.rs"],
+    "verify_command": "cargo test -p codex-context-harness packet_golden -q"
+  },
+  {
+    "id": "verification_pytest_safety",
+    "workdir": "codex_rs",
+    "task": "tighten verification pytest command safety for narrow test targets",
+    "relevant_files": [
+      "verification/src/python_rules.rs",
+      "verification/src/command_exec.rs"
+    ],
+    "bridge_files": ["verification/src/command_exec.rs"],
+    "verify_command": "cargo test -p codex-verification --test plan_python -q"
+  },
+  {
+    "id": "agent_eval_scoring",
+    "workdir": "codex_rs",
+    "task": "extend agent-eval scoring to support repo_intelligence session-injection arms",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs",
+      "cli/src/context_agent_eval_cmd.rs"
+    ],
+    "bridge_files": ["cli/src/context_agent_eval_cmd.rs"],
+    "verify_command": "cargo test -p codex-context-harness agent_eval -q"
+  },
+  {
+    "id": "harness_eval_runner_flag",
+    "workdir": "codex_rs",
+    "task": "document harness-agent-eval session-injection mode and codex_rs workdir in the runner script",
+    "relevant_files": ["scripts/harness-agent-eval.sh"],
+    "bridge_files": ["scripts/harness-agent-eval.sh", "context-harness/src/agent_eval.rs"],
+    "verify_command": "cargo test -p codex-context-harness agent_eval -q"
+  },
+  {
+    "id": "post_failure_prompt_format",
+    "workdir": "codex_rs",
+    "task": "adjust post-failure prompt fragment formatting for verification reports",
+    "relevant_files": [
+      "context-harness/src/post_failure.rs",
+      "verification/tests/report_integration.rs"
+    ],
+    "bridge_files": ["context-harness/src/post_failure.rs"],
+    "verify_command": "cargo test -p codex-verification --test report_integration -q"
+  }
+]

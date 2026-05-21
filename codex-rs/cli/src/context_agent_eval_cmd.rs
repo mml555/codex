@@ -35,9 +35,12 @@ pub struct ContextAgentEvalScoreCommand {
     /// Task fixture (same tasks for both arms).
     #[arg(long)]
     pub fixture: PathBuf,
-    /// Directory with `{task_id}/vanilla/record.json` and `{task_id}/harness/record.json`.
+    /// Directory with `{task_id}/vanilla/record.json` and treatment arm `record.json`.
     #[arg(long)]
     pub artifacts_dir: PathBuf,
+    /// Treatment arm: `harness` (manual prefix) or `repo_intelligence` (session injection).
+    #[arg(long)]
+    pub treatment_arm: Option<String>,
     #[arg(long)]
     pub human: bool,
     #[arg(long)]
@@ -53,23 +56,69 @@ pub async fn run_context_agent_eval(command: ContextAgentEvalCli) -> Result<()> 
 async fn run_agent_eval_score(cmd: ContextAgentEvalScoreCommand) -> Result<()> {
     let tasks = load_agent_eval_tasks(&cmd.fixture)?;
     let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
-    validate_artifacts_layout(&cmd.artifacts_dir, &task_ids)?;
+    let treatment_arm = resolve_treatment_arm(&cmd, &task_ids)?;
+    validate_artifacts_layout(&cmd.artifacts_dir, &task_ids, treatment_arm)?;
     let mut comparisons = Vec::new();
     for task in &tasks {
         let vanilla = load_run_record(&cmd.artifacts_dir, &task.id, AgentArm::Vanilla)?;
-        let harness = load_run_record(&cmd.artifacts_dir, &task.id, AgentArm::Harness)?;
-        comparisons.push(compare_task(task, &vanilla, &harness));
+        let treatment = load_run_record(&cmd.artifacts_dir, &task.id, treatment_arm)?;
+        comparisons.push(compare_task(task, &vanilla, &treatment));
     }
     let report = build_report(comparisons);
     emit_report(&cmd, &report)
 }
 
-fn load_run_record(base: &Path, task_id: &str, arm: AgentArm) -> Result<AgentRunRecord> {
-    let arm_dir = match arm {
-        AgentArm::Vanilla => "vanilla",
-        AgentArm::Harness => "harness",
+fn resolve_treatment_arm(
+    cmd: &ContextAgentEvalScoreCommand,
+    task_ids: &[String],
+) -> Result<AgentArm> {
+    if let Some(ref name) = cmd.treatment_arm {
+        return parse_treatment_arm(name);
+    }
+    detect_treatment_arm(&cmd.artifacts_dir, task_ids)
+}
+
+fn parse_treatment_arm(name: &str) -> Result<AgentArm> {
+    match name {
+        "harness" => Ok(AgentArm::Harness),
+        "repo_intelligence" => Ok(AgentArm::RepoIntelligence),
+        other => {
+            bail!("unknown treatment arm {other:?}; expected \"harness\" or \"repo_intelligence\"")
+        }
+    }
+}
+
+fn detect_treatment_arm(artifacts_dir: &Path, task_ids: &[String]) -> Result<AgentArm> {
+    let Some(task_id) = task_ids.first() else {
+        bail!("fixture has no tasks");
     };
-    let path = base.join(task_id).join(arm_dir).join("record.json");
+    let repo_intel = artifacts_dir
+        .join(task_id)
+        .join(AgentArm::RepoIntelligence.artifact_dir())
+        .join("record.json");
+    if repo_intel.is_file() {
+        return Ok(AgentArm::RepoIntelligence);
+    }
+    let harness = artifacts_dir
+        .join(task_id)
+        .join(AgentArm::Harness.artifact_dir())
+        .join("record.json");
+    if harness.is_file() {
+        return Ok(AgentArm::Harness);
+    }
+    bail!(
+        "could not detect treatment arm under {}; expected {} or {}",
+        artifacts_dir.display(),
+        AgentArm::RepoIntelligence.artifact_dir(),
+        AgentArm::Harness.artifact_dir()
+    );
+}
+
+fn load_run_record(base: &Path, task_id: &str, arm: AgentArm) -> Result<AgentRunRecord> {
+    let path = base
+        .join(task_id)
+        .join(arm.artifact_dir())
+        .join("record.json");
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
@@ -88,10 +137,17 @@ fn emit_report(cmd: &ContextAgentEvalScoreCommand, report: &AgentEvalReport) -> 
     Ok(())
 }
 
-pub fn validate_artifacts_layout(artifacts_dir: &Path, task_ids: &[String]) -> Result<()> {
+pub fn validate_artifacts_layout(
+    artifacts_dir: &Path,
+    task_ids: &[String],
+    treatment_arm: AgentArm,
+) -> Result<()> {
     for task_id in task_ids {
-        for arm in ["vanilla", "harness"] {
-            let path = artifacts_dir.join(task_id).join(arm).join("record.json");
+        for arm in [AgentArm::Vanilla, treatment_arm] {
+            let path = artifacts_dir
+                .join(task_id)
+                .join(arm.artifact_dir())
+                .join("record.json");
             if !path.is_file() {
                 bail!("missing artifact: {}", path.display());
             }

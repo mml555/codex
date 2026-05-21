@@ -30,6 +30,7 @@ pub use agent_eval::AgentArm;
 pub use agent_eval::AgentEvalComparison;
 pub use agent_eval::AgentEvalReport;
 pub use agent_eval::AgentEvalTask;
+pub use agent_eval::AgentEvalWorkdir;
 pub use agent_eval::AgentRunRecord;
 pub use agent_eval::AgentRunScore;
 pub use agent_eval::FailureRecoveryQuality;
