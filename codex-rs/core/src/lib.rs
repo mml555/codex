@@ -70,6 +70,8 @@ pub(crate) mod prompt_debug;
 #[doc(hidden)]
 pub use prompt_debug::build_prompt_input;
 #[doc(hidden)]
+pub use prompt_debug::build_prompt_input_with_extensions;
+#[doc(hidden)]
 pub use prompt_debug::build_prompt_input_self_contained;
 pub(crate) mod mentions {
     pub(crate) use crate::plugins::build_connector_slug_counts;

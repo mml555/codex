@@ -27,6 +27,13 @@ where
     Arc::new(builder.build())
 }
 
+/// Builds the prompt-only extension registry used by debug prompt assembly.
+pub fn repo_intelligence_prompt_extensions() -> Arc<ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    codex_repo_intelligence_extension::install(&mut builder);
+    Arc::new(builder.build())
+}
+
 pub(crate) fn guardian_agent_spawner(
     thread_manager: Weak<ThreadManager>,
 ) -> impl AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> {

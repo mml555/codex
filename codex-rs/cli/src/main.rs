@@ -1735,7 +1735,13 @@ async fn run_debug_prompt_input_command(
         });
     }
 
-    let prompt_input = codex_core::build_prompt_input(config, input, /*state_db*/ None).await?;
+    let prompt_input = codex_core::build_prompt_input_with_extensions(
+        config,
+        input,
+        /*state_db*/ None,
+        codex_app_server::repo_intelligence_prompt_extensions(),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&prompt_input)?);
 
     Ok(())

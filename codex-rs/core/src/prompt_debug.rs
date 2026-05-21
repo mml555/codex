@@ -19,14 +19,26 @@ use crate::session::turn::built_tools;
 use crate::state_db_bridge::StateDbHandle;
 use crate::thread_manager::ThreadManager;
 use crate::thread_manager::thread_store_from_config;
+use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::empty_extension_registry;
 
 /// Build the model-visible `input` list for a single debug turn.
 #[doc(hidden)]
 pub async fn build_prompt_input(
+    config: Config,
+    input: Vec<UserInput>,
+    state_db: Option<StateDbHandle>,
+) -> CodexResult<Vec<ResponseItem>> {
+    build_prompt_input_with_extensions(config, input, state_db, empty_extension_registry()).await
+}
+
+/// Build the model-visible `input` list for a single debug turn with extensions.
+#[doc(hidden)]
+pub async fn build_prompt_input_with_extensions(
     mut config: Config,
     input: Vec<UserInput>,
     state_db: Option<StateDbHandle>,
+    extensions: Arc<ExtensionRegistry<Config>>,
 ) -> CodexResult<Vec<ResponseItem>> {
     config.ephemeral = true;
 
@@ -40,7 +52,14 @@ pub async fn build_prompt_input(
             .map_err(|err| CodexErr::Fatal(err.to_string()))?,
     );
 
-    build_prompt_input_with_environment_manager(config, input, state_db, environment_manager).await
+    build_prompt_input_with_environment_manager(
+        config,
+        input,
+        state_db,
+        environment_manager,
+        extensions,
+    )
+    .await
 }
 
 /// Build prompt input without reading configured execution environments or API key env vars.
@@ -53,7 +72,14 @@ pub async fn build_prompt_input_self_contained(
     config.ephemeral = true;
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
 
-    build_prompt_input_with_environment_manager(config, input, state_db, environment_manager).await
+    build_prompt_input_with_environment_manager(
+        config,
+        input,
+        state_db,
+        environment_manager,
+        empty_extension_registry(),
+    )
+    .await
 }
 
 async fn build_prompt_input_with_environment_manager(
@@ -61,6 +87,7 @@ async fn build_prompt_input_with_environment_manager(
     input: Vec<UserInput>,
     state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
+    extensions: Arc<ExtensionRegistry<Config>>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
@@ -72,7 +99,7 @@ async fn build_prompt_input_with_environment_manager(
         Arc::clone(&auth_manager),
         SessionSource::Exec,
         environment_manager,
-        empty_extension_registry(),
+        extensions,
         /*analytics_events_client*/ None,
         thread_store,
         state_db.clone(),
@@ -94,6 +121,9 @@ pub(crate) async fn build_prompt_input_from_session(
     input: Vec<UserInput>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
+    sess.services
+        .extensions
+        .prepare_turn_input(&sess.services.thread_extension_data, &input);
     sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 
