@@ -33,6 +33,15 @@ const CONTEXT_SUBCOMMANDS: &[(&str, &str, &[&str])] = &[
         ],
     ),
     (
+        "agent-eval",
+        "context-harness",
+        &[
+            "context-harness/src/agent_eval.rs",
+            "cli/src/context_agent_eval_cmd.rs",
+            "scripts/harness-agent-eval.sh",
+        ],
+    ),
+    (
         "smoke",
         "context-harness",
         &["context-harness/src/prompt_visibility.rs"],
@@ -107,7 +116,45 @@ pub fn match_command_from_task<'a>(
             if best.is_none_or(|(_, best_len)| len > best_len) {
                 best = Some((entry, len));
             }
+            continue;
+        }
+        // `agent-eval` tasks often omit the `context` qualifier but still
+        // clearly refer to the command family.
+        if subcommand.contains('-') && lower.contains(subcommand) {
+            let len = subcommand.len();
+            if best.is_none_or(|(_, best_len)| len > best_len) {
+                best = Some((entry, len));
+            }
         }
     }
     best.map(|(entry, _)| entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(command: &str) -> CommandMapEntry {
+        CommandMapEntry {
+            command: command.to_string(),
+            entrypoint: CONTEXT_CMD_PATH.to_string(),
+            implementation_area: "context-harness".to_string(),
+            related_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn matches_agent_eval_without_context_prefix() {
+        let commands = vec![command("context eval"), command("context agent-eval")];
+        let matched =
+            match_command_from_task("extend agent-eval scoring output", &commands).unwrap();
+        assert_eq!(matched.command, "context agent-eval");
+    }
+
+    #[test]
+    fn prefers_longer_specific_command_match() {
+        let commands = vec![command("context eval"), command("context agent-eval")];
+        let matched = match_command_from_task("run context agent-eval score", &commands).unwrap();
+        assert_eq!(matched.command, "context agent-eval");
+    }
 }

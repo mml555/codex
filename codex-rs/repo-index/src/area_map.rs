@@ -11,7 +11,14 @@ const AREA_CLI_BRIDGES: &[(&str, &[&str])] = &[
         "repo-index",
         &["cli/src/context_cmd.rs", "repo-index/src/builder.rs"],
     ),
-    ("ext/repo-intelligence", &["app-server/src/extensions.rs"]),
+    (
+        "ext/repo-intelligence",
+        &[
+            "app-server/src/extensions.rs",
+            "core/src/session/turn.rs",
+            "ext/extension-api/src/contributors/turn_input.rs",
+        ],
+    ),
 ];
 
 pub fn build_area_maps(paths: &[String]) -> Vec<AreaMap> {

@@ -28,9 +28,13 @@ const PENALTY_PATH_MARKERS: &[&str] = &[
 
 const SYNONYMS: &[(&str, &[&str])] = &[
     ("eval", &["evaluation", "metrics", "benchmark"]),
+    ("agent", &["assistant", "agent_eval"]),
     ("fixture", &["fixtures"]),
     ("harness", &["context", "packet", "assembler"]),
+    ("score", &["scoring", "metric", "metrics"]),
     ("prompt", &["fragment", "contextual", "input"]),
+    ("post", &["failure", "repair", "report"]),
+    ("failure", &["post", "repair", "report"]),
     ("test", &["spec", "fixture", "golden"]),
     ("restaurant", &["restaurants"]),
     (
@@ -79,21 +83,40 @@ pub fn task_targets_crate(phrases: &[String], crate_name: &str) -> bool {
 }
 
 fn finalize_likely_areas(phrases: &[String], mut areas: Vec<String>) -> Vec<String> {
+    let has = |term: &str| phrases.iter().any(|p| p == term);
     if task_targets_crate(phrases, "context-harness") {
         areas.retain(|area| !area.starts_with("apply-patch"));
-        if !areas.iter().any(|area| area == "context-harness") {
-            areas.insert(0, "context-harness".to_string());
-        }
+        prefer_area_front(&mut areas, "context-harness");
     }
-    if phrases
-        .iter()
-        .any(|p| p == "intelligence" || p == "extension")
-        && !areas.iter().any(|a| a.contains("repo-intelligence"))
-    {
-        areas.insert(0, "ext/repo-intelligence".to_string());
+    if has("extension") && (has("repo") || has("intelligence")) {
+        prefer_area_front(&mut areas, "ext/repo-intelligence");
+        // Extension wiring typically crosses app-server + core session.
+        prefer_area(&mut areas, "app-server");
+        prefer_area(&mut areas, "core");
+    }
+    if has("agent") && has("eval") && (has("score") || has("scoring") || has("metric")) {
+        prefer_area_front(&mut areas, "context-harness");
+        prefer_area(&mut areas, "cli");
+    }
+    if has("post") && has("failure") {
+        prefer_area_front(&mut areas, "context-harness");
+        if has("report") || has("verification") {
+            prefer_area(&mut areas, "verification");
+        }
     }
     areas.truncate(3);
     areas
+}
+
+fn prefer_area_front(areas: &mut Vec<String>, area: &str) {
+    areas.retain(|current| current != area);
+    areas.insert(0, area.to_string());
+}
+
+fn prefer_area(areas: &mut Vec<String>, area: &str) {
+    if !areas.iter().any(|current| current == area) {
+        areas.push(area.to_string());
+    }
 }
 
 /// Repo-wide tokens that should not drive file selection on their own.
@@ -101,11 +124,6 @@ const LOW_SIGNAL_REPO_TERMS: &[&str] = &["codex", "openai", "rs"];
 
 /// Task verbs that are too common to justify inclusion on a single match.
 const WEAK_TASK_TERMS: &[&str] = &["add", "fix", "make", "new", "use", "with"];
-
-const SEGMENT_ONLY_TERMS: &[&str] = &[
-    "add", "all", "app", "codex", "command", "context", "edit", "file", "fix", "lib", "make",
-    "mod", "new", "review", "src", "test", "use", "util", "with",
-];
 
 pub fn path_matches_term(path: &str, term: &str) -> bool {
     let term_lower = term.to_ascii_lowercase();
@@ -383,5 +401,60 @@ mod tests {
             "context"
         ));
         assert!(path_matches_term("context-harness/src/eval.rs", "context"));
+    }
+
+    fn empty_repo_map() -> RepoMap {
+        RepoMap {
+            version: 2,
+            repo_id: "t".to_string(),
+            root: "/t".to_string(),
+            files: Vec::new(),
+            tests: Vec::new(),
+            areas: Vec::new(),
+            packages: Vec::new(),
+            area_maps: Vec::new(),
+            commands: Vec::new(),
+            test_map: Vec::new(),
+            agents_md: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn repo_intelligence_extension_prefers_cross_area_ids() {
+        let terms = build_task_terms(
+            "wire repo intelligence extension into session prompt assembly",
+            &empty_repo_map(),
+        );
+        assert_eq!(
+            terms.likely_areas.first().map(String::as_str),
+            Some("ext/repo-intelligence")
+        );
+        assert!(terms.likely_areas.iter().any(|area| area == "app-server"));
+    }
+
+    #[test]
+    fn agent_eval_scoring_prefers_harness_and_cli() {
+        let terms = build_task_terms(
+            "extend agent-eval scoring to support repo_intelligence session-injection arms",
+            &empty_repo_map(),
+        );
+        assert_eq!(
+            terms.likely_areas.first().map(String::as_str),
+            Some("context-harness")
+        );
+        assert!(terms.likely_areas.iter().any(|area| area == "cli"));
+    }
+
+    #[test]
+    fn post_failure_prompt_prefers_context_harness() {
+        let terms = build_task_terms(
+            "adjust post-failure prompt fragment formatting for verification reports",
+            &empty_repo_map(),
+        );
+        assert_eq!(
+            terms.likely_areas.first().map(String::as_str),
+            Some("context-harness")
+        );
     }
 }
