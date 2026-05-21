@@ -1,0 +1,40 @@
+[
+  {
+    "id": "repo_intelligence_extension",
+    "workdir": "codex_rs",
+    "task": "wire repo intelligence extension into session prompt assembly",
+    "relevant_files": [
+      "ext/repo-intelligence/src/extension.rs",
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "bridge_files": [
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "relevant_tests": ["ext/repo-intelligence/tests/contributor_injection.rs"],
+    "verify_command": "cargo test -p codex-repo-intelligence-extension -q"
+  },
+  {
+    "id": "agent_eval_scoring",
+    "workdir": "codex_rs",
+    "task": "extend agent-eval scoring to support repo_intelligence session-injection arms",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs",
+      "cli/src/context_agent_eval_cmd.rs"
+    ],
+    "bridge_files": ["cli/src/context_agent_eval_cmd.rs"],
+    "verify_command": "cargo test -p codex-context-harness agent_eval -q"
+  },
+  {
+    "id": "post_failure_prompt_format",
+    "workdir": "codex_rs",
+    "task": "adjust post-failure prompt fragment formatting for verification reports",
+    "relevant_files": [
+      "context-harness/src/post_failure.rs",
+      "verification/tests/report_integration.rs"
+    ],
+    "bridge_files": ["context-harness/src/post_failure.rs"],
+    "verify_command": "cargo test -p codex-verification --test report_integration -q"
+  }
+]
