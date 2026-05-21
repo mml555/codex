@@ -17,7 +17,6 @@ use codex_context_harness::render_eval_human;
 use codex_context_harness::render_eval_summary;
 use codex_context_harness::render_post_failure_prompt_fragment;
 use codex_context_harness::run_eval;
-use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::LoaderOverrides;

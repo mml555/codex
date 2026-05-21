@@ -201,6 +201,7 @@ enum Subcommand {
     Features(FeaturesCli),
 
     /// Harness-native repo context tools.
+    #[clap(visible_alias = "context-harness")]
     Context(context_cmd::ContextCli),
 
     /// Deterministic post-edit verification planning (no test execution).
