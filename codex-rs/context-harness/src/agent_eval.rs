@@ -133,8 +133,45 @@ pub fn load_agent_eval_tasks(path: &Path) -> anyhow::Result<Vec<AgentEvalTask>> 
         if task.id.is_empty() {
             task.id = format!("task_{index}");
         }
+        normalize_task_paths(task);
     }
     Ok(tasks)
+}
+
+/// Normalize repo-relative paths so fixture gold/bridge labels match `git diff` output.
+///
+/// Examples:
+/// - `codex-rs/cli/src/foo.rs` → `cli/src/foo.rs`
+/// - `./cli/src/foo.rs` → `cli/src/foo.rs`
+/// - `/abs/.../codex-rs/cli/src/foo.rs` → `cli/src/foo.rs`
+pub fn normalize_agent_eval_path(path: &str) -> String {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return String::new();
+    }
+    let path = path.trim_start_matches("./");
+    if let Some(idx) = path.find("/codex-rs/") {
+        return path[idx + "/codex-rs/".len()..].to_string();
+    }
+    let mut rest = path;
+    while let Some(stripped) = rest.strip_prefix("codex-rs/") {
+        rest = stripped;
+    }
+    rest.to_string()
+}
+
+fn normalize_agent_eval_paths(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| normalize_agent_eval_path(path))
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn normalize_task_paths(task: &mut AgentEvalTask) {
+    task.relevant_files = normalize_agent_eval_paths(&task.relevant_files);
+    task.bridge_files = normalize_agent_eval_paths(&task.bridge_files);
+    task.danger_zones = normalize_agent_eval_paths(&task.danger_zones);
 }
 
 /// Paths produced by verification/pytest side effects, not meaningful agent edits.
@@ -163,6 +200,8 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
     let gold: BTreeSet<String> = task.relevant_files.iter().cloned().collect();
     let changed: BTreeSet<String> = filter_scoring_changed_files(&record.changed_files)
         .into_iter()
+        .map(|path| normalize_agent_eval_path(&path))
+        .filter(|path| !path.is_empty())
         .collect();
     let correct_file_touched = task
         .relevant_files
@@ -476,5 +515,85 @@ mod tests {
         let record: AgentRunRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.arm, AgentArm::RepoIntelligence);
         assert!(record.harness_context_visible);
+    }
+
+    #[test]
+    fn normalize_strips_codex_rs_prefix() {
+        assert_eq!(
+            normalize_agent_eval_path("codex-rs/cli/src/context_cmd.rs"),
+            "cli/src/context_cmd.rs"
+        );
+        assert_eq!(
+            normalize_agent_eval_path("./cli/src/context_cmd.rs"),
+            "cli/src/context_cmd.rs"
+        );
+        assert_eq!(
+            normalize_agent_eval_path("/Users/me/codex/codex-rs/cli/src/context_cmd.rs"),
+            "cli/src/context_cmd.rs"
+        );
+    }
+
+    #[test]
+    fn scores_codex_rs_prefixed_changed_paths_against_fixture_gold() {
+        let task = AgentEvalTask {
+            id: "path_norm".to_string(),
+            task: "touch context cmd".to_string(),
+            relevant_files: vec!["cli/src/context_cmd.rs".to_string()],
+            relevant_tests: Vec::new(),
+            danger_zones: Vec::new(),
+            verify_command: None,
+            requires_post_failure: false,
+            bridge_files: Vec::new(),
+            workdir: AgentEvalWorkdir::CodexRs,
+        };
+        let record = AgentRunRecord {
+            arm: AgentArm::Vanilla,
+            task_id: task.id.clone(),
+            changed_files: vec!["codex-rs/cli/src/context_cmd.rs".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            used_post_failure: false,
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
+        };
+        let score = score_run(&record, &task);
+        assert!(score.correct_file_touched);
+        assert_eq!(score.unnecessary_files_changed, Vec::<String>::new());
+    }
+
+    #[test]
+    fn scores_codex_rs_prefixed_bridge_paths() {
+        let task = AgentEvalTask {
+            id: "bridge_norm".to_string(),
+            task: "touch bridge".to_string(),
+            relevant_files: vec!["other/src/lib.rs".to_string()],
+            relevant_tests: Vec::new(),
+            danger_zones: Vec::new(),
+            verify_command: None,
+            requires_post_failure: false,
+            bridge_files: vec!["cli/src/main.rs".to_string()],
+            workdir: AgentEvalWorkdir::CodexRs,
+        };
+        let record = AgentRunRecord {
+            arm: AgentArm::RepoIntelligence,
+            task_id: task.id.clone(),
+            changed_files: vec!["codex-rs/cli/src/main.rs".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            used_post_failure: false,
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: true,
+            harness_context_visible: true,
+        };
+        let score = score_run(&record, &task);
+        assert_eq!(
+            score.bridge_files_touched,
+            vec!["cli/src/main.rs".to_string()]
+        );
+        assert_eq!(
+            score.unnecessary_files_changed,
+            vec!["cli/src/main.rs".to_string()]
+        );
     }
 }

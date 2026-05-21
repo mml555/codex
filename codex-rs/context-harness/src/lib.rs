@@ -40,6 +40,7 @@ pub use agent_eval::changed_files_from_git_diff;
 pub use agent_eval::compare_task;
 pub use agent_eval::count_turns_from_exec_jsonl;
 pub use agent_eval::load_agent_eval_tasks;
+pub use agent_eval::normalize_agent_eval_path;
 pub use agent_eval::render_agent_eval_human;
 pub use agent_eval::score_run;
 pub use assembler::ContextAssembler;
