@@ -52,8 +52,8 @@ Artifacts layout:
   ARTIFACTS_DIR/<task_id>/harness/record.json   (manual prefix arm)
   ARTIFACTS_DIR/<task_id>/repo_intelligence/record.json   (--session-injection)
 
-Metrics: harness_context_visible, correct file, tests pass, bridge files touched,
-turn count, unnecessary files.
+Metrics: harness_context_visible, target files (gold ∪ bridge), tests pass,
+turn count, unnecessary files, token usage (input/output/total per arm).
 EOF
 }
 
@@ -282,6 +282,9 @@ write_record() {
   local events="$8"
   local run_valid="$9"
   local invalid_reason="${10}"
+  local tokens_input="${11}"
+  local tokens_output="${12}"
+  local tokens_total="${13}"
   local repo_intel_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
@@ -289,24 +292,90 @@ write_record() {
     repo_intel_enabled=true
   fi
   mkdir -p "$(dirname "${out}")"
-  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" <<'PY'
+  python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, sys
-out, arm, task_id, changed_json, tests_passed, turn_count, exec_exit, repo_intel, harness_visible, run_valid, invalid_reason = sys.argv[1:12]
+(
+    out,
+    arm,
+    task_id,
+    changed_json,
+    tests_passed,
+    turn_count,
+    exec_exit,
+    repo_intel,
+    harness_visible,
+    run_valid,
+    invalid_reason,
+    tokens_input,
+    tokens_output,
+    tokens_total,
+) = sys.argv[1:15]
+
+def opt_int(value):
+    return int(value) if value not in ("", "null") else None
+
 record = {
     "arm": arm,
     "task_id": task_id,
     "changed_files": json.loads(changed_json),
     "tests_passed": tests_passed == "true",
-    "turn_count": int(turn_count) if turn_count not in ("", "null") else None,
-    "exec_exit_code": int(exec_exit) if exec_exit not in ("", "null") else None,
+    "turn_count": opt_int(turn_count),
+    "exec_exit_code": opt_int(exec_exit),
     "repo_intelligence_enabled": repo_intel == "true",
     "harness_context_visible": harness_visible == "true",
     "run_valid": run_valid == "true",
     "invalid_reason": (invalid_reason or None),
+    "tokens_input": opt_int(tokens_input),
+    "tokens_output": opt_int(tokens_output),
+    "tokens_total": opt_int(tokens_total),
 }
 with open(out, "w", encoding="utf-8") as f:
     json.dump(record, f, indent=2)
     f.write("\n")
+PY
+}
+
+# Sum input/output tokens across turn.completed events. Emits three lines
+# (tokens_input, tokens_output, tokens_total) — each is an integer if at
+# least one turn.completed event was seen, otherwise "null". `null` here
+# means "no completed turn observed", which is distinct from a completed
+# turn that reported zero usage.
+count_tokens() {
+  local events="$1"
+  python3 - "${events}" <<'PY'
+import json, sys
+from pathlib import Path
+
+events_path = Path(sys.argv[1])
+seen_completed = False
+input_total = 0
+output_total = 0
+
+if events_path.exists():
+    with events_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "turn.completed":
+                continue
+            seen_completed = True
+            usage = ev.get("usage") or {}
+            input_total += max(int(usage.get("input_tokens") or 0), 0)
+            output_total += max(int(usage.get("output_tokens") or 0), 0)
+
+if seen_completed:
+    print(input_total)
+    print(output_total)
+    print(input_total + output_total)
+else:
+    print("null")
+    print("null")
+    print("null")
 PY
 }
 
@@ -396,6 +465,12 @@ ${task_text}"
   fi
   local turns
   turns="$(count_turns "${events}")"
+  local tokens_input tokens_output tokens_total
+  {
+    read -r tokens_input
+    read -r tokens_output
+    read -r tokens_total
+  } < <(count_tokens "${events}")
   local validity
   validity="$(classify_run_validity "${events}" "${exec_exit}")"
   local run_valid
@@ -406,7 +481,8 @@ ${task_text}"
     invalid_reason=""
   fi
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
-    "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" "${run_valid}" "${invalid_reason}"
+    "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
+    "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
   log "arm=${arm} task=${task_id} workdir=${workdir} exit=${exec_exit}"
 }
 

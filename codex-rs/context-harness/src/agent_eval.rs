@@ -55,6 +55,14 @@ pub struct AgentRunRecord {
     pub run_valid: bool,
     #[serde(default)]
     pub invalid_reason: Option<AgentRunInvalidReason>,
+    /// Sum of `turn.completed.usage.input_tokens` across all turns. `None` if
+    /// no `turn.completed` events were parsed (e.g. missing/empty events.jsonl).
+    #[serde(default)]
+    pub tokens_input: Option<u64>,
+    #[serde(default)]
+    pub tokens_output: Option<u64>,
+    #[serde(default)]
+    pub tokens_total: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -103,11 +111,16 @@ impl AgentArm {
     }
 }
 
-/// Per-run scores on the five comparison dimensions.
+/// Per-run scores for one arm.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRunScore {
+    /// True if any gold (`relevant_files`) path was touched.
     pub correct_file_touched: bool,
+    /// Count of distinct paths from (gold ∪ bridge) that were touched.
+    pub target_files_hit: usize,
+    /// Size of the (gold ∪ bridge) set, i.e. denominator for target_files_hit.
+    pub target_files_total: usize,
     pub tests_passed: bool,
     pub turn_count: Option<u32>,
     pub unnecessary_files_changed: Vec<String>,
@@ -115,6 +128,57 @@ pub struct AgentRunScore {
     pub bridge_files_touched: Vec<String>,
     pub run_valid: bool,
     pub invalid_reason: Option<AgentRunInvalidReason>,
+    pub tokens_input: Option<u64>,
+    pub tokens_output: Option<u64>,
+    pub tokens_total: Option<u64>,
+}
+
+/// Comparison verdict for a (vanilla, treatment) pair on one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEvalResult {
+    /// Treatment improved on vanilla on the named dimension.
+    RiBetter { reason: ResultReason },
+    /// Treatment regressed against vanilla on the named dimension.
+    RiWorse { reason: ResultReason },
+    /// All comparison dimensions tied.
+    Tie,
+    /// Comparison was not made because the pair was invalid.
+    Excluded { reason: String },
+}
+
+/// First-dimension-of-divergence label. Priority order (highest first):
+/// file_targeting → fewer_extra_files → fewer_turns → fewer_tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultReason {
+    FileTargeting,
+    FewerExtraFiles,
+    FewerTurns,
+    FewerTokens,
+}
+
+impl ResultReason {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::FileTargeting => "file_targeting",
+            Self::FewerExtraFiles => "fewer_extra_files",
+            Self::FewerTurns => "fewer_turns",
+            Self::FewerTokens => "fewer_tokens",
+        }
+    }
+}
+
+impl AgentEvalResult {
+    /// Render as the machine+human label, e.g. `ri_better:file_targeting`.
+    pub fn slug(&self) -> String {
+        match self {
+            Self::RiBetter { reason } => format!("ri_better:{}", reason.slug()),
+            Self::RiWorse { reason } => format!("ri_worse:{}", reason.slug()),
+            Self::Tie => "tie".to_string(),
+            Self::Excluded { reason } => format!("excluded:{reason}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,6 +194,7 @@ pub struct AgentEvalComparison {
     pub valid_for_comparison: bool,
     #[serde(default)]
     pub excluded_reason: Option<String>,
+    pub result: AgentEvalResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,26 +285,23 @@ pub fn filter_scoring_changed_files(paths: &[String]) -> Vec<String> {
 
 pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore {
     let gold: BTreeSet<String> = task.relevant_files.iter().cloned().collect();
+    let bridge: BTreeSet<String> = task.bridge_files.iter().cloned().collect();
+    let target: BTreeSet<String> = gold.union(&bridge).cloned().collect();
     let changed: BTreeSet<String> = filter_scoring_changed_files(&record.changed_files)
         .into_iter()
         .map(|path| normalize_agent_eval_path(&path))
         .filter(|path| !path.is_empty())
         .collect();
-    let correct_file_touched = task
-        .relevant_files
-        .iter()
-        .any(|path| changed.contains(path));
+    let correct_file_touched = gold.iter().any(|path| changed.contains(path));
+    let target_files_hit = target.intersection(&changed).count();
+    let target_files_total = target.len();
     let unnecessary_files_changed: Vec<String> = changed.difference(&gold).cloned().collect();
-
-    let bridge_files_touched: Vec<String> = task
-        .bridge_files
-        .iter()
-        .filter(|path| changed.contains(*path))
-        .cloned()
-        .collect();
+    let bridge_files_touched: Vec<String> = bridge.intersection(&changed).cloned().collect();
 
     AgentRunScore {
         correct_file_touched,
+        target_files_hit,
+        target_files_total,
         tests_passed: record.tests_passed && record.run_valid,
         turn_count: record.turn_count,
         unnecessary_files_changed,
@@ -247,7 +309,77 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         bridge_files_touched,
         run_valid: record.run_valid,
         invalid_reason: record.invalid_reason,
+        tokens_input: record.tokens_input,
+        tokens_output: record.tokens_output,
+        tokens_total: record.tokens_total,
     }
+}
+
+/// Decide the comparison verdict using the priority order
+/// `file_targeting > fewer_extra_files > fewer_turns > fewer_tokens`. Cheaper
+/// is never preferred over correctness — token comparison runs last.
+pub fn classify_result(
+    vanilla: &AgentRunScore,
+    treatment: &AgentRunScore,
+    valid_for_comparison: bool,
+    excluded_reason: Option<&str>,
+) -> AgentEvalResult {
+    if !valid_for_comparison {
+        let reason = excluded_reason.unwrap_or("invalid").to_string();
+        return AgentEvalResult::Excluded { reason };
+    }
+
+    if treatment.target_files_hit > vanilla.target_files_hit {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+    if treatment.target_files_hit < vanilla.target_files_hit {
+        return AgentEvalResult::RiWorse {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+
+    let v_extra = vanilla.unnecessary_files_changed.len();
+    let t_extra = treatment.unnecessary_files_changed.len();
+    if t_extra < v_extra {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FewerExtraFiles,
+        };
+    }
+    if t_extra > v_extra {
+        return AgentEvalResult::RiWorse {
+            reason: ResultReason::FewerExtraFiles,
+        };
+    }
+
+    if let (Some(vt), Some(tt)) = (vanilla.turn_count, treatment.turn_count) {
+        if tt < vt {
+            return AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerTurns,
+            };
+        }
+        if tt > vt {
+            return AgentEvalResult::RiWorse {
+                reason: ResultReason::FewerTurns,
+            };
+        }
+    }
+
+    if let (Some(vt), Some(tt)) = (vanilla.tokens_total, treatment.tokens_total) {
+        if tt < vt {
+            return AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerTokens,
+            };
+        }
+        if tt > vt {
+            return AgentEvalResult::RiWorse {
+                reason: ResultReason::FewerTokens,
+            };
+        }
+    }
+
+    AgentEvalResult::Tie
 }
 
 pub fn compare_task(
@@ -257,14 +389,23 @@ pub fn compare_task(
 ) -> AgentEvalComparison {
     let excluded_reason = pair_excluded_reason(vanilla, treatment);
     let valid_for_comparison = excluded_reason.is_none();
+    let vanilla_score = score_run(vanilla, task);
+    let treatment_score = score_run(treatment, task);
+    let result = classify_result(
+        &vanilla_score,
+        &treatment_score,
+        valid_for_comparison,
+        excluded_reason.as_deref(),
+    );
     AgentEvalComparison {
         task_id: task.id.clone(),
         task: task.task.clone(),
-        vanilla: score_run(vanilla, task),
-        treatment: score_run(treatment, task),
+        vanilla: vanilla_score,
+        treatment: treatment_score,
         treatment_arm: treatment.arm,
         valid_for_comparison,
         excluded_reason,
+        result,
     }
 }
 
@@ -338,6 +479,55 @@ pub fn count_turns_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<u32> {
     Ok(count)
 }
 
+/// Per-arm token totals summed across all `turn.completed.usage` events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Sum `usage.input_tokens` and `usage.output_tokens` across `turn.completed`
+/// events. Returns `None` if no `turn.completed` event is present (e.g. the
+/// run crashed before completing a turn) — distinct from `Some(0)` for a
+/// completed turn that reported zero usage.
+pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenUsageTotals>> {
+    let mut seen_completed = false;
+    let mut input: u64 = 0;
+    let mut output: u64 = 0;
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if kind != "turn.completed" {
+            continue;
+        }
+        seen_completed = true;
+        let Some(usage) = value.get("usage") else {
+            continue;
+        };
+        if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+            input = input.saturating_add(n.max(0) as u64);
+        }
+        if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+            output = output.saturating_add(n.max(0) as u64);
+        }
+    }
+    if !seen_completed {
+        return Ok(None);
+    }
+    Ok(Some(TokenUsageTotals {
+        input_tokens: input,
+        output_tokens: output,
+        total_tokens: input.saturating_add(output),
+    }))
+}
+
 /// Parse changed paths from `git diff --name-only` output.
 pub fn changed_files_from_git_diff(diff_output: &str) -> Vec<String> {
     diff_output
@@ -371,15 +561,57 @@ impl AgentEvalTask {
     }
 }
 
+/// Render the eval report as the single 8-column table that makes or breaks
+/// the repo-intelligence claim:
+///
+/// `Task | Valid? | RI visible? | Target files V/RI | Extra files V/RI |
+///  Turns V/RI | Tokens V/RI | Result`
+///
+/// Missing dimensions (e.g. token usage when the run had no completed turn)
+/// render as `—`. Excluded pairs render `—` across every data column.
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
+    const HEADERS: [&str; 8] = [
+        "Task",
+        "Valid?",
+        "RI visible?",
+        "Target files V/RI",
+        "Extra files V/RI",
+        "Turns V/RI",
+        "Tokens V/RI",
+        "Result",
+    ];
+
+    let mut rows: Vec<[String; 8]> = Vec::with_capacity(report.comparisons.len());
+    for row in &report.comparisons {
+        rows.push(format_table_row(row));
+    }
+
+    let mut widths = [0usize; 8];
+    for (i, header) in HEADERS.iter().enumerate() {
+        widths[i] = header.len();
+    }
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let render_row = |cells: &[String; 8]| -> String {
+        let parts: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| format!("{cell:<width$}", width = widths[i]))
+            .collect();
+        parts.join(" | ")
+    };
+    let header_cells: [String; 8] = HEADERS.map(str::to_string);
+    let separator_cells: [String; 8] =
+        std::array::from_fn(|i| "-".repeat(widths[i]));
+
     let mut lines = Vec::new();
     lines.push(format!(
         "Valid comparisons: {}/{}",
         report.summary.valid_pairs, report.summary.total_pairs
-    ));
-    lines.push(format!(
-        "Invalid comparisons: {}/{}",
-        report.summary.invalid_pairs, report.summary.total_pairs
     ));
     if !report.summary.invalid_reason_counts.is_empty() {
         let reasons: Vec<String> = report
@@ -391,70 +623,103 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         lines.push(format!("Invalid reasons: {}", reasons.join(", ")));
     }
     lines.push(String::new());
-    for row in &report.comparisons {
-        let treatment = row.treatment_arm.display_label();
-        lines.push(format!("Task: {} ({})", row.task_id, row.task));
-        lines.push(format!(
-            "  treatment_arm: {}",
-            row.treatment_arm.display_label()
-        ));
-        lines.push(format!(
-            "  valid_for_comparison: {}",
-            row.valid_for_comparison
-        ));
-        if let Some(reason) = &row.excluded_reason {
-            lines.push(format!("  excluded_reason: {reason}"));
-        }
-        lines.push(format_dimension_row(
-            "correct_file_touched",
-            row.vanilla.correct_file_touched,
-            row.treatment.correct_file_touched,
-            treatment,
-        ));
-        lines.push(format_dimension_row(
-            "tests_passed",
-            row.vanilla.tests_passed,
-            row.treatment.tests_passed,
-            treatment,
-        ));
-        lines.push(format_dimension_row(
-            "harness_context_visible",
-            row.vanilla.harness_context_visible,
-            row.treatment.harness_context_visible,
-            treatment,
-        ));
-        lines.push(format!(
-            "  turn_count: vanilla {:?} | {treatment} {:?}",
-            row.vanilla.turn_count, row.treatment.turn_count
-        ));
-        lines.push(format!(
-            "  unnecessary_files: vanilla {:?} | {treatment} {:?}",
-            row.vanilla.unnecessary_files_changed, row.treatment.unnecessary_files_changed
-        ));
-        lines.push(format!(
-            "  bridge_files_touched: vanilla {:?} | {treatment} {:?}",
-            row.vanilla.bridge_files_touched, row.treatment.bridge_files_touched
-        ));
-        lines.push(format!(
-            "  run_valid: vanilla {} | {treatment} {}",
-            row.vanilla.run_valid, row.treatment.run_valid
-        ));
-        lines.push(format!(
-            "  invalid_reason: vanilla {:?} | {treatment} {:?}",
-            row.vanilla.invalid_reason, row.treatment.invalid_reason
-        ));
-        lines.push(String::new());
+    lines.push(render_row(&header_cells));
+    lines.push(render_row(&separator_cells));
+    for row in &rows {
+        lines.push(render_row(row));
     }
     lines.join("\n")
 }
 
-fn format_dimension_row(
-    name: &str,
-    vanilla: bool,
-    treatment: bool,
-    treatment_label: &str,
-) -> String {
-    format!("  {name}: vanilla {vanilla} | {treatment_label} {treatment}")
+const DASH: &str = "—";
+
+fn format_table_row(row: &AgentEvalComparison) -> [String; 8] {
+    let result = row.result.slug();
+    if !row.valid_for_comparison {
+        let valid_cell = format_invalid_cell(row);
+        let ri_visible = if row.treatment.harness_context_visible {
+            "yes".to_string()
+        } else {
+            DASH.to_string()
+        };
+        return [
+            row.task_id.clone(),
+            valid_cell,
+            ri_visible,
+            DASH.to_string(),
+            DASH.to_string(),
+            DASH.to_string(),
+            DASH.to_string(),
+            result,
+        ];
+    }
+
+    let target = format!(
+        "{} vs {}",
+        ratio_cell(row.vanilla.target_files_hit, row.vanilla.target_files_total),
+        ratio_cell(
+            row.treatment.target_files_hit,
+            row.treatment.target_files_total,
+        ),
+    );
+    let extra = format!(
+        "{}/{}",
+        row.vanilla.unnecessary_files_changed.len(),
+        row.treatment.unnecessary_files_changed.len(),
+    );
+    let turns = format!(
+        "{}/{}",
+        option_cell(row.vanilla.turn_count),
+        option_cell(row.treatment.turn_count),
+    );
+    let tokens = format!(
+        "{}/{}",
+        option_cell(row.vanilla.tokens_total),
+        option_cell(row.treatment.tokens_total),
+    );
+    let ri_visible = if row.treatment.harness_context_visible {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    };
+
+    [
+        row.task_id.clone(),
+        "valid".to_string(),
+        ri_visible,
+        target,
+        extra,
+        turns,
+        tokens,
+        result,
+    ]
+}
+
+fn format_invalid_cell(row: &AgentEvalComparison) -> String {
+    let v = row.vanilla.invalid_reason.map(invalid_reason_slug);
+    let t = row.treatment.invalid_reason.map(invalid_reason_slug);
+    match (v, t) {
+        (Some(v), Some(t)) if v == t => format!("invalid: {v}"),
+        (Some(v), Some(t)) => format!("invalid: vanilla {v}, RI {t}"),
+        (Some(v), None) => format!("invalid: vanilla {v}"),
+        (None, Some(t)) => format!("invalid: RI {t}"),
+        (None, None) => "invalid".to_string(),
+    }
+}
+
+fn ratio_cell(hit: usize, total: usize) -> String {
+    if total == 0 {
+        DASH.to_string()
+    } else {
+        format!("{hit}/{total}")
+    }
+}
+
+fn option_cell<T: std::fmt::Display>(value: Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => DASH.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -475,26 +740,44 @@ mod tests {
         }
     }
 
+    fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
+        AgentRunRecord {
+            arm,
+            task_id: task_id.to_string(),
+            changed_files: Vec::new(),
+            tests_passed: false,
+            turn_count: None,
+            exec_exit_code: None,
+            repo_intelligence_enabled: matches!(arm, AgentArm::RepoIntelligence),
+            harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
+            tokens_input: None,
+            tokens_output: None,
+            tokens_total: None,
+        }
+    }
+
     #[test]
     fn scores_correct_fix() {
         let task = calculator_task();
         let record = AgentRunRecord {
-            arm: AgentArm::Harness,
-            task_id: task.id.clone(),
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(2),
             exec_exit_code: Some(0),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
-            run_valid: true,
-            invalid_reason: None,
+            tokens_input: Some(100),
+            tokens_output: Some(50),
+            tokens_total: Some(150),
+            ..synthetic_record(AgentArm::Harness, &task.id)
         };
         let score = score_run(&record, &task);
         assert_eq!(
             score,
             AgentRunScore {
                 correct_file_touched: true,
+                target_files_hit: 1,
+                target_files_total: 1,
                 tests_passed: true,
                 turn_count: Some(2),
                 unnecessary_files_changed: Vec::new(),
@@ -502,6 +785,9 @@ mod tests {
                 bridge_files_touched: Vec::new(),
                 run_valid: true,
                 invalid_reason: None,
+                tokens_input: Some(100),
+                tokens_output: Some(50),
+                tokens_total: Some(150),
             }
         );
     }
@@ -510,8 +796,6 @@ mod tests {
     fn ignores_python_cache_artifacts_in_scoring() {
         let task = calculator_task();
         let record = AgentRunRecord {
-            arm: AgentArm::Harness,
-            task_id: task.id.clone(),
             changed_files: vec![
                 "src/__pycache__/calculator.cpython-313.pyc".to_string(),
                 "tests/__pycache__/test_calculator.cpython-313-pytest-9.0.0.pyc".to_string(),
@@ -519,14 +803,10 @@ mod tests {
             ],
             tests_passed: false,
             turn_count: Some(1),
-            exec_exit_code: Some(0),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
-            run_valid: true,
-            invalid_reason: None,
+            ..synthetic_record(AgentArm::Harness, &task.id)
         };
         let score = score_run(&record, &task);
-        assert_eq!(score.correct_file_touched, false);
+        assert!(!score.correct_file_touched);
         assert_eq!(score.unnecessary_files_changed, Vec::<String>::new());
     }
 
@@ -534,23 +814,19 @@ mod tests {
     fn scores_unnecessary_files_and_no_touch() {
         let task = calculator_task();
         let record = AgentRunRecord {
-            arm: AgentArm::Vanilla,
-            task_id: task.id.clone(),
             changed_files: vec!["README.md".to_string()],
-            tests_passed: false,
             turn_count: Some(5),
             exec_exit_code: Some(1),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
-            run_valid: true,
-            invalid_reason: None,
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
         };
         let score = score_run(&record, &task);
-        assert_eq!(score.correct_file_touched, false);
+        assert!(!score.correct_file_touched);
         assert_eq!(
             score.unnecessary_files_changed,
             vec!["README.md".to_string()]
         );
+        assert_eq!(score.target_files_hit, 0);
+        assert_eq!(score.target_files_total, 1);
     }
 
     #[test]
@@ -564,6 +840,31 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_sums_input_and_output_across_turns() {
+        let jsonl = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":200,"output_tokens":300,"reasoning_output_tokens":40}}
+{"type":"turn.completed","usage":{"input_tokens":150,"output_tokens":50}}"#;
+        let totals = token_usage_from_exec_jsonl(jsonl.as_bytes())
+            .unwrap()
+            .expect("expected token totals when turn.completed events are present");
+        assert_eq!(totals.input_tokens, 1350);
+        assert_eq!(totals.output_tokens, 350);
+        assert_eq!(totals.total_tokens, 1700);
+    }
+
+    #[test]
+    fn token_usage_is_none_when_no_turn_completed_event() {
+        let jsonl = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"provider unavailable"}}"#;
+        assert_eq!(
+            token_usage_from_exec_jsonl(jsonl.as_bytes()).unwrap(),
+            None,
+            "missing turn.completed must surface as None, not Some(0)"
+        );
+    }
+
+    #[test]
     fn repo_intelligence_arm_round_trips() {
         let json = r#"{"arm":"repo_intelligence","task_id":"t","changed_files":[],"tests_passed":false,"turn_count":null,"exec_exit_code":null,"harness_context_visible":true}"#;
         let record: AgentRunRecord = serde_json::from_str(json).unwrap();
@@ -571,6 +872,7 @@ mod tests {
         assert!(record.harness_context_visible);
         assert!(record.run_valid);
         assert_eq!(record.invalid_reason, None);
+        assert_eq!(record.tokens_total, None);
     }
 
     #[test]
@@ -602,16 +904,11 @@ mod tests {
             workdir: AgentEvalWorkdir::CodexRs,
         };
         let record = AgentRunRecord {
-            arm: AgentArm::Vanilla,
-            task_id: task.id.clone(),
             changed_files: vec!["codex-rs/cli/src/context_cmd.rs".to_string()],
             tests_passed: true,
             turn_count: Some(1),
             exec_exit_code: Some(0),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
-            run_valid: true,
-            invalid_reason: None,
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
         };
         let score = score_run(&record, &task);
         assert!(score.correct_file_touched);
@@ -631,54 +928,45 @@ mod tests {
             workdir: AgentEvalWorkdir::CodexRs,
         };
         let record = AgentRunRecord {
-            arm: AgentArm::RepoIntelligence,
-            task_id: task.id.clone(),
             changed_files: vec!["codex-rs/cli/src/main.rs".to_string()],
             tests_passed: true,
             turn_count: Some(1),
             exec_exit_code: Some(0),
-            repo_intelligence_enabled: true,
             harness_context_visible: true,
-            run_valid: true,
-            invalid_reason: None,
+            ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
         };
         let score = score_run(&record, &task);
         assert_eq!(
             score.bridge_files_touched,
             vec!["cli/src/main.rs".to_string()]
         );
+        // bridge files aren't gold; they still count as unnecessary against gold targets.
         assert_eq!(
             score.unnecessary_files_changed,
             vec!["cli/src/main.rs".to_string()]
         );
+        // But they DO count toward target_files_hit (gold ∪ bridge).
+        assert_eq!(score.target_files_hit, 1);
+        assert_eq!(score.target_files_total, 2);
     }
 
     #[test]
     fn invalid_pairs_are_excluded_from_behavioral_comparison() {
         let task = calculator_task();
         let vanilla = AgentRunRecord {
-            arm: AgentArm::Vanilla,
-            task_id: task.id.clone(),
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            exec_exit_code: Some(0),
-            repo_intelligence_enabled: false,
-            harness_context_visible: false,
             run_valid: false,
             invalid_reason: Some(AgentRunInvalidReason::ProviderUsageLimit),
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
         };
         let treatment = AgentRunRecord {
-            arm: AgentArm::RepoIntelligence,
-            task_id: task.id.clone(),
             changed_files: vec!["src/calculator.py".to_string()],
             tests_passed: true,
             turn_count: Some(1),
-            exec_exit_code: Some(0),
-            repo_intelligence_enabled: true,
             harness_context_visible: true,
-            run_valid: true,
-            invalid_reason: None,
+            ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
         };
         let row = compare_task(&task, &vanilla, &treatment);
         assert!(!row.valid_for_comparison);
@@ -688,5 +976,167 @@ mod tests {
         );
         // tests_passed is ignored for invalid runs
         assert!(!row.vanilla.tests_passed);
+        // Excluded results carry the pair_invalid reason verbatim.
+        assert_eq!(
+            row.result.slug(),
+            "excluded:pair_invalid:provider_usage_limit|invalid"
+        );
+    }
+
+    fn classify(vanilla: AgentRunScore, treatment: AgentRunScore) -> AgentEvalResult {
+        classify_result(&vanilla, &treatment, true, None)
+    }
+
+    fn zero_score() -> AgentRunScore {
+        AgentRunScore {
+            correct_file_touched: false,
+            target_files_hit: 0,
+            target_files_total: 2,
+            tests_passed: false,
+            turn_count: None,
+            unnecessary_files_changed: Vec::new(),
+            harness_context_visible: false,
+            bridge_files_touched: Vec::new(),
+            run_valid: true,
+            invalid_reason: None,
+            tokens_input: None,
+            tokens_output: None,
+            tokens_total: None,
+        }
+    }
+
+    #[test]
+    fn classify_ri_better_by_file_targeting() {
+        let vanilla = zero_score();
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FileTargeting,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_ri_better_by_fewer_extra_files_when_targets_tie() {
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            unnecessary_files_changed: vec!["a".into(), "b".into(), "c".into()],
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            unnecessary_files_changed: vec!["a".into()],
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerExtraFiles,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_ri_better_by_fewer_turns_when_targets_and_extras_tie() {
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(8),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerTurns,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_ri_better_by_fewer_tokens_only_after_other_tiebreakers_tie() {
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(4),
+            tokens_total: Some(2000),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(4),
+            tokens_total: Some(1500),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerTokens,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_tokens_never_override_correctness() {
+        // RI is cheaper but wrong; result must be ri_worse:file_targeting, not ri_better.
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            tokens_total: Some(5000),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 0,
+            tokens_total: Some(500),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::FileTargeting,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_tie_when_all_dimensions_match() {
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            tokens_total: Some(1000),
+            ..zero_score()
+        };
+        let treatment = vanilla.clone();
+        assert_eq!(classify(vanilla, treatment), AgentEvalResult::Tie);
+    }
+
+    #[test]
+    fn render_human_emits_dash_for_missing_tokens() {
+        let task = calculator_task();
+        let vanilla = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: false,
+            turn_count: Some(4),
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
+        };
+        let treatment = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(2),
+            harness_context_visible: true,
+            ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
+        };
+        let report = build_report(vec![compare_task(&task, &vanilla, &treatment)]);
+        let text = render_agent_eval_human(&report);
+        assert!(
+            text.contains("—/—"),
+            "expected token cell to render as `—/—` when both arms lack usage data\n{text}"
+        );
+        assert!(text.contains("ri_better:fewer_turns"), "{text}");
     }
 }

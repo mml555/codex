@@ -14,6 +14,24 @@ fn fixture_tasks() -> Vec<codex_context_harness::AgentEvalTask> {
     load_agent_eval_tasks(&path).expect("fixture tasks")
 }
 
+fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
+    AgentRunRecord {
+        arm,
+        task_id: task_id.to_string(),
+        changed_files: Vec::new(),
+        tests_passed: false,
+        turn_count: None,
+        exec_exit_code: None,
+        repo_intelligence_enabled: matches!(arm, AgentArm::RepoIntelligence),
+        harness_context_visible: false,
+        run_valid: true,
+        invalid_reason: None,
+        tokens_input: None,
+        tokens_output: None,
+        tokens_total: None,
+    }
+}
+
 #[test]
 fn fixture_tasks_load_with_ids() {
     let tasks = fixture_tasks();
@@ -26,28 +44,17 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
     let tasks = fixture_tasks();
     let task = &tasks[0];
     let vanilla = AgentRunRecord {
-        arm: AgentArm::Vanilla,
-        task_id: task.id.clone(),
-        changed_files: vec![],
         tests_passed: false,
         turn_count: Some(4),
         exec_exit_code: Some(1),
-        repo_intelligence_enabled: false,
-        harness_context_visible: false,
-        run_valid: true,
-        invalid_reason: None,
+        ..synthetic_record(AgentArm::Vanilla, &task.id)
     };
     let harness = AgentRunRecord {
-        arm: AgentArm::Harness,
-        task_id: task.id.clone(),
         changed_files: vec!["src/calculator.py".to_string()],
         tests_passed: true,
         turn_count: Some(2),
         exec_exit_code: Some(0),
-        repo_intelligence_enabled: false,
-        harness_context_visible: false,
-        run_valid: true,
-        invalid_reason: None,
+        ..synthetic_record(AgentArm::Harness, &task.id)
     };
     let row = compare_task(task, &vanilla, &harness);
     assert_eq!(row.treatment_arm, AgentArm::Harness);
@@ -57,39 +64,57 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
         row.treatment.unnecessary_files_changed,
         Vec::<String>::new()
     );
+    assert_eq!(row.result.slug(), "ri_better:file_targeting");
 }
 
 #[test]
-fn report_renders_human_summary() {
+fn report_renders_human_summary_with_8_column_table() {
     let tasks = fixture_tasks();
     let task = &tasks[0];
     let vanilla = AgentRunRecord {
-        arm: AgentArm::Vanilla,
-        task_id: task.id.clone(),
-        changed_files: vec![],
         tests_passed: false,
         turn_count: Some(3),
         exec_exit_code: Some(1),
-        repo_intelligence_enabled: false,
-        harness_context_visible: false,
-        run_valid: true,
-        invalid_reason: None,
+        tokens_input: Some(800),
+        tokens_output: Some(200),
+        tokens_total: Some(1000),
+        ..synthetic_record(AgentArm::Vanilla, &task.id)
     };
     let harness = AgentRunRecord {
-        arm: AgentArm::Harness,
-        task_id: task.id.clone(),
         changed_files: vec!["src/calculator.py".to_string()],
         tests_passed: true,
         turn_count: Some(2),
         exec_exit_code: Some(0),
-        repo_intelligence_enabled: false,
-        harness_context_visible: false,
-        run_valid: true,
-        invalid_reason: None,
+        harness_context_visible: true,
+        tokens_input: Some(900),
+        tokens_output: Some(150),
+        tokens_total: Some(1050),
+        ..synthetic_record(AgentArm::Harness, &task.id)
     };
     let report = build_report(vec![compare_task(task, &vanilla, &harness)]);
     let text = render_agent_eval_human(&report);
-    assert!(text.contains("calculator_fix"));
+    // Header columns are present in the rendered table.
+    for column in [
+        "Task",
+        "Valid?",
+        "RI visible?",
+        "Target files V/RI",
+        "Extra files V/RI",
+        "Turns V/RI",
+        "Tokens V/RI",
+        "Result",
+    ] {
+        assert!(text.contains(column), "missing column `{column}`:\n{text}");
+    }
+    // The task row contains the canonical V vs RI values.
+    assert!(text.contains("calculator_fix"), "{text}");
+    assert!(text.contains("0/1 vs 1/1"), "target column missing:\n{text}");
+    assert!(text.contains("3/2"), "turns column missing:\n{text}");
+    assert!(text.contains("1000/1050"), "tokens column missing:\n{text}");
+    assert!(
+        text.contains("ri_better:file_targeting"),
+        "result column missing:\n{text}"
+    );
 }
 
 #[test]
