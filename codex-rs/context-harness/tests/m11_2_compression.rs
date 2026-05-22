@@ -11,7 +11,7 @@ fn codex_harness_map() -> RepoMap {
 }
 
 #[test]
-fn prompt_uses_primary_and_also_considered_sections() {
+fn directive_inspect_list_includes_top_relevant_file() {
     let map = codex_harness_map();
     let packet = build_context_packet(
         "add codex context-harness eval command with fixture metrics",
@@ -20,17 +20,8 @@ fn prompt_uses_primary_and_also_considered_sections() {
         BuildPacketOptions::default(),
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
-    assert!(fragment.contains("Primary files:"));
+    assert!(fragment.contains("Before editing, inspect these files first:"));
     assert!(fragment.contains("context-harness/src/eval.rs"));
-
-    let packet_rendering = build_context_packet(
-        "improve context packet prompt fragment rendering for models",
-        &map,
-        &Default::default(),
-        BuildPacketOptions::default(),
-    );
-    let fragment_rendering = ContextPacketRenderer::render_prompt_fragment(&packet_rendering);
-    assert!(fragment_rendering.contains("Also considered:"));
 }
 
 #[test]

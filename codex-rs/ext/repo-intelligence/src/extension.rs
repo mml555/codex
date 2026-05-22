@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use codex_context_harness::BuildPacketOptions;
+use codex_context_harness::ContextPacket;
 use codex_context_harness::ContextPacketRenderer;
 use codex_context_harness::build_context_packet;
 use codex_core::config::Config;
@@ -18,6 +19,10 @@ use codex_protocol::user_input::UserInput;
 use codex_repo_index::RepoMap;
 use codex_repo_index::RepoMapBuilder;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_verification::PlanRequest;
+use codex_verification::PlanScope;
+use codex_verification::VerificationPlanner;
+use codex_verification::is_safe_to_run;
 
 use crate::run_memory_bridge::RunMemoryBridge;
 use crate::user_input::task_text_from_user_input;
@@ -82,10 +87,58 @@ impl ContextContributor for RepoIntelligenceExtension {
                 .unwrap_or("continue current task");
             let packet =
                 build_context_packet(task, &map, &run_memory, BuildPacketOptions::default());
-            let text = ContextPacketRenderer::render_prompt_fragment(&packet);
+            let mut text = ContextPacketRenderer::render_prompt_fragment(&packet);
+            if let Some(hint) = narrow_verification_hint(task, &map, &packet) {
+                text.push_str("\n\n");
+                text.push_str(&hint);
+            }
             vec![PromptFragment::new(PromptSlot::ContextualUser, text)]
         })
     }
+}
+
+/// Append a single-line directive that names the deterministic narrow test
+/// command the planner would run for this task. Returns `None` if the planner
+/// emits no narrow command that passes `is_safe_to_run`.
+///
+/// The hint is rendered as a post-edit checklist line ("after editing"), not a
+/// pre-edit imperative — the main behavioral lift being tested is file
+/// routing before first edit, not test-first execution.
+pub fn narrow_verification_hint(
+    task: &str,
+    map: &RepoMap,
+    packet: &ContextPacket,
+) -> Option<String> {
+    // Treat the inspect list as the prospective change set so the planner has
+    // enough signal to emit area-specific commands before any files have been
+    // edited.
+    let prospective: Vec<String> = packet
+        .included_paths()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let plan = VerificationPlanner::plan_with_context(
+        map,
+        &PlanRequest {
+            task: Some(task.to_string()),
+            changed_paths: prospective,
+        },
+        packet,
+    );
+    let command = plan
+        .commands
+        .iter()
+        .filter(|cmd| cmd.scope == PlanScope::Narrow)
+        .filter(|cmd| is_safe_to_run(&cmd.command))
+        .max_by(|a, b| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    Some(format!(
+        "After editing, likely narrow verification:\n- {}",
+        command.command
+    ))
 }
 
 #[async_trait::async_trait]

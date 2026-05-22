@@ -3520,6 +3520,7 @@ dependencies = [
  "codex-protocol",
  "codex-repo-index",
  "codex-utils-absolute-path",
+ "codex-verification",
  "pretty_assertions",
  "serde",
  "serde_json",

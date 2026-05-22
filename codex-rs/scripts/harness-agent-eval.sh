@@ -140,7 +140,7 @@ import json
 import sys
 from pathlib import Path
 
-needle = "Harness repo context:"
+needle = "Harness repo intelligence:"
 events_path = Path(sys.argv[1])
 codex_home = Path(sys.argv[2])
 

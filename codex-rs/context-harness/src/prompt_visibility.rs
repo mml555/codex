@@ -1,7 +1,7 @@
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
-const HARNESS_MARKER: &str = "Harness repo context:";
+use crate::renderer::HARNESS_MARKER;
 
 /// Returns true when formatted model prompt input includes the harness fragment.
 pub fn model_prompt_contains_harness_context(items: &[ResponseItem]) -> bool {

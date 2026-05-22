@@ -114,13 +114,23 @@ fn prompt_fragment_omits_dropped_and_caps_visible_items() {
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
     assert!(!fragment.contains("Dropped:"));
-    assert!(fragment.contains("Primary files:") || fragment.contains("Also considered:"));
+    // Directive shape emits a numbered "Before editing, inspect these files first:" list.
+    assert!(fragment.contains("Before editing, inspect these files first:"));
     assert!(!fragment.contains("legacy_restaurants"));
-    let included_lines = fragment
+    let inspect_entries = fragment
         .lines()
-        .filter(|line| line.starts_with("- ") && line.contains('/'))
+        .filter(|line| {
+            line.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && line.contains(". ")
+                && line.contains(" — ")
+        })
         .count();
-    assert!(included_lines <= SelectionCaps::default().max_prompt_included_files);
+    assert!(
+        inspect_entries
+            <= SelectionCaps::default()
+                .max_prompt_included_files
+                .min(ContextPacketRenderer::MAX_INSPECT_FILES)
+    );
 }
 
 #[test]

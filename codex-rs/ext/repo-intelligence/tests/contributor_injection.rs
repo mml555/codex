@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use codex_context_harness::BuildPacketOptions;
+use codex_context_harness::RunMemory;
+use codex_context_harness::build_context_packet;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::PromptSlot;
@@ -8,6 +11,7 @@ use codex_protocol::user_input::UserInput;
 use codex_repo_index::RepoMap;
 use codex_repo_intelligence_extension::RepoIntelligenceExtension;
 use codex_repo_intelligence_extension::RepoIntelligenceExtensionConfig;
+use codex_repo_intelligence_extension::narrow_verification_hint;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 fn fixture_map() -> RepoMap {
@@ -16,7 +20,7 @@ fn fixture_map() -> RepoMap {
 }
 
 #[tokio::test]
-async fn contributor_emits_contextual_user_harness_fragment_when_enabled() {
+async fn contributor_emits_directive_repo_intelligence_fragment_when_enabled() {
     let extension = RepoIntelligenceExtension;
     let session_store = ExtensionData::new("session");
     let thread_store = ExtensionData::new("thread");
@@ -31,8 +35,69 @@ async fn contributor_emits_contextual_user_harness_fragment_when_enabled() {
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].slot(), PromptSlot::ContextualUser);
     let text = fragments[0].text();
-    assert!(text.contains("Harness repo context:"));
+    assert!(text.contains("Harness repo intelligence:"));
+    assert!(text.contains("Use this as task-routing guidance before editing."));
+    assert!(text.contains("Before editing, inspect these files first:"));
+    assert!(
+        text.contains("After editing, likely narrow verification:"),
+        "extension should append the planner-driven verification hint when one exists\n{text}"
+    );
     assert!(!text.contains("<codex-context-packet>"));
+}
+
+#[test]
+fn narrow_verification_hint_present_for_restaurant_task() {
+    let map = fixture_map();
+    let task = "fix restaurant search pagination";
+    let packet = build_context_packet(
+        task,
+        &map,
+        &RunMemory::default(),
+        BuildPacketOptions::default(),
+    );
+    let hint = narrow_verification_hint(task, &map, &packet)
+        .expect("planner should emit a narrow command for an included Python file");
+    assert!(
+        hint.starts_with("After editing, likely narrow verification:\n- "),
+        "hint must lead with the post-edit directive, got: {hint}"
+    );
+    assert!(
+        hint.contains("python -m pytest tests/")
+            && hint.lines().any(|line| line.ends_with(".py")),
+        "hint should name a narrow `python -m pytest tests/test_*.py` command, got: {hint}"
+    );
+}
+
+#[test]
+fn narrow_verification_hint_absent_when_no_narrow_command() {
+    // Minimal RepoMap: no packages, no files, no test_map.
+    // The planner has no signal to produce a narrow command, so the hint
+    // must be omitted (not rendered as an empty bullet).
+    let empty_map = RepoMap {
+        version: 2,
+        repo_id: "empty".to_string(),
+        root: "/empty".to_string(),
+        files: Vec::new(),
+        tests: Vec::new(),
+        areas: Vec::new(),
+        packages: Vec::new(),
+        area_maps: Vec::new(),
+        commands: Vec::new(),
+        test_map: Vec::new(),
+        agents_md: None,
+        warnings: Vec::new(),
+    };
+    let task = "do something with no clear area";
+    let packet = build_context_packet(
+        task,
+        &empty_map,
+        &RunMemory::default(),
+        BuildPacketOptions::default(),
+    );
+    assert!(
+        narrow_verification_hint(task, &empty_map, &packet).is_none(),
+        "expected no hint when planner produces no narrow command"
+    );
 }
 
 #[tokio::test]

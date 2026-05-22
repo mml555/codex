@@ -21,6 +21,7 @@ codex-features = { workspace = true }
 codex-protocol = { workspace = true }
 codex-repo-index = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-verification = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 

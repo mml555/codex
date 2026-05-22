@@ -39,7 +39,7 @@ fn golden_packet_shape_for_restaurant_search_task() {
 }
 
 #[test]
-fn renderer_outputs_non_empty_fragments() {
+fn renderer_emits_directive_routing_fragment() {
     let map = fixture_map();
     let packet = build_context_packet(
         "fix restaurant search pagination",
@@ -48,23 +48,77 @@ fn renderer_outputs_non_empty_fragments() {
         BuildPacketOptions::default(),
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
-    assert!(fragment.contains("Harness repo context:"));
+
+    // New directive header + routing language.
+    assert!(fragment.contains("Harness repo intelligence:"));
+    assert!(fragment.contains("Use this as task-routing guidance before editing."));
     assert!(fragment.contains("Task: fix restaurant search pagination"));
-    assert!(fragment.contains("Guidance: Treat this as a repo map."));
-    assert!(fragment.contains("Repo rules:"));
-    assert!(fragment.contains("- Project AGENTS.md instructions"));
-    assert!(fragment.contains("Primary files:"));
-    assert!(fragment.contains("restaurants.py"));
-    assert!(fragment.contains("why: Path matches"));
-    assert!(fragment.contains("relevance="));
-    assert!(fragment.contains("evidence="));
-    assert!(fragment.contains("path: tests/api/test_restaurants.py; why:"));
-    assert!(!fragment.contains("<codex-context-packet>"));
-    assert!(!fragment.contains("Primary files:\n- Project AGENTS.md instructions"));
+    assert!(fragment.contains("Before editing, inspect these files first:"));
+    // Inspect entries are numbered (`1. `, `2. `, ...) with a reason after `—`.
+    let numbered_lines: Vec<_> = fragment
+        .lines()
+        .filter(|line| line.starts_with("1. ") || line.starts_with("2. "))
+        .collect();
+    assert!(
+        !numbered_lines.is_empty(),
+        "expected numbered inspect entries:\n{fragment}"
+    );
+    assert!(
+        numbered_lines.iter().all(|line| line.contains(" — ")),
+        "every numbered entry must carry a `<path> — <reason>` shape:\n{fragment}"
+    );
+    // The most-relevant fixture path is in the inspect list.
+    assert!(fragment.contains("restaurants.py"), "{fragment}");
+
+    // Background-only sections that used to dominate the fragment must be gone.
+    assert!(
+        !fragment.contains("Guidance: Treat this as a repo map."),
+        "old descriptive guidance line leaked:\n{fragment}"
+    );
+    assert!(!fragment.contains("Primary files:"), "{fragment}");
+    assert!(!fragment.contains("Also considered:"), "{fragment}");
+    assert!(!fragment.contains("Likely tests:"), "{fragment}");
+    assert!(!fragment.contains("Repo rules:"), "{fragment}");
+    assert!(!fragment.contains("Warnings:"), "{fragment}");
+    assert!(!fragment.contains("evidence="), "{fragment}");
+    assert!(!fragment.contains("<codex-context-packet>"), "{fragment}");
 }
 
 #[test]
-fn repo_rules_do_not_spend_file_prompt_cap() {
+fn renderer_inspect_list_is_capped_at_five() {
+    let map = fixture_map();
+    let packet = build_context_packet(
+        "fix restaurant search pagination",
+        &map,
+        &RunMemory::default(),
+        BuildPacketOptions::default(),
+    );
+    // Caller asks for more than the hard cap; renderer must clamp to ≤5.
+    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(
+        &packet,
+        SelectionCaps {
+            max_prompt_included_files: 50,
+            ..SelectionCaps::default()
+        },
+    );
+
+    let inspect_entries = fragment
+        .lines()
+        .filter(|line| {
+            line.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && line.contains(". ")
+                && line.contains(" — ")
+        })
+        .count();
+    assert!(
+        inspect_entries <= ContextPacketRenderer::MAX_INSPECT_FILES,
+        "inspect list exceeded {} entries: {inspect_entries}\n{fragment}",
+        ContextPacketRenderer::MAX_INSPECT_FILES
+    );
+}
+
+#[test]
+fn renderer_caller_cap_can_shrink_inspect_list_below_max() {
     let map = fixture_map();
     let packet = build_context_packet(
         "fix restaurant search pagination",
@@ -76,70 +130,18 @@ fn repo_rules_do_not_spend_file_prompt_cap() {
         &packet,
         SelectionCaps {
             max_prompt_included_files: 1,
-            max_prompt_tests: 0,
-            max_prompt_warnings: 0,
             ..SelectionCaps::default()
         },
     );
 
-    assert!(fragment.contains("Repo rules:"));
-    assert!(fragment.contains("- Project AGENTS.md instructions"));
-    assert!(fragment.contains("Primary files:"));
-    assert!(fragment.contains("restaurants.py"));
+    let inspect_entries = fragment
+        .lines()
+        .filter(|line| line.starts_with("1. ") || line.starts_with("2. "))
+        .count();
     assert_eq!(
-        fragment
-            .lines()
-            .filter(|line| line.starts_with("- ") && line.contains('/'))
-            .count(),
-        1
+        inspect_entries, 1,
+        "caller cap should clamp inspect list to 1 entry:\n{fragment}"
     );
-}
-
-#[test]
-fn repo_rules_do_not_spend_primary_file_slots() {
-    let map = fixture_map();
-    let caps = SelectionCaps {
-        max_prompt_full_files: 1,
-        max_prompt_compact_files: 0,
-        max_prompt_tests: 0,
-        max_prompt_warnings: 0,
-        ..SelectionCaps::default()
-    };
-    let packet = build_context_packet(
-        "fix restaurant search pagination",
-        &map,
-        &RunMemory::default(),
-        BuildPacketOptions {
-            selection: caps,
-            ..BuildPacketOptions::default()
-        },
-    );
-    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(&packet, caps);
-
-    assert!(fragment.contains("Repo rules:"));
-    assert!(fragment.contains("- Project AGENTS.md instructions"));
-    assert!(fragment.contains("Primary files:"));
-    assert!(fragment.contains("restaurants.py"));
-}
-
-#[test]
-fn zero_test_prompt_cap_omits_likely_tests_section() {
-    let map = fixture_map();
-    let packet = build_context_packet(
-        "fix restaurant search pagination",
-        &map,
-        &RunMemory::default(),
-        BuildPacketOptions::default(),
-    );
-    let fragment = ContextPacketRenderer::render_prompt_fragment_with_caps(
-        &packet,
-        SelectionCaps {
-            max_prompt_tests: 0,
-            ..SelectionCaps::default()
-        },
-    );
-
-    assert!(!fragment.contains("Likely tests:"));
 }
 
 #[test]
