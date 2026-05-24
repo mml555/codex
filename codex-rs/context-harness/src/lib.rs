@@ -34,6 +34,7 @@ pub use agent_eval::AgentRunInvalidReason;
 pub use agent_eval::AgentRunRecord;
 pub use agent_eval::AgentRunScore;
 pub use agent_eval::ResultReason;
+pub use agent_eval::TaskCategory;
 pub use agent_eval::TokenUsageTotals;
 pub use agent_eval::agent_labels_from_task;
 pub use agent_eval::build_report;

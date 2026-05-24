@@ -132,3 +132,71 @@ fn codex_session_fixture_loads() {
             .all(|t| matches!(t.workdir, codex_context_harness::AgentEvalWorkdir::CodexRs))
     );
 }
+
+#[test]
+fn ri_v1_fixture_loads_15_tasks_across_five_categories() {
+    use codex_context_harness::TaskCategory;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/agent_eval_tasks_ri_v1.json");
+    let tasks = load_agent_eval_tasks(&path).expect("ri_v1 fixture loads");
+    assert_eq!(
+        tasks.len(),
+        15,
+        "ri_v1 fixture must hold exactly 15 tasks (3 per category × 5 categories)"
+    );
+
+    // All tasks run against the codex-rs tree — `--isolated-worktrees` is
+    // mandatory for this fixture.
+    for t in &tasks {
+        assert!(
+            matches!(t.workdir, codex_context_harness::AgentEvalWorkdir::CodexRs),
+            "task {} must declare workdir=codex_rs",
+            t.id
+        );
+        assert!(!t.id.is_empty(), "task missing id");
+        assert!(!t.task.is_empty(), "task {} missing prompt text", t.id);
+        assert!(
+            !t.relevant_files.is_empty(),
+            "task {} must declare at least one relevant_file (gold)",
+            t.id
+        );
+        assert!(
+            t.category.is_some(),
+            "task {} must declare a category",
+            t.id
+        );
+    }
+
+    // Counts per category match the proposal: 3 per category, all 5 covered.
+    let mut counts = std::collections::BTreeMap::<TaskCategory, usize>::new();
+    for t in &tasks {
+        *counts.entry(t.category.unwrap()).or_default() += 1;
+    }
+    let expected = [
+        (TaskCategory::FileRouting, 3),
+        (TaskCategory::BridgeWiring, 3),
+        (TaskCategory::TestTargeting, 3),
+        (TaskCategory::LocalConvention, 3),
+        (TaskCategory::CrossModuleOwnership, 3),
+    ];
+    for (cat, want) in expected {
+        let got = counts.get(&cat).copied().unwrap_or(0);
+        assert_eq!(
+            got, want,
+            "category {} count: expected {}, got {}",
+            cat.slug(),
+            want,
+            got
+        );
+    }
+
+    // All task IDs are unique.
+    let mut ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        tasks.len(),
+        "duplicate task ids in ri_v1 fixture"
+    );
+}

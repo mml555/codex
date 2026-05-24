@@ -34,6 +34,44 @@ pub struct AgentEvalTask {
     /// `calculator` copies the Python E2E fixture; `codex_rs` runs in the codex-rs tree.
     #[serde(default)]
     pub workdir: AgentEvalWorkdir,
+    /// Coarse-grained category for grouping the report. None tasks render under
+    /// a final "uncategorized" group.
+    #[serde(default)]
+    pub category: Option<TaskCategory>,
+}
+
+/// What aspect of repo intelligence a task is meant to exercise. Used purely
+/// for report grouping — scoring is unchanged across categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCategory {
+    /// Multiple files share the same keyword; RI should route to the right
+    /// one before the first edit.
+    FileRouting,
+    /// Task names an owner concept; RI should also surface the bridge file
+    /// the agent has to touch to wire it.
+    BridgeWiring,
+    /// Task names a behavior to verify; RI should point at the matching test
+    /// file rather than a same-named file in src/.
+    TestTargeting,
+    /// Task asks to follow a convention that exists in one specific file
+    /// (e.g. a feature-flag entry); RI should surface that file.
+    LocalConvention,
+    /// Task implicitly requires edits in two or more crates; RI should
+    /// surface both owner and dependent.
+    CrossModuleOwnership,
+}
+
+impl TaskCategory {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::FileRouting => "file_routing",
+            Self::BridgeWiring => "bridge_wiring",
+            Self::TestTargeting => "test_targeting",
+            Self::LocalConvention => "local_convention",
+            Self::CrossModuleOwnership => "cross_module_ownership",
+        }
+    }
 }
 
 /// Recorded outcome of one agent run (vanilla or harness-context).
@@ -211,6 +249,8 @@ pub struct AgentEvalComparison {
     #[serde(default)]
     pub excluded_reason: Option<String>,
     pub result: AgentEvalResult,
+    #[serde(default)]
+    pub category: Option<TaskCategory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +462,7 @@ pub fn compare_task(
         valid_for_comparison,
         excluded_reason,
         result,
+        category: task.category,
     }
 }
 
@@ -573,6 +614,7 @@ impl AgentEvalTask {
             verify_command: None,
             bridge_files: fixture.bridge_files.clone(),
             workdir: AgentEvalWorkdir::Calculator,
+            category: None,
         }
     }
 }
@@ -583,8 +625,11 @@ impl AgentEvalTask {
 /// `Task | Valid? | RI visible? | Target files V/RI | Extra files V/RI |
 ///  Turns V/RI | Tokens V/RI | Result`
 ///
-/// Missing dimensions (e.g. token usage when the run had no completed turn)
-/// render as `—`. Excluded pairs render `—` across every data column.
+/// Rows are grouped by [`TaskCategory`] with a `== <category> ==` header and
+/// a per-group `Group: <category> — N ri_better / N ri_worse / ...` summary
+/// line. Column widths are computed across the whole report so columns line
+/// up vertically across groups. Missing dimensions render as `—`. Excluded
+/// pairs render `—` across every data column.
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
     const HEADERS: [&str; 8] = [
         "Task",
@@ -597,17 +642,19 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         "Result",
     ];
 
-    let mut rows: Vec<[String; 8]> = Vec::with_capacity(report.comparisons.len());
-    for row in &report.comparisons {
-        rows.push(format_table_row(row));
-    }
+    // Build all rows once; we need widths up front for the entire report.
+    let formatted: Vec<(Option<TaskCategory>, &AgentEvalComparison, [String; 8])> = report
+        .comparisons
+        .iter()
+        .map(|row| (row.category, row, format_table_row(row)))
+        .collect();
 
     let mut widths = [0usize; 8];
     for (i, header) in HEADERS.iter().enumerate() {
         widths[i] = header.len();
     }
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
+    for (_, _, cells) in &formatted {
+        for (i, cell) in cells.iter().enumerate() {
             widths[i] = widths[i].max(cell.len());
         }
     }
@@ -621,8 +668,23 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         parts.join(" | ")
     };
     let header_cells: [String; 8] = HEADERS.map(str::to_string);
-    let separator_cells: [String; 8] =
-        std::array::from_fn(|i| "-".repeat(widths[i]));
+    let separator_cells: [String; 8] = std::array::from_fn(|i| "-".repeat(widths[i]));
+
+    // Group by category. None goes last under `uncategorized`. Within a
+    // group rows keep their original order so callers can pre-sort by id.
+    let category_order: Vec<Option<TaskCategory>> = {
+        let mut seen: Vec<Option<TaskCategory>> = Vec::new();
+        for (cat, _, _) in &formatted {
+            if !seen.contains(cat) {
+                seen.push(*cat);
+            }
+        }
+        seen.sort_by_key(|cat| match cat {
+            Some(c) => (0, c.slug()),
+            None => (1, ""),
+        });
+        seen
+    };
 
     let mut lines = Vec::new();
     lines.push(format!(
@@ -638,13 +700,48 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
             .collect();
         lines.push(format!("Invalid reasons: {}", reasons.join(", ")));
     }
-    lines.push(String::new());
-    lines.push(render_row(&header_cells));
-    lines.push(render_row(&separator_cells));
-    for row in &rows {
-        lines.push(render_row(row));
+
+    for category in &category_order {
+        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, [String; 8])> = formatted
+            .iter()
+            .filter(|(c, _, _)| c == category)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let category_label = category.map_or("uncategorized", TaskCategory::slug);
+        lines.push(String::new());
+        lines.push(format!("== {category_label} =="));
+        lines.push(render_row(&header_cells));
+        lines.push(render_row(&separator_cells));
+        for (_, _, cells) in &group {
+            lines.push(render_row(cells));
+        }
+        lines.push(format!(
+            "Group: {category_label} — {}",
+            group_summary(group.iter().map(|(_, row, _)| *row)),
+        ));
     }
+
     lines.join("\n")
+}
+
+/// Count `result` outcomes across a slice of comparisons and emit a one-line
+/// summary like `2 ri_better / 0 ri_worse / 1 tie / 0 excluded`.
+fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) -> String {
+    let mut better = 0u32;
+    let mut worse = 0u32;
+    let mut tie = 0u32;
+    let mut excluded = 0u32;
+    for row in rows {
+        match row.result {
+            AgentEvalResult::RiBetter { .. } => better += 1,
+            AgentEvalResult::RiWorse { .. } => worse += 1,
+            AgentEvalResult::Tie => tie += 1,
+            AgentEvalResult::Excluded { .. } => excluded += 1,
+        }
+    }
+    format!("{better} ri_better / {worse} ri_worse / {tie} tie / {excluded} excluded")
 }
 
 const DASH: &str = "—";
@@ -753,6 +850,7 @@ mod tests {
             verify_command: Some("python -m pytest tests/test_calculator.py".to_string()),
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::Calculator,
+            category: None,
         }
     }
 
@@ -937,6 +1035,7 @@ mod tests {
             verify_command: None,
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::CodexRs,
+            category: None,
         };
         let record = AgentRunRecord {
             changed_files: vec!["codex-rs/cli/src/context_cmd.rs".to_string()],
@@ -961,6 +1060,7 @@ mod tests {
             verify_command: None,
             bridge_files: vec!["cli/src/main.rs".to_string()],
             workdir: AgentEvalWorkdir::CodexRs,
+            category: None,
         };
         let record = AgentRunRecord {
             changed_files: vec!["codex-rs/cli/src/main.rs".to_string()],
@@ -1173,5 +1273,112 @@ mod tests {
             "expected token cell to render as `—/—` when both arms lack usage data\n{text}"
         );
         assert!(text.contains("ri_better:fewer_turns"), "{text}");
+    }
+
+    #[test]
+    fn task_category_serializes_as_snake_case() {
+        let cat = TaskCategory::CrossModuleOwnership;
+        assert_eq!(
+            serde_json::to_string(&cat).unwrap(),
+            "\"cross_module_ownership\""
+        );
+        let back: TaskCategory = serde_json::from_str("\"bridge_wiring\"").unwrap();
+        assert_eq!(back, TaskCategory::BridgeWiring);
+    }
+
+    #[test]
+    fn category_flows_through_compare_task() {
+        let mut task = calculator_task();
+        task.category = Some(TaskCategory::FileRouting);
+        let vanilla = synthetic_record(AgentArm::Vanilla, &task.id);
+        let treatment = synthetic_record(AgentArm::RepoIntelligence, &task.id);
+        let row = compare_task(&task, &vanilla, &treatment);
+        assert_eq!(row.category, Some(TaskCategory::FileRouting));
+    }
+
+    #[test]
+    fn render_human_groups_by_category_with_summary_lines() {
+        let mut t_routing = calculator_task();
+        t_routing.id = "fr_1".to_string();
+        t_routing.category = Some(TaskCategory::FileRouting);
+        let mut t_bridge = calculator_task();
+        t_bridge.id = "bw_1".to_string();
+        t_bridge.category = Some(TaskCategory::BridgeWiring);
+        let mut t_uncat = calculator_task();
+        t_uncat.id = "uc_1".to_string();
+        t_uncat.category = None;
+
+        // For fr_1: RI hits gold, vanilla doesn't → ri_better:file_targeting.
+        let mk_records = |task: &AgentEvalTask, ri_hits: bool| {
+            let vanilla = AgentRunRecord {
+                changed_files: vec!["README.md".to_string()],
+                tests_passed: false,
+                turn_count: Some(4),
+                ..synthetic_record(AgentArm::Vanilla, &task.id)
+            };
+            let treatment = AgentRunRecord {
+                changed_files: if ri_hits {
+                    vec!["src/calculator.py".to_string()]
+                } else {
+                    vec!["README.md".to_string()]
+                },
+                tests_passed: ri_hits,
+                turn_count: Some(2),
+                harness_context_visible: true,
+                ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
+            };
+            (vanilla, treatment)
+        };
+
+        let (v1, t1) = mk_records(&t_routing, true); // ri_better
+        let (v2, t2) = mk_records(&t_bridge, false); // ri_worse (both miss but vanilla touches same wrong file; classifier picks Tie or another path)
+        let (v3, t3) = mk_records(&t_uncat, true); // ri_better
+
+        let report = build_report(vec![
+            compare_task(&t_routing, &v1, &t1),
+            compare_task(&t_bridge, &v2, &t2),
+            compare_task(&t_uncat, &v3, &t3),
+        ]);
+        let text = render_agent_eval_human(&report);
+
+        // Each category gets a header.
+        assert!(text.contains("== bridge_wiring =="), "missing bw header:\n{text}");
+        assert!(text.contains("== file_routing =="), "missing fr header:\n{text}");
+        assert!(text.contains("== uncategorized =="), "missing uncat header:\n{text}");
+
+        // Each group has a per-group summary line.
+        let group_summaries: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("Group: "))
+            .collect();
+        assert_eq!(
+            group_summaries.len(),
+            3,
+            "expected exactly 3 group summaries, got {}:\n{text}",
+            group_summaries.len()
+        );
+
+        // None group renders last.
+        let bw_idx = text.find("== bridge_wiring ==").unwrap();
+        let fr_idx = text.find("== file_routing ==").unwrap();
+        let uc_idx = text.find("== uncategorized ==").unwrap();
+        assert!(bw_idx < fr_idx, "categories should be alphabetic; bw < fr");
+        assert!(fr_idx < uc_idx, "uncategorized must come last");
+
+        // Column widths shared across groups: header line appears under each
+        // category and lines up (same character count).
+        let header_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("Task "))
+            .collect();
+        assert_eq!(header_lines.len(), 3, "one header per group");
+        let first_len = header_lines[0].len();
+        for h in &header_lines[1..] {
+            assert_eq!(
+                h.len(),
+                first_len,
+                "header widths drifted across groups:\n{text}"
+            );
+        }
     }
 }

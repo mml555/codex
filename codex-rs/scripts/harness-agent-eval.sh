@@ -6,7 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODEX_RS_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FIXTURE_SRC="${CODEX_RS_ROOT}/context-harness/tests/fixtures/e2e_python_calculator"
 CALCULATOR_TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks.json"
-CODEX_SESSION_TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks_codex_session.json"
+# v1 RI fixture: 15 codex_rs tasks across the five RI categories. Requires
+# --isolated-worktrees because every task edits the live codex-rs tree.
+CODEX_SESSION_TASK_FIXTURE="${CODEX_RS_ROOT}/context-harness/tests/fixtures/agent_eval_tasks_ri_v1.json"
 TASK_FIXTURE="${CALCULATOR_TASK_FIXTURE}"
 FIXTURE_EXPLICIT=0
 
@@ -41,8 +43,9 @@ Fixtures:
   default: context-harness/tests/fixtures/agent_eval_tasks.json
     Uses workdir "calculator", which copies the Python calculator fixture into
     a fresh temporary git repo for each arm.
-  --session-injection default: context-harness/tests/fixtures/agent_eval_tasks_codex_session.json
-    unless --fixture is set.
+  --session-injection default: context-harness/tests/fixtures/agent_eval_tasks_ri_v1.json
+    (15 codex_rs tasks across file_routing / bridge_wiring / test_targeting /
+    local_convention / cross_module_ownership), unless --fixture is set.
   Task fixtures may set "workdir": "codex_rs" to run the task directly in this
     codex-rs checkout instead of a copied temp fixture. Without
     --isolated-worktrees, both arms share ${CODEX_RS_ROOT} (their edits and
