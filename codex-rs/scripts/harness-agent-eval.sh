@@ -523,25 +523,20 @@ ${task_text}"
 
   local events="${ARTIFACTS_DIR}/${task_id}/${arm}/events.jsonl"
   mkdir -p "$(dirname "${events}")"
-  set +e
-  if ((${#OSS_ARGS[@]} > 0)); then
-    "${CODEX_BIN}" exec "${OSS_ARGS[@]}" -s workspace-write \
-      --dangerously-bypass-approvals-and-sandbox \
-      --json \
-      "${prompt}" </dev/null >"${events}" 2>/dev/null
-  else
-    if [[ "${arm}" == "repo_intelligence" ]]; then
-      "${CODEX_BIN}" exec -c features.repo_intelligence=true -s workspace-write \
-        --dangerously-bypass-approvals-and-sandbox \
-        --json \
-        "${prompt}" </dev/null >"${events}" 2>/dev/null
-    else
-      "${CODEX_BIN}" exec -s workspace-write \
-        --dangerously-bypass-approvals-and-sandbox \
-        --json \
-        "${prompt}" </dev/null >"${events}" 2>/dev/null
-    fi
+  # The repo_intelligence arm needs features.repo_intelligence=true regardless
+  # of provider mode. Without it the extension early-returns on the gate
+  # check and the RI arm reduces to vanilla — invalidating the entire A/B.
+  local feature_args=()
+  if [[ "${arm}" == "repo_intelligence" ]]; then
+    feature_args=(-c features.repo_intelligence=true)
   fi
+  # `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under `set -u`
+  # (bash 3.x on macOS treats an empty `${arr[@]}` as unbound).
+  set +e
+  "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
+    --dangerously-bypass-approvals-and-sandbox \
+    --json \
+    "${prompt}" </dev/null >"${events}" 2>/dev/null
   local exec_exit=$?
   set -e
 
