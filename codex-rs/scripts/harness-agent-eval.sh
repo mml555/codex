@@ -112,7 +112,8 @@ while [[ $# -gt 0 ]]; do
       shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --codex-bin | --artifacts-dir | --fixture | --run | --session-injection | --verbose | -h | --help) break ;;
+          --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
+            | --isolated-worktrees | --base-ref | --verbose | -h | --help) break ;;
           *)
             OSS_ARGS+=("$1")
             shift
