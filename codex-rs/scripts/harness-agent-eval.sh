@@ -15,11 +15,17 @@ ARTIFACTS_DIR=""
 RUN_AGENT=0
 SESSION_INJECTION=0
 VERBOSE=0
+ISOLATED_WORKTREES=0
+BASE_REF="HEAD"
+BASE_REF_SHA=""
+REPO_ROOT=""
 OSS_ARGS=()
 
 usage() {
   cat <<'EOF'
-Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH] [--run] [--session-injection] [--verbose] [--oss ...]
+Usage: harness-agent-eval.sh [--codex-bin PATH] [--artifacts-dir DIR] [--fixture PATH]
+                             [--run] [--session-injection] [--isolated-worktrees] [--base-ref REF]
+                             [--verbose] [--oss ...]
 
 Compares vanilla Codex vs treatment Codex on the same tasks.
 
@@ -38,11 +44,17 @@ Fixtures:
   --session-injection default: context-harness/tests/fixtures/agent_eval_tasks_codex_session.json
     unless --fixture is set.
   Task fixtures may set "workdir": "codex_rs" to run the task directly in this
-    codex-rs checkout instead of a copied temp fixture. The script resolves the
-    checkout as ${CODEX_RS_ROOT} (scripts/..) and uses it as the cwd for both
-    arms; it does not copy or reset the worktree. This mode is intended for
-    Codex-repo tasks, so use a clean disposable checkout because agent edits and
-    git diffs are collected from the real worktree.
+    codex-rs checkout instead of a copied temp fixture. Without
+    --isolated-worktrees, both arms share ${CODEX_RS_ROOT} (their edits and
+    git diffs leak across arms — only safe on a disposable checkout).
+
+Isolation:
+  --isolated-worktrees   For "codex_rs" workdirs, give each arm a fresh
+                         `git worktree add --detach` rooted at --base-ref and
+                         clean it up after artifact capture. Calculator-mode
+                         arms are already isolated by `mktemp -d` + `git init`.
+  --base-ref REF         Resolved by `git rev-parse REF` against the codex-rs
+                         repo root before any arms run. Default: HEAD.
 
 Without --run: scores existing artifacts only (requires record.json per task/arm).
 With --run: executes both arms via `codex exec --json` (needs a working model provider).
@@ -84,6 +96,14 @@ while [[ $# -gt 0 ]]; do
       VERBOSE=1
       shift
       ;;
+    --isolated-worktrees)
+      ISOLATED_WORKTREES=1
+      shift
+      ;;
+    --base-ref)
+      BASE_REF="$2"
+      shift 2
+      ;;
     --oss)
       OSS_ARGS=(--oss)
       shift
@@ -112,6 +132,68 @@ done
 if [[ "${SESSION_INJECTION}" -eq 1 && "${FIXTURE_EXPLICIT}" -eq 0 ]]; then
   TASK_FIXTURE="${CODEX_SESSION_TASK_FIXTURE}"
 fi
+
+resolve_isolation_base() {
+  if [[ "${ISOLATED_WORKTREES}" -ne 1 ]]; then
+    return
+  fi
+  REPO_ROOT="$(git -C "${CODEX_RS_ROOT}" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -z "${REPO_ROOT}" ]]; then
+    echo "--isolated-worktrees requires a git repo; ${CODEX_RS_ROOT} is not inside one" >&2
+    exit 2
+  fi
+  BASE_REF_SHA="$(git -C "${REPO_ROOT}" rev-parse "${BASE_REF}" 2>/dev/null || true)"
+  if [[ -z "${BASE_REF_SHA}" ]]; then
+    echo "--base-ref ${BASE_REF} could not be resolved in ${REPO_ROOT}" >&2
+    exit 2
+  fi
+}
+
+# Create the per-arm workdir. Echoes a single line "<workdir>|<isolated>|<base_ref>" so the
+# caller can record it; non-isolated calculator runs report isolated=true,base_ref="" because
+# `mktemp -d` + `git init` already guarantees per-arm isolation.
+create_arm_workdir() {
+  local workdir_kind="$1"
+  local workdir worktree_root
+  local isolated=true
+  local base_ref=""
+  if [[ "${workdir_kind}" == "codex_rs" ]]; then
+    if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
+      worktree_root="$(mktemp -d -t codex-arm-XXXXXX)"
+      # `git worktree add` insists on a path that does not yet exist.
+      rmdir "${worktree_root}"
+      git -C "${REPO_ROOT}" worktree add --detach -q "${worktree_root}" "${BASE_REF_SHA}"
+      workdir="${worktree_root}/codex-rs"
+      base_ref="${BASE_REF_SHA}"
+    else
+      workdir="${CODEX_RS_ROOT}"
+      isolated=false
+    fi
+  else
+    workdir="$(mktemp -d)"
+    cp -R "${FIXTURE_SRC}/." "${workdir}/"
+    (
+      cd "${workdir}"
+      git init -q
+      git add -A
+      git commit -q -m initial
+    )
+  fi
+  printf '%s|%s|%s\n' "${workdir}" "${isolated}" "${base_ref}"
+}
+
+# Remove an isolated worktree. No-op for shared codex_rs runs and for
+# calculator mktemp dirs (those are cleaned later via OS tmp reaping).
+cleanup_arm_workdir() {
+  local workdir_kind="$1"
+  local workdir="$2"
+  local isolated="$3"
+  if [[ "${workdir_kind}" == "codex_rs" && "${isolated}" == "true" ]]; then
+    local worktree_root
+    worktree_root="$(dirname "${workdir}")"
+    git -C "${REPO_ROOT}" worktree remove --force "${worktree_root}" 2>/dev/null || true
+  fi
+}
 
 log() {
   if [[ "${VERBOSE}" -eq 1 ]]; then
@@ -285,6 +367,10 @@ write_record() {
   local tokens_input="${11}"
   local tokens_output="${12}"
   local tokens_total="${13}"
+  # Worktree metadata: passed via env (RECORD_WORKTREE_ISOLATED /
+  # RECORD_BASE_REF / RECORD_WORKTREE_PATH) to keep the positional surface
+  # bounded. `serde(default)` on the Rust side accepts records that lack
+  # these keys.
   local repo_intel_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
@@ -292,8 +378,11 @@ write_record() {
     repo_intel_enabled=true
   fi
   mkdir -p "$(dirname "${out}")"
+  RECORD_WORKTREE_ISOLATED="${RECORD_WORKTREE_ISOLATED:-false}" \
+  RECORD_BASE_REF="${RECORD_BASE_REF:-}" \
+  RECORD_WORKTREE_PATH="${RECORD_WORKTREE_PATH:-}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
-import json, sys
+import json, os, sys
 (
     out,
     arm,
@@ -314,6 +403,9 @@ import json, sys
 def opt_int(value):
     return int(value) if value not in ("", "null") else None
 
+def opt_str(value):
+    return value if value else None
+
 record = {
     "arm": arm,
     "task_id": task_id,
@@ -328,6 +420,9 @@ record = {
     "tokens_input": opt_int(tokens_input),
     "tokens_output": opt_int(tokens_output),
     "tokens_total": opt_int(tokens_total),
+    "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
+    "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
+    "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
 }
 with open(out, "w", encoding="utf-8") as f:
     json.dump(record, f, indent=2)
@@ -405,18 +500,13 @@ run_arm() {
   local task_text="$3"
   local verify_cmd="$4"
   local workdir_kind="${5:-calculator}"
-  local workdir
-  if [[ "${workdir_kind}" == "codex_rs" ]]; then
-    workdir="${CODEX_RS_ROOT}"
-    cd "${workdir}"
-  else
-    workdir="$(mktemp -d)"
-    cp -R "${FIXTURE_SRC}/." "${workdir}/"
-    cd "${workdir}"
-    git init -q
-    git add -A
-    git commit -q -m initial
-  fi
+  local workdir_info workdir worktree_isolated base_ref
+  workdir_info="$(create_arm_workdir "${workdir_kind}")"
+  workdir="${workdir_info%%|*}"
+  workdir_info="${workdir_info#*|}"
+  worktree_isolated="${workdir_info%%|*}"
+  base_ref="${workdir_info#*|}"
+  cd "${workdir}"
 
   local prompt="${task_text}"
   if [[ "${arm}" == "harness" ]]; then
@@ -453,7 +543,11 @@ ${task_text}"
   set -e
 
   local changed_json
-  changed_json="$(python3 -c 'import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l.strip()]))' <<<"$(git diff --name-only)")"
+  # Capture both modified tracked files (vs HEAD / base_ref) and untracked
+  # files honoring .gitignore. `git diff --name-only` alone misses new files,
+  # which are the common shape of "add a regression test" tasks and would
+  # zero out target_files_hit in the score.
+  changed_json="$( { git diff --name-only HEAD; git ls-files --others --exclude-standard; } | python3 -c 'import json,sys; print(json.dumps(sorted(set(l for l in sys.stdin.read().splitlines() if l.strip()))))')"
   local tests_passed=false
   if [[ -n "${verify_cmd}" ]]; then
     set +e
@@ -480,20 +574,33 @@ ${task_text}"
   if [[ "${run_valid}" == "true" ]]; then
     invalid_reason=""
   fi
+  RECORD_WORKTREE_ISOLATED="${worktree_isolated}" \
+  RECORD_BASE_REF="${base_ref}" \
+  RECORD_WORKTREE_PATH="${workdir}" \
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
     "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
-  log "arm=${arm} task=${task_id} workdir=${workdir} exit=${exec_exit}"
+  cd "${CODEX_RS_ROOT}"
+  cleanup_arm_workdir "${workdir_kind}" "${workdir}" "${worktree_isolated}"
+  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit}"
 }
 
 resolve_codex_bin
+resolve_isolation_base
 if [[ -z "${ARTIFACTS_DIR}" ]]; then
   ARTIFACTS_DIR="$(mktemp -d)"
   log "artifacts: ${ARTIFACTS_DIR}"
 fi
+if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
+  log "isolated worktrees enabled; base_ref=${BASE_REF} (${BASE_REF_SHA}) repo=${REPO_ROOT}"
+fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
-  while IFS=$'\t' read -r id task verify workdir_kind || [[ -n "${id:-}" ]]; do
+  # Use ASCII Unit Separator (\x1f), not tab, so an empty verify_command
+  # does not cause adjacent IFS whitespace to collapse and shift fields
+  # (which makes workdir_kind silently default to "calculator" and turns
+  # the next task's id into a stray `eval` argument).
+  while IFS=$'\x1f' read -r id task verify workdir_kind || [[ -n "${id:-}" ]]; do
     [[ -z "${id}" ]] && break
     workdir_kind="${workdir_kind:-calculator}"
     if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
@@ -512,7 +619,7 @@ for t in tasks:
         t["task"],
         t.get("verify_command") or "",
         t.get("workdir", "calculator"),
-        sep="\t",
+        sep="\x1f",
     )
 PY
 )

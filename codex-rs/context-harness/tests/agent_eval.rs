@@ -29,6 +29,9 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         tokens_input: None,
         tokens_output: None,
         tokens_total: None,
+        worktree_isolated: false,
+        base_ref: None,
+        worktree_path: None,
     }
 }
 

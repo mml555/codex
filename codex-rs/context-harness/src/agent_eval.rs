@@ -63,6 +63,22 @@ pub struct AgentRunRecord {
     pub tokens_output: Option<u64>,
     #[serde(default)]
     pub tokens_total: Option<u64>,
+    /// True when this arm ran in a worktree that was not shared with any other
+    /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
+    /// was set; for `calculator` workdirs the arm always gets a fresh
+    /// `mktemp -d` + `git init`, so this is always true.
+    #[serde(default)]
+    pub worktree_isolated: bool,
+    /// Resolved git SHA the arm's worktree started from. `None` for
+    /// `calculator` workdirs (no shared base ref) and for non-isolated
+    /// `codex_rs` runs.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// Absolute path of the cwd the arm ran in. Recorded so a reviewer can
+    /// later distinguish two runs that nominally shared the same checkout
+    /// from two runs that were genuinely isolated.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -755,6 +771,9 @@ mod tests {
             tokens_input: None,
             tokens_output: None,
             tokens_total: None,
+            worktree_isolated: false,
+            base_ref: None,
+            worktree_path: None,
         }
     }
 
@@ -873,6 +892,22 @@ mod tests {
         assert!(record.run_valid);
         assert_eq!(record.invalid_reason, None);
         assert_eq!(record.tokens_total, None);
+        // Pre-isolation artifacts must keep loading (serde(default)).
+        assert!(!record.worktree_isolated);
+        assert_eq!(record.base_ref, None);
+        assert_eq!(record.worktree_path, None);
+    }
+
+    #[test]
+    fn isolated_worktree_metadata_round_trips() {
+        let json = r#"{"arm":"repo_intelligence","task_id":"t","changed_files":[],"tests_passed":false,"turn_count":null,"exec_exit_code":null,"harness_context_visible":true,"worktree_isolated":true,"base_ref":"abc123","worktree_path":"/tmp/codex-arm-XXXX/codex-rs"}"#;
+        let record: AgentRunRecord = serde_json::from_str(json).unwrap();
+        assert!(record.worktree_isolated);
+        assert_eq!(record.base_ref.as_deref(), Some("abc123"));
+        assert_eq!(
+            record.worktree_path.as_deref(),
+            Some("/tmp/codex-arm-XXXX/codex-rs")
+        );
     }
 
     #[test]
