@@ -1,0 +1,15 @@
+[
+  {
+    "id": "rate_limit_invalid_reason_cross_lang",
+    "category": "cross_module_ownership",
+    "workdir": "codex_rs",
+    "task": "The eval harness has an enum that classifies why a model run was invalid (provider_usage_limit, provider_auth_error, etc.). Add a NEW variant `ProviderRateLimit` with snake_case slug `\"provider_rate_limit\"`. Then update the bash agent-eval runner so that its Python `classify_run_validity` detects error messages containing the phrase \"rate limit\" (case-insensitive) and emits `provider_rate_limit` instead of `provider_usage_limit`. Both the Rust enum (with its slug-mapping helper) and the bash classifier need to be updated for the change to be functional.",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs"
+    ],
+    "bridge_files": [
+      "scripts/harness-agent-eval.sh"
+    ],
+    "danger_zones": []
+  }
+]

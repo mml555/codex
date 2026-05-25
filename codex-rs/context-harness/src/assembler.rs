@@ -410,36 +410,10 @@ fn score_file_for_task(
         }
     }
 
-    if task_targets_crate(terms, "context-harness") && file.path.starts_with("context-harness/") {
-        relevance += 0.45;
-        evidence.push("crate:context-harness".to_string());
-    }
-    if task_targets_crate(terms, "cli") && file.path.starts_with("cli/") {
-        relevance += 0.35;
-        evidence.push("crate:cli".to_string());
-    }
-    if terms.phrases.iter().any(|p| p == "command")
-        && terms.phrases.iter().any(|p| p == "eval")
-        && file.path.starts_with("cli/")
-    {
-        relevance += 0.25;
-        evidence.push("crate:cli-command".to_string());
-    }
-
-    if terms.likely_areas.is_empty() {
-        // No area inference; rely on term matching only.
-    } else {
-        let in_likely_area = terms
-            .likely_areas
-            .iter()
-            .any(|area| file.path.starts_with(area) || path_lower.contains(area));
-        if in_likely_area {
-            relevance += 0.3;
-            evidence.push(format!("area:{}", terms.likely_areas[0]));
-        } else {
-            relevance -= 0.3;
-            evidence.push("area:outside_likely".to_string());
-        }
+    let (area_delta, area_evidence) = area_affinity_adjustment(&file.path, &terms.likely_areas);
+    relevance += area_delta;
+    if let Some(e) = area_evidence {
+        evidence.push(e);
     }
 
     if file.signals.tags.iter().any(|t| t == "route") {
@@ -542,6 +516,48 @@ fn task_targets_crate(terms: &TaskTerms, crate_name: &str) -> bool {
     crate::task_terms::task_targets_crate(&terms.phrases, crate_name)
 }
 
+/// Crate-affinity adjustment to `score_file_for_task`'s relevance
+/// score. Returns `(delta, evidence_label)` so the caller can append
+/// the evidence string uniformly.
+///
+/// Previously three hardcoded special cases boosted `context-harness`
+/// and `cli` files when the task mentioned their crate names. Every
+/// other crate (verification, features, repo-index, ext/*, app-server,
+/// core) got no crate-level boost at all — so a literal example string
+/// like ``"`cli`"`` in a task about the verification crate could leak
+/// CLI files past actual verification files.
+///
+/// The fix: use the inferred top `likely_area` instead. The inference
+/// already runs against the full RepoMap and produces a ranked list
+/// (top-3 entries above the `> 0.5` confidence threshold in
+/// `infer_likely_areas`). A non-empty list is itself the confidence
+/// guard — if no area cleared the threshold, no boost is applied.
+///
+/// The +0.40 boost is asymmetric with the -0.30 outside-area penalty:
+/// inflated term-match scores from example-string mentions of OTHER
+/// crates can stack to ~0.24 (2 hits × +0.12), so the boost must be
+/// larger than the symmetric penalty to overcome them.
+pub(crate) const AREA_AFFINITY_BOOST: f64 = 0.40;
+pub(crate) const AREA_OUTSIDE_PENALTY: f64 = 0.30;
+
+pub(crate) fn area_affinity_adjustment(
+    path: &str,
+    likely_areas: &[String],
+) -> (f64, Option<String>) {
+    let Some(top_area) = likely_areas.first() else {
+        return (0.0, None);
+    };
+    let prefix = format!("{top_area}/");
+    if path.starts_with(&prefix) {
+        (AREA_AFFINITY_BOOST, Some(format!("area:{top_area}")))
+    } else {
+        (
+            -AREA_OUTSIDE_PENALTY,
+            Some("area:outside_likely".to_string()),
+        )
+    }
+}
+
 fn is_manifest_path(path: &str) -> bool {
     path.ends_with("BUILD.bazel") || path.ends_with("Cargo.toml") || path.ends_with("package.json")
 }
@@ -591,10 +607,82 @@ mod tests {
     use codex_repo_index::RepoMap;
     use codex_repo_index::RepoSignals;
 
+    use super::AREA_AFFINITY_BOOST;
+    use super::AREA_OUTSIDE_PENALTY;
     use super::ContextAssembler;
+    use super::area_affinity_adjustment;
     use crate::RunMemory;
     use crate::TaskClassifier;
     use crate::selection::SelectionCaps;
+
+    #[test]
+    fn area_affinity_boosts_files_under_top_likely_area() {
+        // Top area = "verification" → verification/* gets +0.40 boost.
+        // The cli/Cargo.toml that previously won the first packet check
+        // (because the task said "`cli`" as a quoted example) now gets
+        // -0.30 instead — a net swing of 0.70 in favor of the right
+        // crate. This is the structural fix that replaces the
+        // hardcoded `if task_targets_crate(terms, "context-harness")`
+        // / `if task_targets_crate(terms, "cli")` boosts.
+        let areas = vec!["verification".to_string()];
+        let (boost, evidence) = area_affinity_adjustment("verification/src/rules.rs", &areas);
+        assert_eq!(boost, AREA_AFFINITY_BOOST);
+        assert_eq!(evidence.as_deref(), Some("area:verification"));
+
+        let (penalty, evidence) = area_affinity_adjustment("cli/Cargo.toml", &areas);
+        assert_eq!(penalty, -AREA_OUTSIDE_PENALTY);
+        assert_eq!(evidence.as_deref(), Some("area:outside_likely"));
+    }
+
+    #[test]
+    fn area_affinity_skips_boost_when_no_area_inferred() {
+        // Empty likely_areas → no signal → zero adjustment. The
+        // pre-existing inference threshold (`score > 0.5` in
+        // `infer_likely_areas`) acts as the confidence guard: if no
+        // area cleared that bar, the affinity logic stays out of the
+        // ranker entirely.
+        let (delta, evidence) = area_affinity_adjustment("any/file.rs", &[]);
+        assert_eq!(delta, 0.0);
+        assert!(evidence.is_none());
+    }
+
+    #[test]
+    fn area_affinity_requires_exact_path_prefix_not_substring() {
+        // The OLD code's area block used `path.starts_with(area) ||
+        // path_lower.contains(area)`. The substring branch matched any
+        // path with the area name as a substring — e.g. with
+        // likely_area="cli", `client.rs` would be treated as "in area",
+        // and with likely_area="core", anything containing "core"
+        // would. The fix anchors on the `<area>/` prefix exactly.
+        let areas = vec!["cli".to_string()];
+        let (boost, _) = area_affinity_adjustment("cli/src/main.rs", &areas);
+        assert_eq!(boost, AREA_AFFINITY_BOOST, "exact prefix match");
+
+        let (delta, _) = area_affinity_adjustment("client.rs", &areas);
+        assert_eq!(
+            delta, -AREA_OUTSIDE_PENALTY,
+            "substring match must NOT count as in-area"
+        );
+        let (delta, _) = area_affinity_adjustment("foo/cli/bar.rs", &areas);
+        assert_eq!(
+            delta, -AREA_OUTSIDE_PENALTY,
+            "area only matches as path PREFIX, not anywhere mid-path"
+        );
+    }
+
+    #[test]
+    fn area_affinity_uses_only_the_top_likely_area() {
+        // `likely_areas` is a ranked Vec; the boost is applied to
+        // files under the FIRST entry only. Files under second-place
+        // areas get the outside-area penalty. This is intentional —
+        // a single confident routing signal is the design.
+        let areas = vec!["verification".to_string(), "cli".to_string()];
+        let (delta, _) = area_affinity_adjustment("cli/Cargo.toml", &areas);
+        assert_eq!(
+            delta, -AREA_OUTSIDE_PENALTY,
+            "second-ranked area must NOT inherit the boost"
+        );
+    }
 
     #[test]
     fn legacy_paths_are_dropped_for_restaurant_task() {
