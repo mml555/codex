@@ -20,7 +20,7 @@ fn directive_inspect_list_includes_top_relevant_file() {
         BuildPacketOptions::default(),
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
-    assert!(fragment.contains("Before editing, inspect these files first:"));
+    assert!(fragment.contains("Likely edit targets:"));
     assert!(fragment.contains("context-harness/src/eval.rs"));
 }
 

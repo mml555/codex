@@ -37,6 +37,8 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         edit_command_count: None,
         verify_command_count: None,
         warnings: Vec::new(),
+        ri_surfaced_edit_targets: Vec::new(),
+        ri_surfaced_orientation: Vec::new(),
         worktree_isolated: false,
         base_ref: None,
         worktree_path: None,
@@ -79,7 +81,7 @@ fn compare_vanilla_vs_harness_on_synthetic_records() {
 }
 
 #[test]
-fn report_renders_human_summary_with_8_column_table() {
+fn report_renders_human_summary_with_main_and_cost_tables() {
     let tasks = fixture_tasks();
     let task = &tasks[0];
     let vanilla = AgentRunRecord {
@@ -104,12 +106,15 @@ fn report_renders_human_summary_with_8_column_table() {
     };
     let report = build_report(vec![compare_task(task, &vanilla, &harness)]);
     let text = render_agent_eval_human(&report);
-    // Header columns are present in the rendered table.
+    // Header columns are present in the rendered tables. Main table now
+    // separates "Edit targets" (gold only) from "Orient. touched"
+    // (bridge ∪ ri_surfaced − gold). Tokens stayed in the Cost table.
     for column in [
         "Task",
         "Valid?",
         "RI visible?",
-        "Target files V/RI",
+        "Edit targets V/RI",
+        "Orient. touched V/RI",
         "Extra files V/RI",
         "Turns V/RI",
         "Tokens V/RI",
@@ -119,7 +124,7 @@ fn report_renders_human_summary_with_8_column_table() {
     }
     // The task row contains the canonical V vs RI values.
     assert!(text.contains("calculator_fix"), "{text}");
-    assert!(text.contains("0/1 vs 1/1"), "target column missing:\n{text}");
+    assert!(text.contains("0/1 vs 1/1"), "edit targets column missing:\n{text}");
     assert!(text.contains("3/2"), "turns column missing:\n{text}");
     assert!(text.contains("1000/1050"), "tokens column missing:\n{text}");
     assert!(

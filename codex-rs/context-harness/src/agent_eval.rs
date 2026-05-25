@@ -139,6 +139,24 @@ pub struct AgentRunRecord {
     /// Pre-warning records load with an empty Vec via `serde(default)`.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Paths the RI extension rendered under the "Likely edit targets:"
+    /// section of its directive prompt for THIS run. Recovered from the
+    /// rollout's user/developer message via
+    /// `ContextPacketRenderer::parse_directive_file_lists`. Empty for
+    /// vanilla arms (no RI directive in their prompt) and for pre-split
+    /// records (the legacy `Before editing, inspect these files first:`
+    /// single section is intentionally not back-parsed; see the
+    /// `parse_directive_file_lists_handles_legacy_single_section_fragment`
+    /// test).
+    #[serde(default)]
+    pub ri_surfaced_edit_targets: Vec<String>,
+    /// Paths the RI extension rendered under the "Orientation only:"
+    /// section. Same provenance as `ri_surfaced_edit_targets`. Feeds
+    /// the new `orientation_files_touched` metric: a file the model
+    /// edited despite being labeled orientation is direct evidence
+    /// that the directive failed to constrain scope.
+    #[serde(default)]
+    pub ri_surfaced_orientation: Vec<String>,
     /// True when this arm ran in a worktree that was not shared with any other
     /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
     /// was set; for `calculator` workdirs the arm always gets a fresh
@@ -248,6 +266,25 @@ pub struct AgentRunScore {
     /// Non-fatal observations carried over from `AgentRunRecord`.
     /// Surfaced in the Main table's Valid? cell as `valid (warning)`.
     pub warnings: Vec<String>,
+    /// Count of gold (`relevant_files`) paths that were touched. New
+    /// stricter cut than `target_files_hit`: this excludes bridge files,
+    /// which the first cloud batch showed were sometimes mistakenly
+    /// counted as wins even when the model only updated wiring.
+    pub edit_target_files_hit: usize,
+    /// Size of the gold set, denominator for `edit_target_files_hit`.
+    pub edit_target_files_total: usize,
+    /// Count of files in (bridge ∪ ri_surfaced_orientation − gold) that
+    /// the model TOUCHED. Captures scope-broadening: a non-zero value
+    /// means the model edited something the directive explicitly
+    /// labeled orientation (or a bridge file that the new directive
+    /// rendering should classify as orientation by default).
+    /// Pre-split records (no `ri_surfaced_*` data) fall back to
+    /// `bridge − gold ∩ changed_files`, so the metric is meaningful
+    /// for backfilled artifacts too.
+    pub orientation_files_touched: usize,
+    /// Size of (bridge ∪ ri_surfaced_orientation − gold). The
+    /// denominator the model COULD have over-touched.
+    pub orientation_files_total: usize,
 }
 
 /// Comparison verdict for a (vanilla, treatment) pair on one task.
@@ -426,6 +463,28 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
     let unnecessary_files_changed: Vec<String> = changed.difference(&gold).cloned().collect();
     let bridge_files_touched: Vec<String> = bridge.intersection(&changed).cloned().collect();
 
+    // Orientation set: every file the directive labeled "orientation
+    // only" for this arm, plus the fixture's bridge_files (which the
+    // new directive rendering treats as orientation by default). Then
+    // subtract the gold so an edit to a gold path doesn't double-count
+    // as an over-broaden. Vanilla arms have no `ri_surfaced_*` data,
+    // so their orientation_set collapses to (bridge − gold).
+    let ri_orientation: BTreeSet<String> = record
+        .ri_surfaced_orientation
+        .iter()
+        .map(|p| normalize_agent_eval_path(p))
+        .filter(|p| !p.is_empty())
+        .collect();
+    let orientation_set: BTreeSet<String> = bridge
+        .union(&ri_orientation)
+        .filter(|p| !gold.contains(*p))
+        .cloned()
+        .collect();
+    let edit_target_files_hit = gold.intersection(&changed).count();
+    let edit_target_files_total = gold.len();
+    let orientation_files_touched = orientation_set.intersection(&changed).count();
+    let orientation_files_total = orientation_set.len();
+
     AgentRunScore {
         correct_file_touched,
         target_files_hit,
@@ -448,6 +507,10 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         edit_command_count: record.edit_command_count,
         verify_command_count: record.verify_command_count,
         warnings: record.warnings.clone(),
+        edit_target_files_hit,
+        edit_target_files_total,
+        orientation_files_touched,
+        orientation_files_total,
     }
 }
 
@@ -1029,11 +1092,12 @@ impl AgentEvalTask {
 /// dimensions render as `—`. Excluded pairs render `—` across every
 /// data column.
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
-    const MAIN_HEADERS: [&str; 8] = [
+    const MAIN_HEADERS: [&str; 9] = [
         "Task",
         "Valid?",
         "RI visible?",
-        "Target files V/RI",
+        "Edit targets V/RI",
+        "Orient. touched V/RI",
         "Extra files V/RI",
         "Turns V/RI",
         "Time V/RI",
@@ -1201,7 +1265,7 @@ fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) ->
 
 const DASH: &str = "—";
 
-fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
+fn format_main_row(row: &AgentEvalComparison) -> [String; 9] {
     let result = row.result.slug();
     if !row.valid_for_comparison {
         let valid_cell = format_invalid_cell(row);
@@ -1218,17 +1282,30 @@ fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
             DASH.to_string(),
             DASH.to_string(),
             DASH.to_string(),
+            DASH.to_string(),
             result,
         ];
     }
 
-    let target = format!(
+    // Edit targets: gold-only hit/total. Stricter than the old
+    // `target_files_hit` column, which lumped bridge in with gold.
+    let edit_targets = format!(
         "{} vs {}",
-        ratio_cell(row.vanilla.target_files_hit, row.vanilla.target_files_total),
         ratio_cell(
-            row.treatment.target_files_hit,
-            row.treatment.target_files_total,
+            row.vanilla.edit_target_files_hit,
+            row.vanilla.edit_target_files_total,
         ),
+        ratio_cell(
+            row.treatment.edit_target_files_hit,
+            row.treatment.edit_target_files_total,
+        ),
+    );
+    // Orientation touched: count of files in (bridge ∪ ri_surfaced
+    // orientation − gold) that were edited. Per-arm, since the RI arm
+    // may have a strictly larger orientation set.
+    let orientation = format!(
+        "{}/{}",
+        row.vanilla.orientation_files_touched, row.treatment.orientation_files_touched,
     );
     let extra = format!(
         "{}/{}",
@@ -1255,7 +1332,8 @@ fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
         row.task_id.clone(),
         format_valid_cell(row),
         ri_visible,
-        target,
+        edit_targets,
+        orientation,
         extra,
         turns,
         time,
@@ -1448,6 +1526,8 @@ mod tests {
             edit_command_count: None,
             verify_command_count: None,
             warnings: Vec::new(),
+            ri_surfaced_edit_targets: Vec::new(),
+            ri_surfaced_orientation: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -1496,6 +1576,10 @@ mod tests {
                 edit_command_count: None,
                 verify_command_count: None,
                 warnings: Vec::new(),
+                edit_target_files_hit: 1,
+                edit_target_files_total: 1,
+                orientation_files_touched: 0,
+                orientation_files_total: 0,
             }
         );
     }
@@ -1736,6 +1820,10 @@ mod tests {
             edit_command_count: None,
             verify_command_count: None,
             warnings: Vec::new(),
+            edit_target_files_hit: 0,
+            edit_target_files_total: 0,
+            orientation_files_touched: 0,
+            orientation_files_total: 0,
         }
     }
 
@@ -2261,6 +2349,123 @@ mod tests {
 
         let rollout_string = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":"Harness repo intelligence: prelude"}}"#;
         assert!(rollout_carries_harness_directive(rollout_string));
+    }
+
+    #[test]
+    fn score_run_counts_bridge_and_ri_surfaced_as_orientation_excluding_gold() {
+        // Build a task where: gold=[a.rs], bridge=[b.rs], and the RI
+        // arm surfaced [a.rs, b.rs, c.rs, d.rs] in its directive. The
+        // model touched a.rs (gold), b.rs (bridge → orientation), and
+        // c.rs (RI-surfaced extra → orientation). d.rs was NOT edited.
+        let task = AgentEvalTask {
+            id: "orient_test".to_string(),
+            task: "test orientation".to_string(),
+            relevant_files: vec!["a.rs".to_string()],
+            relevant_tests: Vec::new(),
+            bridge_files: vec!["b.rs".to_string()],
+            danger_zones: Vec::new(),
+            verify_command: None,
+            workdir: AgentEvalWorkdir::Calculator,
+            category: None,
+        };
+        let record = AgentRunRecord {
+            arm: AgentArm::RepoIntelligence,
+            task_id: task.id.clone(),
+            changed_files: vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: true,
+            harness_context_visible: true,
+            run_valid: true,
+            invalid_reason: None,
+            tokens_input: None,
+            tokens_output: None,
+            tokens_total: None,
+            duration_ms: None,
+            tool_call_count: None,
+            shell_command_count: None,
+            file_read_count: None,
+            discover_command_count: None,
+            edit_command_count: None,
+            verify_command_count: None,
+            warnings: Vec::new(),
+            // RI surfaced 1 edit target (a.rs) + 3 orientation files
+            // (b.rs, c.rs, d.rs). a.rs as an edit target overlaps with
+            // gold and is therefore NOT in the orientation set; the
+            // formula `bridge ∪ ri_orient − gold` keeps that invariant.
+            ri_surfaced_edit_targets: vec!["a.rs".to_string()],
+            ri_surfaced_orientation: vec![
+                "b.rs".to_string(),
+                "c.rs".to_string(),
+                "d.rs".to_string(),
+            ],
+            worktree_isolated: false,
+            base_ref: None,
+            worktree_path: None,
+        };
+        let score = score_run(&record, &task);
+        assert_eq!(score.edit_target_files_hit, 1, "a.rs is in gold and touched");
+        assert_eq!(score.edit_target_files_total, 1);
+        // Orientation set: bridge {b} ∪ ri_orient {b,c,d} − gold {a}
+        //                 = {b, c, d}
+        // Touched: {a, b, c}. Intersection with orientation_set = {b, c}.
+        assert_eq!(
+            score.orientation_files_touched, 2,
+            "b (bridge) + c (RI-surfaced extra) edited; d was surfaced but not edited"
+        );
+        assert_eq!(score.orientation_files_total, 3, "{{b, c, d}}");
+    }
+
+    #[test]
+    fn score_run_falls_back_to_bridge_only_for_vanilla_with_no_ri_surfaced() {
+        // Vanilla arm has empty ri_surfaced_*. The orientation set
+        // collapses to (bridge − gold). This keeps backfilled / legacy
+        // records meaningful: orientation_files_touched still measures
+        // "bridge file edited" even without the RI packet.
+        let task = AgentEvalTask {
+            id: "vanilla_orient".to_string(),
+            task: "test".to_string(),
+            relevant_files: vec!["gold.rs".to_string()],
+            relevant_tests: Vec::new(),
+            bridge_files: vec!["wiring.rs".to_string()],
+            danger_zones: Vec::new(),
+            verify_command: None,
+            workdir: AgentEvalWorkdir::Calculator,
+            category: None,
+        };
+        let record = AgentRunRecord {
+            arm: AgentArm::Vanilla,
+            task_id: task.id.clone(),
+            changed_files: vec!["gold.rs".to_string(), "wiring.rs".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            exec_exit_code: Some(0),
+            repo_intelligence_enabled: false,
+            harness_context_visible: false,
+            run_valid: true,
+            invalid_reason: None,
+            tokens_input: None,
+            tokens_output: None,
+            tokens_total: None,
+            duration_ms: None,
+            tool_call_count: None,
+            shell_command_count: None,
+            file_read_count: None,
+            discover_command_count: None,
+            edit_command_count: None,
+            verify_command_count: None,
+            warnings: Vec::new(),
+            ri_surfaced_edit_targets: Vec::new(),
+            ri_surfaced_orientation: Vec::new(),
+            worktree_isolated: false,
+            base_ref: None,
+            worktree_path: None,
+        };
+        let score = score_run(&record, &task);
+        assert_eq!(score.edit_target_files_hit, 1);
+        assert_eq!(score.orientation_files_touched, 1, "bridge wiring.rs edited");
+        assert_eq!(score.orientation_files_total, 1);
     }
 
     #[test]

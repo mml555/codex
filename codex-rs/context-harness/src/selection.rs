@@ -10,6 +10,12 @@ pub struct SelectionCaps {
     pub max_prompt_compact_files: usize,
     pub max_prompt_tests: usize,
     pub max_prompt_warnings: usize,
+    /// Top-K relevance-scored files that get marked as "likely edit targets"
+    /// in the directive prompt. Files ranked below K render under
+    /// "Orientation only". K=1 by default: the first cloud batch's
+    /// `rate_limit` failure showed that listing every relevant file as an
+    /// edit candidate made the model broaden scope.
+    pub max_edit_targets: usize,
     pub include_relevance_min: f64,
     pub drop_confidence_below: f64,
 }
@@ -26,6 +32,7 @@ impl Default for SelectionCaps {
             max_prompt_compact_files: 4,
             max_prompt_tests: 5,
             max_prompt_warnings: 3,
+            max_edit_targets: 1,
             include_relevance_min: 0.45,
             drop_confidence_below: 0.25,
         }

@@ -444,6 +444,152 @@ print("true" if visible_in_rollout_prompt() else "false")
 PY
 }
 
+# Extract the "Likely edit targets" and "Orientation only" file lists
+# that the RI directive prompt rendered for THIS run. Walks the rollout
+# (same lookup as harness_context_visible_for_run), finds user/developer
+# message payloads carrying the harness marker, and parses the two
+# named sections out of the content. Emits two newline-separated
+# blocks separated by ASCII Unit Separator (\x1f):
+#   <edit_target_files separated by \n> \x1f <orientation_files separated by \n>
+# Either block can be empty. Empty for vanilla arms (no RI directive
+# in the prompt) and for pre-split fragments (no `Likely edit targets:`
+# header — the legacy `Before editing, inspect these files first:`
+# block is intentionally not back-parsed; see the Rust test
+# `parse_directive_file_lists_handles_legacy_single_section_fragment`).
+extract_ri_surfaced_files() {
+  local events="$1"
+  local codex_home="${CODEX_HOME:-${HOME}/.codex}"
+  python3 - "${events}" "${codex_home}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+NEEDLE = "Harness repo intelligence:"
+EDIT_HEADER = "Likely edit targets:"
+ORIENT_HEADER = "Orientation only:"
+PROMPT_ROLES = {"user", "developer", "system"}
+
+events_path = Path(sys.argv[1])
+codex_home = Path(sys.argv[2])
+
+def thread_id_from_events() -> str:
+    if not events_path.exists():
+        return ""
+    with events_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "thread.started":
+                return ev.get("thread_id") or ""
+    return ""
+
+def directive_text_from_payload(payload) -> str:
+    """Concatenate every text fragment in a message payload's content."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict):
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    out.append(txt)
+        return "\n".join(out)
+    return ""
+
+def parse_numbered_entry(line: str):
+    """Pull `<path>` out of a `N. <path> — <reason>` line; mirrors the
+    Rust parser. Returns None on miss."""
+    s = line.lstrip()
+    if not s or not s[0].isdigit():
+        return None
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    if i >= len(s) or s[i] != ".":
+        return None
+    rest = s[i + 1 :]
+    if not rest.startswith(" "):
+        return None
+    rest = rest[1:]
+    # Path is everything up to the em-dash separator (U+2014).
+    sep = " — "
+    head = rest.split(sep, 1)[0].strip()
+    return head or None
+
+def parse_lists(fragment: str):
+    if NEEDLE not in fragment:
+        return [], []
+    edit, orient = [], []
+    section = None
+    for raw in fragment.splitlines():
+        line = raw.rstrip()
+        if line == EDIT_HEADER:
+            section = edit
+            continue
+        if line == ORIENT_HEADER:
+            section = orient
+            continue
+        if not line.strip():
+            continue
+        path = parse_numbered_entry(line)
+        if path is not None and section is not None:
+            section.append(path)
+            continue
+        # Anything else closes the section.
+        section = None
+    return edit, orient
+
+def lists_from_rollout():
+    thread_id = thread_id_from_events()
+    if not thread_id:
+        return [], []
+    sessions = codex_home / "sessions"
+    if not sessions.is_dir():
+        return [], []
+    for rollout in sessions.rglob(f"*{thread_id}*.jsonl"):
+        try:
+            with rollout.open(encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") != "response_item":
+                        continue
+                    payload = ev.get("payload") or {}
+                    if payload.get("type") != "message":
+                        continue
+                    role = payload.get("role") or ""
+                    if role not in PROMPT_ROLES:
+                        continue
+                    text = directive_text_from_payload(payload)
+                    if NEEDLE not in text:
+                        continue
+                    e, o = parse_lists(text)
+                    if e or o:
+                        return e, o
+        except OSError:
+            continue
+    return [], []
+
+edit_targets, orientation = lists_from_rollout()
+print("\n".join(edit_targets), end="\x1f")
+print("\n".join(orientation), end="")
+PY
+}
+
 classify_run_validity() {
   local events="$1"
   local exec_exit="$2"
@@ -583,6 +729,15 @@ write_record() {
   if [[ "${arm}" == "repo_intelligence" ]]; then
     repo_intel_enabled=true
   fi
+  # RI-surfaced file lists (edit targets + orientation) parsed from the
+  # rollout's directive prompt. Empty unless the rollout carries the
+  # new two-section format. The extractor emits two \n-joined blocks
+  # separated by \x1f; we split here so the Python record writer can
+  # pass both into the JSON.
+  local ri_surfaced
+  ri_surfaced="$(extract_ri_surfaced_files "${events}")"
+  local ri_edit_targets ri_orientation
+  IFS=$'\x1f' read -r ri_edit_targets ri_orientation <<<"${ri_surfaced}"
   mkdir -p "$(dirname "${out}")"
   RECORD_WORKTREE_ISOLATED="${RECORD_WORKTREE_ISOLATED:-false}" \
   RECORD_BASE_REF="${RECORD_BASE_REF:-}" \
@@ -595,6 +750,8 @@ write_record() {
   RECORD_EDIT_COMMAND_COUNT="${RECORD_EDIT_COMMAND_COUNT:-}" \
   RECORD_VERIFY_COMMAND_COUNT="${RECORD_VERIFY_COMMAND_COUNT:-}" \
   RECORD_WARNINGS="${RECORD_WARNINGS:-}" \
+  RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
+  RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -649,6 +806,15 @@ record = {
     # JSON string array. Reviewer-facing only — the validity classifier
     # has already cleared this run as behaviorally valid.
     "warnings": [w for w in os.environ.get("RECORD_WARNINGS", "").split(",") if w],
+    # RI-surfaced file lists. Each env var is a \n-joined block from
+    # `extract_ri_surfaced_files`. Empty for vanilla arms and for
+    # pre-split rollouts that used the legacy single-section header.
+    "ri_surfaced_edit_targets": [
+        p for p in os.environ.get("RECORD_RI_SURFACED_EDIT_TARGETS", "").split("\n") if p
+    ],
+    "ri_surfaced_orientation": [
+        p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
+    ],
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
     "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
     "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
@@ -1026,10 +1192,19 @@ rescore_record() {
     read -r edit_command_count
     read -r verify_command_count
   } < <(count_activity "${events_path}")
+  # RI-surfaced file lists from the rollout (empty for vanilla arms or
+  # pre-split fragments). Threaded via env vars to keep the positional
+  # surface bounded.
+  local ri_surfaced
+  ri_surfaced="$(extract_ri_surfaced_files "${events_path}")"
+  local ri_edit_targets ri_orientation
+  IFS=$'\x1f' read -r ri_edit_targets ri_orientation <<<"${ri_surfaced}"
+  RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
+  RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   python3 - "${record_path}" "${run_valid}" "${invalid_reason}" "${warnings_csv}" "${harness_visible}" \
     "${tool_call_count}" "${shell_command_count}" "${file_read_count}" \
     "${discover_command_count}" "${edit_command_count}" "${verify_command_count}" <<'PY'
-import json, sys
+import json, os, sys
 (
     path, run_valid, invalid_reason, warnings_csv, harness_visible,
     tool_call, shell_cmd, file_read, discover, edit, verify,
@@ -1048,6 +1223,12 @@ rec["file_read_count"] = _i(file_read)
 rec["discover_command_count"] = _i(discover)
 rec["edit_command_count"] = _i(edit)
 rec["verify_command_count"] = _i(verify)
+rec["ri_surfaced_edit_targets"] = [
+    p for p in os.environ.get("RECORD_RI_SURFACED_EDIT_TARGETS", "").split("\n") if p
+]
+rec["ri_surfaced_orientation"] = [
+    p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
+]
 with open(path, "w", encoding="utf-8") as f:
     json.dump(rec, f, indent=2)
     f.write("\n")

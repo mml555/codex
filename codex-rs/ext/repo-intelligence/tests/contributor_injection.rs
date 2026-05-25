@@ -37,7 +37,7 @@ async fn contributor_emits_directive_repo_intelligence_fragment_when_enabled() {
     let text = fragments[0].text();
     assert!(text.contains("Harness repo intelligence:"));
     assert!(text.contains("Use this as task-routing guidance before editing."));
-    assert!(text.contains("Before editing, inspect these files first:"));
+    assert!(text.contains("Likely edit targets:"));
     assert!(
         text.contains("After editing, likely narrow verification:"),
         "extension should append the planner-driven verification hint when one exists\n{text}"

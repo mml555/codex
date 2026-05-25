@@ -53,7 +53,7 @@ fn renderer_emits_directive_routing_fragment() {
     assert!(fragment.contains("Harness repo intelligence:"));
     assert!(fragment.contains("Use this as task-routing guidance before editing."));
     assert!(fragment.contains("Task: fix restaurant search pagination"));
-    assert!(fragment.contains("Before editing, inspect these files first:"));
+    assert!(fragment.contains("Likely edit targets:"));
     // Inspect entries are numbered (`1. `, `2. `, ...) with a reason after `—`.
     let numbered_lines: Vec<_> = fragment
         .lines()

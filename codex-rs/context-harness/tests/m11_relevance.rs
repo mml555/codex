@@ -114,8 +114,9 @@ fn prompt_fragment_omits_dropped_and_caps_visible_items() {
     );
     let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
     assert!(!fragment.contains("Dropped:"));
-    // Directive shape emits a numbered "Before editing, inspect these files first:" list.
-    assert!(fragment.contains("Before editing, inspect these files first:"));
+    // Directive shape emits a numbered "Likely edit targets:" list,
+    // with the remainder split out under "Orientation only:".
+    assert!(fragment.contains("Likely edit targets:"));
     assert!(!fragment.contains("legacy_restaurants"));
     let inspect_entries = fragment
         .lines()
