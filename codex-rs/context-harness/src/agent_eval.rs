@@ -157,6 +157,32 @@ pub struct AgentRunRecord {
     /// that the directive failed to constrain scope.
     #[serde(default)]
     pub ri_surfaced_orientation: Vec<String>,
+    /// Paths the model INTENTIONALLY edited, extracted from
+    /// `file_change` items in `events.jsonl`. The authoritative answer
+    /// to "what did the model decide to touch?" — strictly better than
+    /// `git diff --name-only HEAD`, which also picks up `cargo fmt`
+    /// collateral, build artifacts, and any setup-time worktree writes.
+    /// Empty for pre-instrumentation records; in that case the scorer
+    /// falls back to `changed_files`.
+    #[serde(default)]
+    pub intent_changed_files: Vec<String>,
+    /// Raw `git diff --name-only HEAD` ∪ untracked-files set, captured
+    /// for diagnostic purposes. The `formatter_changed_files` field
+    /// stores `diff_changed_files − intent_changed_files` so a reviewer
+    /// can see at a glance how much collateral a run accumulated. Both
+    /// new fields are diagnostic-only — `score_run` uses
+    /// `intent_changed_files` (with `changed_files` as fallback) when
+    /// computing target/orientation/extra metrics.
+    #[serde(default)]
+    pub diff_changed_files: Vec<String>,
+    /// `diff_changed_files − intent_changed_files`. Files the diff saw
+    /// but the model didn't author via `file_change` / apply_patch.
+    /// Typical sources: `cargo fmt --all` reformatting drift,
+    /// `__pycache__` artifacts, build-side outputs. NOT used for
+    /// scoring; surfaced so reviewers can sanity-check what the eval
+    /// is and isn't crediting.
+    #[serde(default)]
+    pub formatter_changed_files: Vec<String>,
     /// True when this arm ran in a worktree that was not shared with any other
     /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
     /// was set; for `calculator` workdirs the arm always gets a fresh
@@ -452,7 +478,19 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
     let gold: BTreeSet<String> = task.relevant_files.iter().cloned().collect();
     let bridge: BTreeSet<String> = task.bridge_files.iter().cloned().collect();
     let target: BTreeSet<String> = gold.union(&bridge).cloned().collect();
-    let changed: BTreeSet<String> = filter_scoring_changed_files(&record.changed_files)
+    // Source of truth for "what did the model edit?" — prefer
+    // `intent_changed_files` (from authoritative `file_change` events),
+    // fall back to `changed_files` (raw git diff) for pre-instrumented
+    // records. The rate_limit-v2 rerun showed `git diff` over-counts
+    // by 4-7x when the model runs `just fmt`, so anchoring on intent
+    // is required for `extra_files` and `orientation_files_touched`
+    // to mean what their names say.
+    let source = if record.intent_changed_files.is_empty() {
+        &record.changed_files
+    } else {
+        &record.intent_changed_files
+    };
+    let changed: BTreeSet<String> = filter_scoring_changed_files(source)
         .into_iter()
         .map(|path| normalize_agent_eval_path(&path))
         .filter(|path| !path.is_empty())
@@ -916,6 +954,79 @@ pub fn classify_shell_phase(command: &str) -> &'static str {
         }
         _ => "other",
     }
+}
+
+/// Extract the set of file paths the model INTENTIONALLY edited during
+/// a run, sourced from authoritative `file_change` / apply_patch items
+/// in the `events.jsonl` stream. Returns repo-relative paths (the
+/// `codex-rs/` and absolute-worktree prefixes are stripped) so the set
+/// can be compared directly against fixture `relevant_files` /
+/// `bridge_files`.
+///
+/// This is the right source of truth for "what did the model decide to
+/// touch?" — strictly better than `git diff --name-only HEAD`, which
+/// also picks up:
+///   - `cargo fmt --all` collateral (any pre-existing format drift in
+///     the worktree),
+///   - test-artifact dirs (`__pycache__`, `.pytest_cache`),
+///   - build artifacts an agent's shell happens to drop,
+///   - any setup-time writes the runner itself performs.
+///
+/// The gated `rate_limit` rerun demonstrated this failure mode: both
+/// arms intentionally edited 2 files (gold + bridge) per the
+/// `file_change` events, but `git diff` reported 9 files because the
+/// model ran `just fmt` which reformatted 7 unrelated files.
+///
+/// Order is stable (BTreeSet under the hood) so test assertions can
+/// compare by equality. Duplicates collapse — if the model edited the
+/// same path twice, it appears once. Paths are returned LEXICALLY
+/// sorted.
+pub fn intent_changed_files_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Both `item.completed` and `item.started` carry the path; we
+        // only want `completed` so partial/failed patches don't count.
+        if value.get("type").and_then(|v| v.as_str()) != Some("item.completed") {
+            continue;
+        }
+        let Some(item) = value.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // Two shapes:
+        //   - `file_change` items carry an array `item.changes` of
+        //     `{path, kind}` (codex's structured editor).
+        //   - `custom_tool_call` items with `name == "apply_patch"`
+        //     carry the raw patch in `arguments`; we don't parse those
+        //     here. If a deployment goes back to apply_patch shell
+        //     wrappers we'd extend this; current frontier models emit
+        //     `file_change` consistently.
+        if item_type != "file_change" {
+            continue;
+        }
+        let Some(changes) = item.get("changes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for ch in changes {
+            let Some(raw_path) = ch.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let normalized = normalize_agent_eval_path(raw_path);
+            if normalized.is_empty() {
+                continue;
+            }
+            paths.insert(normalized);
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 /// Parse `events.jsonl` and count tool/shell/per-phase activity.
@@ -1528,6 +1639,9 @@ mod tests {
             warnings: Vec::new(),
             ri_surfaced_edit_targets: Vec::new(),
             ri_surfaced_orientation: Vec::new(),
+            intent_changed_files: Vec::new(),
+            diff_changed_files: Vec::new(),
+            formatter_changed_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2352,6 +2466,113 @@ mod tests {
     }
 
     #[test]
+    fn intent_changed_files_from_exec_jsonl_extracts_file_change_paths() {
+        // Two `file_change` items for distinct files + one unrelated
+        // `command_execution` + one item.started (not completed). The
+        // extractor returns repo-relative paths sorted; only completed
+        // file_change items count.
+        let jsonl = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.started","item":{"id":"i1","type":"file_change","changes":[{"path":"/tmp/wt/codex-rs/should/not/appear.rs","kind":"update"}]}}
+{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"ls"}}
+{"type":"item.completed","item":{"id":"i3","type":"file_change","changes":[{"path":"/tmp/wt/codex-rs/context-harness/src/agent_eval.rs","kind":"update"}]}}
+{"type":"item.completed","item":{"id":"i4","type":"file_change","changes":[{"path":"/tmp/wt/codex-rs/scripts/harness-agent-eval.sh","kind":"update"}]}}
+{"type":"item.completed","item":{"id":"i5","type":"file_change","changes":[{"path":"/tmp/wt/codex-rs/context-harness/src/agent_eval.rs","kind":"update"}]}}"#;
+        let intent = intent_changed_files_from_exec_jsonl(jsonl.as_bytes()).unwrap();
+        // Duplicates collapse, paths normalized to repo-relative,
+        // lexically sorted.
+        assert_eq!(
+            intent,
+            vec![
+                "context-harness/src/agent_eval.rs".to_string(),
+                "scripts/harness-agent-eval.sh".to_string(),
+            ]
+        );
+        // item.started is NOT counted (only completed) — `should/not/appear.rs`
+        // must be absent.
+        assert!(!intent.iter().any(|p| p.contains("should/not/appear")));
+    }
+
+    #[test]
+    fn score_run_uses_intent_changed_files_and_ignores_formatter_collateral() {
+        // The rate_limit-v2 measurement bug in concrete form: the
+        // model intentionally edited only the gold + bridge, but
+        // `git diff` saw 9 files because `cargo fmt --all` ran. With
+        // intent_changed_files populated, score_run must ignore the
+        // 7 formatter files entirely.
+        let task = AgentEvalTask {
+            id: "fmt_collateral".to_string(),
+            task: "test".to_string(),
+            relevant_files: vec!["src/agent_eval.rs".to_string()],
+            relevant_tests: Vec::new(),
+            bridge_files: vec!["scripts/runner.sh".to_string()],
+            danger_zones: Vec::new(),
+            verify_command: None,
+            workdir: AgentEvalWorkdir::Calculator,
+            category: None,
+        };
+        let mut record = synthetic_record(AgentArm::RepoIntelligence, &task.id);
+        // Diff sees: gold + bridge + 7 fmt-drift files.
+        record.changed_files = vec![
+            "src/agent_eval.rs".to_string(),
+            "scripts/runner.sh".to_string(),
+            "src/lib.rs".to_string(),
+            "src/renderer.rs".to_string(),
+            "src/task_terms.rs".to_string(),
+            "tests/agent_eval.rs".to_string(),
+            "core/src/lib.rs".to_string(),
+            "ext/repo-intelligence/tests/contributor_injection.rs".to_string(),
+            "verification/src/planner.rs".to_string(),
+        ];
+        // Intent: only the two files the model authored via apply_patch.
+        record.intent_changed_files = vec![
+            "src/agent_eval.rs".to_string(),
+            "scripts/runner.sh".to_string(),
+        ];
+        let score = score_run(&record, &task);
+        assert_eq!(score.edit_target_files_hit, 1, "gold hit via intent");
+        assert_eq!(
+            score.unnecessary_files_changed.len(),
+            1,
+            "extras = intent − gold = {{bridge}}, NOT the 7 formatter files. \
+             Got: {:?}",
+            score.unnecessary_files_changed
+        );
+        assert!(
+            score
+                .unnecessary_files_changed
+                .iter()
+                .all(|p| !p.contains("renderer.rs") && !p.contains("planner.rs")),
+            "formatter collateral leaked into extras: {:?}",
+            score.unnecessary_files_changed
+        );
+    }
+
+    #[test]
+    fn score_run_falls_back_to_changed_files_when_intent_is_empty() {
+        // Pre-instrumentation records (no intent_changed_files
+        // captured) must still score via `changed_files`. Without
+        // this fallback every backfilled artifact would zero out
+        // edit_target_files_hit.
+        let task = AgentEvalTask {
+            id: "legacy".to_string(),
+            task: "test".to_string(),
+            relevant_files: vec!["gold.rs".to_string()],
+            relevant_tests: Vec::new(),
+            bridge_files: Vec::new(),
+            danger_zones: Vec::new(),
+            verify_command: None,
+            workdir: AgentEvalWorkdir::Calculator,
+            category: None,
+        };
+        let mut record = synthetic_record(AgentArm::Vanilla, &task.id);
+        record.changed_files = vec!["gold.rs".to_string(), "other.rs".to_string()];
+        // intent left empty → fallback path.
+        let score = score_run(&record, &task);
+        assert_eq!(score.edit_target_files_hit, 1);
+        assert_eq!(score.unnecessary_files_changed.len(), 1);
+    }
+
+    #[test]
     fn score_run_counts_bridge_and_ri_surfaced_as_orientation_excluding_gold() {
         // Build a task where: gold=[a.rs], bridge=[b.rs], and the RI
         // arm surfaced [a.rs, b.rs, c.rs, d.rs] in its directive. The
@@ -2400,6 +2621,9 @@ mod tests {
                 "c.rs".to_string(),
                 "d.rs".to_string(),
             ],
+            intent_changed_files: Vec::new(),
+            diff_changed_files: Vec::new(),
+            formatter_changed_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2458,6 +2682,9 @@ mod tests {
             warnings: Vec::new(),
             ri_surfaced_edit_targets: Vec::new(),
             ri_surfaced_orientation: Vec::new(),
+            intent_changed_files: Vec::new(),
+            diff_changed_files: Vec::new(),
+            formatter_changed_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,

@@ -38,6 +38,7 @@ pub use agent_eval::ResultReason;
 pub use agent_eval::TaskCategory;
 pub use agent_eval::TokenUsageTotals;
 pub use agent_eval::count_activity_from_exec_jsonl;
+pub use agent_eval::intent_changed_files_from_exec_jsonl;
 pub use agent_eval::agent_labels_from_task;
 pub use agent_eval::build_report;
 pub use agent_eval::changed_files_from_git_diff;

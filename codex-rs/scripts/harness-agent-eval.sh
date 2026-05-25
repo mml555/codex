@@ -752,6 +752,7 @@ write_record() {
   RECORD_WARNINGS="${RECORD_WARNINGS:-}" \
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
+  RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events}")" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -816,9 +817,41 @@ record = {
         p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
     ],
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
+    # See bottom of this dict literal — `intent_changed_files`,
+    # `diff_changed_files`, `formatter_changed_files` are assembled
+    # AFTER the record is built so they can reference `changed_files`
+    # and `intent_changed_files` together.
     "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
     "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
 }
+
+# Assemble the intent/diff/formatter triplet. `intent_changed_files`
+# is the authoritative model-intent set (from `file_change` events).
+# `diff_changed_files` mirrors `changed_files` and is purely
+# diagnostic. `formatter_changed_files = diff − intent` so reviewers
+# can see at a glance how much collateral a run accumulated.
+intent_paths = [
+    p for p in os.environ.get("RECORD_INTENT_CHANGED_FILES", "").split("\n") if p
+]
+diff_paths = list(record["changed_files"])
+intent_set = set(intent_paths)
+
+def _norm(p: str) -> str:
+    # Mirror Rust normalize_agent_eval_path for the diff side, since
+    # the runner emits `codex-rs/`-prefixed paths but intent_paths are
+    # already normalized to repo-relative.
+    p = p.replace("\\", "/").strip()
+    if p.startswith("./"): p = p[2:]
+    idx = p.find("/codex-rs/")
+    if idx >= 0: return p[idx + len("/codex-rs/"):]
+    while p.startswith("codex-rs/"): p = p[len("codex-rs/"):]
+    return p
+
+diff_norm = {_norm(p): p for p in diff_paths if p.strip()}
+formatter_paths = [orig for norm, orig in sorted(diff_norm.items()) if norm not in intent_set]
+record["intent_changed_files"] = intent_paths
+record["diff_changed_files"] = diff_paths
+record["formatter_changed_files"] = formatter_paths
 with open(out, "w", encoding="utf-8") as f:
     json.dump(record, f, indent=2)
     f.write("\n")
@@ -901,6 +934,71 @@ PY
 # `count_activity_from_exec_jsonl` so the bash-emitted and Rust-parsed
 # counts agree on the same events.jsonl. Phase sums equal shell_command
 # count minus an unrecorded "other" residual.
+# Extract the set of file paths the model INTENTIONALLY edited during
+# the run, sourced from `file_change` items in `events.jsonl`. Mirrors
+# `intent_changed_files_from_exec_jsonl` on the Rust side. Emits one
+# repo-relative path per line (sorted, deduped). Empty stdout when no
+# file_change items were observed (which also covers pre-instrumented
+# runs).
+#
+# Critical because `git diff --name-only HEAD` picks up `cargo fmt
+# --all` collateral whenever the agent ran `just fmt` — the rate_limit
+# v2 rerun showed git diff reporting 9 files when the model only
+# authored 2 patches. Scoring against intent eliminates that noise.
+extract_intent_changed_files() {
+  local events="$1"
+  python3 - "${events}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events_path = Path(sys.argv[1])
+
+def normalize(p: str) -> str:
+    """Mirror `agent_eval::normalize_agent_eval_path`. Strip the
+    `/codex-rs/` prefix wherever it appears so absolute worktree paths
+    map to repo-relative paths."""
+    p = p.strip().replace("\\", "/")
+    if not p:
+        return ""
+    if p.startswith("./"):
+        p = p[2:]
+    idx = p.find("/codex-rs/")
+    if idx >= 0:
+        return p[idx + len("/codex-rs/"):]
+    while p.startswith("codex-rs/"):
+        p = p[len("codex-rs/"):]
+    return p
+
+paths = set()
+if events_path.exists():
+    with events_path.open(encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                ev = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "item.completed":
+                continue
+            item = ev.get("item") or {}
+            if item.get("type") != "file_change":
+                continue
+            for ch in (item.get("changes") or []):
+                p = ch.get("path") if isinstance(ch, dict) else None
+                if not isinstance(p, str):
+                    continue
+                norm = normalize(p)
+                if norm:
+                    paths.add(norm)
+
+for p in sorted(paths):
+    print(p)
+PY
+}
+
 count_activity() {
   local events="$1"
   python3 - "${events}" <<'PY'
@@ -1201,6 +1299,7 @@ rescore_record() {
   IFS=$'\x1f' read -r ri_edit_targets ri_orientation <<<"${ri_surfaced}"
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
+  RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events_path}")" \
   python3 - "${record_path}" "${run_valid}" "${invalid_reason}" "${warnings_csv}" "${harness_visible}" \
     "${tool_call_count}" "${shell_command_count}" "${file_read_count}" \
     "${discover_command_count}" "${edit_command_count}" "${verify_command_count}" <<'PY'
@@ -1229,6 +1328,24 @@ rec["ri_surfaced_edit_targets"] = [
 rec["ri_surfaced_orientation"] = [
     p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
 ]
+# Intent / diff / formatter triplet. Mirrors write_record's assembly.
+intent_paths = [
+    p for p in os.environ.get("RECORD_INTENT_CHANGED_FILES", "").split("\n") if p
+]
+diff_paths = list(rec.get("changed_files", []))
+intent_set = set(intent_paths)
+def _norm(p: str) -> str:
+    p = p.replace("\\", "/").strip()
+    if p.startswith("./"): p = p[2:]
+    idx = p.find("/codex-rs/")
+    if idx >= 0: return p[idx + len("/codex-rs/"):]
+    while p.startswith("codex-rs/"): p = p[len("codex-rs/"):]
+    return p
+diff_norm = {_norm(p): p for p in diff_paths if p.strip()}
+formatter_paths = [orig for norm, orig in sorted(diff_norm.items()) if norm not in intent_set]
+rec["intent_changed_files"] = intent_paths
+rec["diff_changed_files"] = diff_paths
+rec["formatter_changed_files"] = formatter_paths
 with open(path, "w", encoding="utf-8") as f:
     json.dump(rec, f, indent=2)
     f.write("\n")
