@@ -1,0 +1,13 @@
+[
+  {
+    "id": "convention_add_area_package_alias",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "task": "Inside the verification crate there is a static array that maps area-id prefixes (like `\"cli\"`) to Cargo package names (like `\"codex-cli\"`). Add a new entry mapping `\"protocol\"` → `\"codex-protocol\"`, keeping the existing tuple shape and alphabetic ordering.",
+    "relevant_files": [
+      "verification/src/rules.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  }
+]

@@ -1187,10 +1187,11 @@ ${task_text}"
   # session start (the source of the ~170s pre-model gap measured
   # in the area-package-alias gated pairs).
   CODEX_REPO_INTELLIGENCE_CACHED_MAP="${SHARED_REPO_MAP_PATH:-}" \
+  RUST_LOG="${RUST_LOG:-codex_repo_intelligence_extension=info}" \
   "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${CLOUD_EXTRA_ARGS[@]+"${CLOUD_EXTRA_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
     --dangerously-bypass-approvals-and-sandbox \
     --json \
-    "${prompt}" </dev/null >"${events}" 2>/dev/null
+    "${prompt}" </dev/null >"${events}" 2>"${ARTIFACTS_DIR}/${task_id}/${arm}/codex_exec.stderr.log"
   local exec_exit=$?
   set -e
   end_ms=$(python3 -c 'import time; print(int(time.time()*1000))')

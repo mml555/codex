@@ -73,8 +73,10 @@ impl RepoIntelligenceExtensionConfig {
 fn load_cached_map_from_env() -> Option<RepoMap> {
     let path = std::env::var(CACHED_MAP_ENV_VAR).ok()?;
     if path.is_empty() {
+        tracing::info!("repo intelligence cached_map: env var empty, will index in-arm");
         return None;
     }
+    let read_start = std::time::Instant::now();
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(err) => {
@@ -84,8 +86,19 @@ fn load_cached_map_from_env() -> Option<RepoMap> {
             return None;
         }
     };
+    let read_ms = read_start.elapsed().as_millis();
+    let parse_start = std::time::Instant::now();
     match serde_json::from_slice::<RepoMap>(&bytes) {
-        Ok(map) => Some(map),
+        Ok(map) => {
+            let parse_ms = parse_start.elapsed().as_millis();
+            tracing::info!(
+                "repo intelligence cached_map: loaded {path} ({} files, read={}ms, parse={}ms)",
+                map.files.len(),
+                read_ms,
+                parse_ms
+            );
+            Some(map)
+        }
         Err(err) => {
             tracing::warn!(
                 "repo intelligence cached_map: failed to deserialize {path}: {err}"
@@ -102,6 +115,7 @@ impl ContextContributor for RepoIntelligenceExtension {
         thread_store: &'a ExtensionData,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<PromptFragment>> + Send + 'a>> {
         Box::pin(async move {
+            let contribute_start = std::time::Instant::now();
             let Some(config) = thread_store.get::<RepoIntelligenceExtensionConfig>() else {
                 return Vec::new();
             };
@@ -109,6 +123,7 @@ impl ContextContributor for RepoIntelligenceExtension {
                 return Vec::new();
             }
 
+            let map_start = std::time::Instant::now();
             let map = match &config.cached_map {
                 Some(map) => map.clone(),
                 None => match RepoMapBuilder::build(config.cwd.as_path()) {
@@ -119,6 +134,7 @@ impl ContextContributor for RepoIntelligenceExtension {
                     }
                 },
             };
+            let map_ms = map_start.elapsed().as_millis();
 
             let run_memory = thread_store
                 .get::<RunMemoryBridge>()
@@ -130,13 +146,23 @@ impl ContextContributor for RepoIntelligenceExtension {
                 .as_deref()
                 .filter(|text| !text.is_empty())
                 .unwrap_or("continue current task");
+            let packet_start = std::time::Instant::now();
             let packet =
                 build_context_packet(task, &map, &run_memory, BuildPacketOptions::default());
+            let packet_ms = packet_start.elapsed().as_millis();
+            let render_start = std::time::Instant::now();
             let mut text = ContextPacketRenderer::render_prompt_fragment(&packet);
+            let render_ms = render_start.elapsed().as_millis();
+            let hint_start = std::time::Instant::now();
             if let Some(hint) = narrow_verification_hint(task, &map, &packet) {
                 text.push_str("\n\n");
                 text.push_str(&hint);
             }
+            let hint_ms = hint_start.elapsed().as_millis();
+            let total_ms = contribute_start.elapsed().as_millis();
+            tracing::info!(
+                "repo intelligence contribute(): total={total_ms}ms (map={map_ms}ms, packet={packet_ms}ms, render={render_ms}ms, verification_hint={hint_ms}ms)"
+            );
             vec![PromptFragment::new(PromptSlot::ContextualUser, text)]
         })
     }
