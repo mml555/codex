@@ -410,28 +410,28 @@ fn score_file_for_task(
         }
     }
 
-    let (area_delta, area_evidence) = area_affinity_adjustment(&file.path, &terms.likely_areas);
+    // Use the OWNERSHIP-resolved primary area (the signal that
+    // already drives the displayed "Likely area: <X>" warning), not
+    // `terms.likely_areas.first()`. The two can disagree:
+    // `infer_area_from_maps` (the ownership path) takes commands and
+    // declared area_maps into account, while `terms.likely_areas` is
+    // pure term-frequency over the repo. The pytest-target packet
+    // check showed both verification files getting the
+    // `area:outside_likely` penalty because `terms.likely_areas.first()`
+    // returned something other than "verification" even when ownership
+    // correctly resolved verification as the primary area.
+    let (area_delta, area_evidence) =
+        area_affinity_adjustment(&file.path, ownership.primary_area.as_deref());
     relevance += area_delta;
     if let Some(e) = area_evidence {
         evidence.push(e);
     }
 
-    // Within-crate ownership: when the inferred area only narrows
-    // routing to a crate (e.g. `verification/`), the ranker still has
-    // to pick a specific file. Without explicit ownership rules,
-    // accidental term overlap decides — the second packet check
-    // surfaced `command_exec.rs` winning a pytest-target task over
-    // `python_rules.rs` because the surface terms matched it more
-    // cleanly. Keep the rules explicit and small per the proposal:
-    // four owners, each keyed on terms that genuinely point at that
-    // file's responsibility. Boost magnitude (+0.30) sits between the
-    // area boost (+0.40) and a single term match (+0.12) so it
-    // decisively breaks within-crate ties without overriding the
-    // area signal.
-    if let Some(owner_evidence) = within_crate_owner_match(&file.path, terms) {
-        relevance += WITHIN_CRATE_OWNER_BOOST;
-        evidence.push(owner_evidence.to_string());
-    }
+    // Within-crate ownership boost is applied AFTER the [0,1] clamp
+    // further down — applying it here would be wasted, since multiple
+    // in-area files already saturate at 1.0 from term matches + area
+    // boost + signals. See the `// Within-crate ownership boost
+    // (post-clamp)` block immediately after the clamp.
 
     if file.signals.tags.iter().any(|t| t == "route") {
         relevance += 0.1;
@@ -501,6 +501,29 @@ fn score_file_for_task(
         evidence.push("task:metrics_file".to_string());
     }
     relevance = relevance.clamp(0.0, 1.0);
+
+    // Within-crate ownership boost (post-clamp): when the inferred
+    // area only narrows routing to a crate (e.g. `verification/`),
+    // the ranker still has to pick a specific file. The pytest-target
+    // packet check exposed this: every verification file saturated at
+    // relevance=1.0 from area boost + term matches + import signals,
+    // so the +0.30 ownership boost was lost to clamping, and
+    // `command_exec.rs` won the alphabetical tiebreaker over
+    // `python_rules.rs`. Applying the boost after the clamp lets
+    // owners exceed 1.0 specifically when the task semantics name
+    // them — the only files that ever exceed the [0,1] range are
+    // confirmed within-crate owners, so downstream consumers (which
+    // sort by relevance descending) see a clean ordering.
+    //
+    // Triggers and table see `WITHIN_CRATE_OWNERS`. Boost magnitude
+    // (+0.30) chosen so an owner at clamped-base 1.0 lands at 1.30,
+    // safely above any tied non-owner. Doesn't affect file inclusion
+    // (the threshold check happens earlier) — purely a tiebreaker.
+    if let Some(owner_evidence) = within_crate_owner_match(&file.path, terms) {
+        relevance += WITHIN_CRATE_OWNER_BOOST;
+        evidence.push(owner_evidence.to_string());
+    }
+
     let confidence = file.signals.confidence.clamp(0.0, 1.0);
 
     let include_reason = if matched_terms > 0 {
@@ -559,9 +582,9 @@ pub(crate) const AREA_OUTSIDE_PENALTY: f64 = 0.30;
 
 pub(crate) fn area_affinity_adjustment(
     path: &str,
-    likely_areas: &[String],
+    primary_area: Option<&str>,
 ) -> (f64, Option<String>) {
-    let Some(top_area) = likely_areas.first() else {
+    let Some(top_area) = primary_area else {
         return (0.0, None);
     };
     let prefix = format!("{top_area}/");
@@ -710,32 +733,29 @@ mod tests {
     use crate::task_terms::build_task_terms;
 
     #[test]
-    fn area_affinity_boosts_files_under_top_likely_area() {
-        // Top area = "verification" → verification/* gets +0.40 boost.
-        // The cli/Cargo.toml that previously won the first packet check
-        // (because the task said "`cli`" as a quoted example) now gets
-        // -0.30 instead — a net swing of 0.70 in favor of the right
-        // crate. This is the structural fix that replaces the
-        // hardcoded `if task_targets_crate(terms, "context-harness")`
-        // / `if task_targets_crate(terms, "cli")` boosts.
-        let areas = vec!["verification".to_string()];
-        let (boost, evidence) = area_affinity_adjustment("verification/src/rules.rs", &areas);
+    fn area_affinity_boosts_files_under_primary_area() {
+        // Primary area = "verification" → verification/* gets +0.40
+        // boost. The cli/Cargo.toml that previously won the first
+        // packet check (because the task said "`cli`" as a quoted
+        // example) now gets -0.30 instead — a net swing of 0.70 in
+        // favor of the right crate.
+        let (boost, evidence) =
+            area_affinity_adjustment("verification/src/rules.rs", Some("verification"));
         assert_eq!(boost, AREA_AFFINITY_BOOST);
         assert_eq!(evidence.as_deref(), Some("area:verification"));
 
-        let (penalty, evidence) = area_affinity_adjustment("cli/Cargo.toml", &areas);
+        let (penalty, evidence) = area_affinity_adjustment("cli/Cargo.toml", Some("verification"));
         assert_eq!(penalty, -AREA_OUTSIDE_PENALTY);
         assert_eq!(evidence.as_deref(), Some("area:outside_likely"));
     }
 
     #[test]
-    fn area_affinity_skips_boost_when_no_area_inferred() {
-        // Empty likely_areas → no signal → zero adjustment. The
-        // pre-existing inference threshold (`score > 0.5` in
-        // `infer_likely_areas`) acts as the confidence guard: if no
-        // area cleared that bar, the affinity logic stays out of the
-        // ranker entirely.
-        let (delta, evidence) = area_affinity_adjustment("any/file.rs", &[]);
+    fn area_affinity_skips_boost_when_no_area_resolved() {
+        // None → no signal → zero adjustment. `ownership.primary_area`
+        // is None when ownership resolution didn't find a command
+        // match, area_map match, or term-driven area inference. Keep
+        // the ranker neutral instead of penalizing.
+        let (delta, evidence) = area_affinity_adjustment("any/file.rs", None);
         assert_eq!(delta, 0.0);
         assert!(evidence.is_none());
     }
@@ -745,19 +765,18 @@ mod tests {
         // The OLD code's area block used `path.starts_with(area) ||
         // path_lower.contains(area)`. The substring branch matched any
         // path with the area name as a substring — e.g. with
-        // likely_area="cli", `client.rs` would be treated as "in area",
-        // and with likely_area="core", anything containing "core"
+        // primary_area="cli", `client.rs` would be treated as "in area",
+        // and with primary_area="core", anything containing "core"
         // would. The fix anchors on the `<area>/` prefix exactly.
-        let areas = vec!["cli".to_string()];
-        let (boost, _) = area_affinity_adjustment("cli/src/main.rs", &areas);
+        let (boost, _) = area_affinity_adjustment("cli/src/main.rs", Some("cli"));
         assert_eq!(boost, AREA_AFFINITY_BOOST, "exact prefix match");
 
-        let (delta, _) = area_affinity_adjustment("client.rs", &areas);
+        let (delta, _) = area_affinity_adjustment("client.rs", Some("cli"));
         assert_eq!(
             delta, -AREA_OUTSIDE_PENALTY,
             "substring match must NOT count as in-area"
         );
-        let (delta, _) = area_affinity_adjustment("foo/cli/bar.rs", &areas);
+        let (delta, _) = area_affinity_adjustment("foo/cli/bar.rs", Some("cli"));
         assert_eq!(
             delta, -AREA_OUTSIDE_PENALTY,
             "area only matches as path PREFIX, not anywhere mid-path"
@@ -765,17 +784,16 @@ mod tests {
     }
 
     #[test]
-    fn area_affinity_uses_only_the_top_likely_area() {
-        // `likely_areas` is a ranked Vec; the boost is applied to
-        // files under the FIRST entry only. Files under second-place
-        // areas get the outside-area penalty. This is intentional —
-        // a single confident routing signal is the design.
-        let areas = vec!["verification".to_string(), "cli".to_string()];
-        let (delta, _) = area_affinity_adjustment("cli/Cargo.toml", &areas);
-        assert_eq!(
-            delta, -AREA_OUTSIDE_PENALTY,
-            "second-ranked area must NOT inherit the boost"
-        );
+    fn area_affinity_handles_nested_area_paths() {
+        // Some area_maps use nested ids like `ext/repo-intelligence`.
+        // The `<area>/` prefix rule must still work — the entire
+        // nested path is the prefix.
+        let area = Some("ext/repo-intelligence");
+        let (boost, _) = area_affinity_adjustment("ext/repo-intelligence/src/lib.rs", area);
+        assert_eq!(boost, AREA_AFFINITY_BOOST);
+
+        let (delta, _) = area_affinity_adjustment("ext/other/src/lib.rs", area);
+        assert_eq!(delta, -AREA_OUTSIDE_PENALTY);
     }
 
     /// Build TaskTerms with an empty RepoMap so the ownership tests

@@ -59,7 +59,6 @@ fn ri_packet_for_area_package_alias_picks_verification_rules() {
 }
 
 #[test]
-#[ignore = "needs within-crate ranking fix: command_exec.rs outranks python_rules.rs"]
 fn ri_packet_for_pytest_target_picks_python_rules() {
     let map = live_codex_rs_map();
     let task = "In the verification crate, find the helper that returns true \
