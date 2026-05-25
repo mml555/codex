@@ -57,18 +57,26 @@ pub fn resolve_ownership(task: &str, map: &RepoMap, terms: &TaskTerms) -> Resolv
     ownership
 }
 
-pub fn infer_area_from_maps(task: &str, map: &RepoMap, terms: &TaskTerms) -> Option<String> {
+pub fn infer_area_from_maps(_task: &str, map: &RepoMap, terms: &TaskTerms) -> Option<String> {
     if map.area_maps.is_empty() {
         return None;
     }
 
-    if task_targets_crate(&terms.phrases, "context-harness")
+    // All term and raw-text checks below consult the QUOTE-AWARE
+    // signals: `terms.strong_phrases` (terms present outside any
+    // backtick / double-quote span) and `terms.task_outside_quotes_lower`
+    // (the raw task text with quoted regions stripped). A quoted
+    // example like ``"`cli`"`` inside a task about the verification
+    // crate must NOT score the CLI area.
+    let strong = &terms.strong_phrases;
+    let task_lower = &terms.task_outside_quotes_lower;
+
+    if task_targets_crate(strong, "context-harness")
         && map.area_map_for_id("context-harness").is_some()
     {
         return Some("context-harness".to_string());
     }
-    if terms
-        .phrases
+    if strong
         .iter()
         .any(|p| p == "intelligence" || p == "extension")
         && map.area_map_for_id("ext/repo-intelligence").is_some()
@@ -76,7 +84,6 @@ pub fn infer_area_from_maps(task: &str, map: &RepoMap, terms: &TaskTerms) -> Opt
         return Some("ext/repo-intelligence".to_string());
     }
 
-    let task_lower = task.to_ascii_lowercase();
     let mut best: Option<(String, f64)> = None;
 
     for area in &map.area_maps {
@@ -98,13 +105,18 @@ pub fn infer_area_from_maps(task: &str, map: &RepoMap, terms: &TaskTerms) -> Opt
             .filter(|t| t.len() >= 3)
             .map(str::to_string)
             .collect();
-        if task_targets_crate(&terms.phrases, &area.area_id)
+        if task_targets_crate(strong, &area.area_id)
             || area_tokens
                 .iter()
-                .all(|token| terms.phrases.iter().any(|p| p == token))
+                .all(|token| strong.iter().any(|p| p == token))
         {
             score += 0.5;
         }
+        // Synonym pass still uses the full `expanded` set (which
+        // includes weak terms) because area_id substring matches are
+        // already heavily gated by the +0.85 prose-mention check
+        // above; the +0.15 increment is a small tiebreaker and
+        // gating it on strong-only terms would over-correct.
         for term in &terms.expanded {
             if area.area_id.contains(term) || term.contains(&area.area_id) {
                 score += 0.15;

@@ -37,7 +37,6 @@ fn live_codex_rs_map() -> codex_repo_index::RepoMap {
 }
 
 #[test]
-#[ignore = "needs area-inference fix: task's quoted `cli` example outranks verification"]
 fn ri_packet_for_area_package_alias_picks_verification_rules() {
     let map = live_codex_rs_map();
     let task = "Inside the verification crate there is a static array that \
