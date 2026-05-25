@@ -1,0 +1,27 @@
+{
+  "arm": "vanilla",
+  "task_id": "first_install_order_in_app_server",
+  "changed_files": [
+    "codex-rs/app-server/src/extensions.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": false,
+  "harness_context_visible": false,
+  "run_valid": true,
+  "invalid_reason": null,
+  "tokens_input": 3376314,
+  "tokens_output": 7214,
+  "tokens_total": 3383528,
+  "duration_ms": 1193517,
+  "tool_call_count": 42,
+  "shell_command_count": 23,
+  "file_read_count": 0,
+  "discover_command_count": 7,
+  "edit_command_count": 0,
+  "verify_command_count": 7,
+  "worktree_isolated": true,
+  "base_ref": "44e056776eef3b9864d18be62091cdc3cfb208d8",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.hBv8xJ6ffB/codex-rs"
+}

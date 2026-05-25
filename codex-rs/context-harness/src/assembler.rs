@@ -416,6 +416,23 @@ fn score_file_for_task(
         evidence.push(e);
     }
 
+    // Within-crate ownership: when the inferred area only narrows
+    // routing to a crate (e.g. `verification/`), the ranker still has
+    // to pick a specific file. Without explicit ownership rules,
+    // accidental term overlap decides — the second packet check
+    // surfaced `command_exec.rs` winning a pytest-target task over
+    // `python_rules.rs` because the surface terms matched it more
+    // cleanly. Keep the rules explicit and small per the proposal:
+    // four owners, each keyed on terms that genuinely point at that
+    // file's responsibility. Boost magnitude (+0.30) sits between the
+    // area boost (+0.40) and a single term match (+0.12) so it
+    // decisively breaks within-crate ties without overriding the
+    // area signal.
+    if let Some(owner_evidence) = within_crate_owner_match(&file.path, terms) {
+        relevance += WITHIN_CRATE_OWNER_BOOST;
+        evidence.push(owner_evidence.to_string());
+    }
+
     if file.signals.tags.iter().any(|t| t == "route") {
         relevance += 0.1;
         evidence.push("tag:route".to_string());
@@ -558,6 +575,81 @@ pub(crate) fn area_affinity_adjustment(
     }
 }
 
+/// Boost magnitude applied to a file that owns the task's
+/// responsibility within its crate. Sits between the area boost
+/// (+0.40) and a single term match (+0.12) so it decisively breaks
+/// within-crate ties without overriding the area signal.
+pub(crate) const WITHIN_CRATE_OWNER_BOOST: f64 = 0.30;
+
+/// Static within-crate ownership table. Each row maps a specific
+/// file path suffix to the set of task-term triggers that indicate
+/// that file is the actual owner of the task's intent.
+///
+/// Scoped narrowly on purpose: the user's directive was to add
+/// explicit ownership for the verification crate's known files only,
+/// NOT to build a generic semantic system. Each rule's triggers are
+/// the actual term forms the tokenizer emits after singularization
+/// (`commands` → `command`, etc.), so we don't need fuzzy matching.
+///
+/// The matcher checks `terms.phrases` and `terms.expanded`. Phrases
+/// are the raw tokens from the task; `expanded` adds synonyms from
+/// the `task_terms::SYNONYMS` table.
+const WITHIN_CRATE_OWNERS: &[(&str, &[&str], &str)] = &[
+    // (file-path-suffix, trigger-terms, evidence-label)
+    //
+    // `python_rules.rs` owns the python/pytest validation rules.
+    // The pytest-target packet check failed when this file lost a
+    // tie to `command_exec.rs` despite the task being explicitly
+    // about pytest.
+    (
+        "verification/src/python_rules.rs",
+        &["python", "pytest"],
+        "owner:python_rules",
+    ),
+    // `command_exec.rs` owns shell command parsing / execution
+    // safety. Triggers cover both noun ("command") and verb
+    // ("exec", "parse") forms a task description might use.
+    (
+        "verification/src/command_exec.rs",
+        &["command", "exec", "execution", "shell", "parse", "parser", "safe", "safety"],
+        "owner:command_exec",
+    ),
+    // `planner.rs` owns verification-plan assembly.
+    (
+        "verification/src/planner.rs",
+        &["plan", "planner"],
+        "owner:planner",
+    ),
+    // `rules.rs` owns the area-to-cargo-package map and other static
+    // rules tables. Triggers cover both the literal "rules" mention
+    // and the area-package-alias task's vocabulary ("cargo",
+    // "package", "alias", "area").
+    (
+        "verification/src/rules.rs",
+        &["rule", "rules", "cargo", "package", "alias", "area"],
+        "owner:rules",
+    ),
+];
+
+/// If `path` is a known within-crate owner AND any of its trigger
+/// terms appears in the task, return the evidence label. The caller
+/// adds the +`WITHIN_CRATE_OWNER_BOOST` to the file's relevance.
+/// Returns None for unknown paths or non-matching tasks.
+pub(crate) fn within_crate_owner_match(path: &str, terms: &TaskTerms) -> Option<&'static str> {
+    let has = |term: &str| {
+        terms.phrases.iter().any(|p| p == term) || terms.expanded.iter().any(|p| p == term)
+    };
+    for (suffix, triggers, evidence) in WITHIN_CRATE_OWNERS {
+        if !path.ends_with(suffix) {
+            continue;
+        }
+        if triggers.iter().copied().any(has) {
+            return Some(*evidence);
+        }
+    }
+    None
+}
+
 fn is_manifest_path(path: &str) -> bool {
     path.ends_with("BUILD.bazel") || path.ends_with("Cargo.toml") || path.ends_with("package.json")
 }
@@ -611,9 +703,11 @@ mod tests {
     use super::AREA_OUTSIDE_PENALTY;
     use super::ContextAssembler;
     use super::area_affinity_adjustment;
+    use super::within_crate_owner_match;
     use crate::RunMemory;
     use crate::TaskClassifier;
     use crate::selection::SelectionCaps;
+    use crate::task_terms::build_task_terms;
 
     #[test]
     fn area_affinity_boosts_files_under_top_likely_area() {
@@ -681,6 +775,112 @@ mod tests {
         assert_eq!(
             delta, -AREA_OUTSIDE_PENALTY,
             "second-ranked area must NOT inherit the boost"
+        );
+    }
+
+    /// Build TaskTerms with an empty RepoMap so the ownership tests
+    /// don't depend on the live codex-rs tree. `infer_likely_areas`
+    /// will return an empty vec, which is fine — the ownership match
+    /// reads from `terms.phrases` / `terms.expanded` only.
+    fn task_terms_for(task: &str) -> crate::task_terms::TaskTerms {
+        let map = RepoMap {
+            version: 2,
+            repo_id: "t".to_string(),
+            root: "/t".to_string(),
+            files: Vec::new(),
+            tests: Vec::new(),
+            areas: Vec::new(),
+            packages: Vec::new(),
+            area_maps: Vec::new(),
+            commands: Vec::new(),
+            test_map: Vec::new(),
+            agents_md: None,
+            warnings: Vec::new(),
+        };
+        build_task_terms(task, &map)
+    }
+
+    #[test]
+    fn within_crate_owner_matches_python_rules_for_pytest_task() {
+        // The packet check 2 failure: pytest-target-check picked
+        // command_exec.rs over python_rules.rs. The owner table must
+        // route any task carrying "python" or "pytest" to
+        // python_rules.rs.
+        let terms = task_terms_for(
+            "In the verification crate, find the helper that returns true \
+             when a path matches the narrow single-file pytest target shape",
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/python_rules.rs", &terms),
+            Some("owner:python_rules"),
+        );
+        // The same task must NOT activate command_exec ownership —
+        // its triggers (command, exec, parse, shell) are absent here.
+        assert_eq!(
+            within_crate_owner_match("verification/src/command_exec.rs", &terms),
+            None,
+        );
+    }
+
+    #[test]
+    fn within_crate_owner_matches_command_exec_for_command_safety_task() {
+        // The complementary direction: a task explicitly about
+        // shell command parsing/execution must route to
+        // command_exec.rs, NOT to python_rules.rs (even though both
+        // are in `verification/`).
+        let terms = task_terms_for(
+            "Add a helper to the verification crate that parses shell commands \
+             and rejects unsafe execution patterns",
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/command_exec.rs", &terms),
+            Some("owner:command_exec"),
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/python_rules.rs", &terms),
+            None,
+        );
+    }
+
+    #[test]
+    fn within_crate_owner_matches_planner_for_verification_plan_task() {
+        // Planning tasks must route to planner.rs — and must NOT
+        // collide with command_exec or python_rules even when the
+        // task happens to mention verification or rules.
+        let terms = task_terms_for(
+            "Update the verification planner to produce a narrower plan when \
+             only one file changed",
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/planner.rs", &terms),
+            Some("owner:planner"),
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/command_exec.rs", &terms),
+            None,
+        );
+        assert_eq!(
+            within_crate_owner_match("verification/src/python_rules.rs", &terms),
+            None,
+        );
+    }
+
+    #[test]
+    fn within_crate_owner_returns_none_for_files_outside_known_owners() {
+        // A verification file that isn't in the owners table (or any
+        // file in another crate) gets None — the ranker falls back
+        // to area boost + term matching only. Keeps the table's
+        // scope narrow and predictable.
+        let terms = task_terms_for("any task about pytest verification");
+        assert_eq!(
+            within_crate_owner_match("verification/src/lib.rs", &terms),
+            None,
+            "lib.rs is not an owner — must not get the boost"
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/agent_eval.rs", &terms),
+            None,
+            "the table is verification-only by design"
         );
     }
 

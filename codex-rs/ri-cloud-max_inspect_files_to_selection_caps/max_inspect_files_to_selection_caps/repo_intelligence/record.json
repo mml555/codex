@@ -1,0 +1,30 @@
+{
+  "arm": "repo_intelligence",
+  "task_id": "max_inspect_files_to_selection_caps",
+  "changed_files": [
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/selection.rs",
+    "codex-rs/context-harness/tests/m11_relevance.rs",
+    "codex-rs/context-harness/tests/packet_golden.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": true,
+  "harness_context_visible": true,
+  "run_valid": false,
+  "invalid_reason": "provider_network_error",
+  "tokens_input": 1948351,
+  "tokens_output": 9019,
+  "tokens_total": 1957370,
+  "duration_ms": 561995,
+  "tool_call_count": 44,
+  "shell_command_count": 33,
+  "file_read_count": 0,
+  "discover_command_count": 11,
+  "edit_command_count": 0,
+  "verify_command_count": 5,
+  "worktree_isolated": true,
+  "base_ref": "44e056776eef3b9864d18be62091cdc3cfb208d8",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.r2EbRwT09F/codex-rs"
+}

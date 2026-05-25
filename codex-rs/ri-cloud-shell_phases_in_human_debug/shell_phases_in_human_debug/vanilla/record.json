@@ -1,0 +1,28 @@
+{
+  "arm": "vanilla",
+  "task_id": "shell_phases_in_human_debug",
+  "changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/lib.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": false,
+  "harness_context_visible": true,
+  "run_valid": false,
+  "invalid_reason": "provider_network_error",
+  "tokens_input": 7535151,
+  "tokens_output": 23869,
+  "tokens_total": 7559020,
+  "duration_ms": 811729,
+  "tool_call_count": 87,
+  "shell_command_count": 58,
+  "file_read_count": 0,
+  "discover_command_count": 15,
+  "edit_command_count": 0,
+  "verify_command_count": 25,
+  "worktree_isolated": true,
+  "base_ref": "44e056776eef3b9864d18be62091cdc3cfb208d8",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.5ac1eSbXaV/codex-rs"
+}
