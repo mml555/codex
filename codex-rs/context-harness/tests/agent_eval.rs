@@ -33,6 +33,9 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         tool_call_count: None,
         shell_command_count: None,
         file_read_count: None,
+        discover_command_count: None,
+        edit_command_count: None,
+        verify_command_count: None,
         worktree_isolated: false,
         base_ref: None,
         worktree_path: None,
@@ -134,6 +137,53 @@ fn codex_session_fixture_loads() {
         tasks
             .iter()
             .all(|t| matches!(t.workdir, codex_context_harness::AgentEvalWorkdir::CodexRs))
+    );
+}
+
+#[test]
+fn ri_hard_v1_fixture_loads_with_no_prompt_naming_the_gold_file() {
+    use codex_context_harness::TaskCategory;
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/agent_eval_tasks_ri_hard_v1.json");
+    let tasks = load_agent_eval_tasks(&path).expect("ri_hard_v1 fixture loads");
+
+    // 5 tasks, all codex_rs workdir, all categorized.
+    assert_eq!(tasks.len(), 5, "ri_hard_v1 fixture should hold 5 tasks");
+    for t in &tasks {
+        assert!(
+            matches!(t.workdir, codex_context_harness::AgentEvalWorkdir::CodexRs),
+            "task {} must declare workdir=codex_rs",
+            t.id
+        );
+        assert!(t.category.is_some(), "task {} must declare a category", t.id);
+        assert!(!t.relevant_files.is_empty(), "task {} must declare gold", t.id);
+
+        // Anti-leak rule: the prompt MUST NOT contain any gold file path
+        // as a substring. The whole point of the hard fixture is that
+        // discovery is non-trivial; if the prompt names the file, vanilla
+        // gets a free pass and RI's discovery savings are unmeasurable.
+        for gold in &t.relevant_files {
+            assert!(
+                !t.task.contains(gold.as_str()),
+                "task {} prompt MUST NOT name its gold file `{}` \
+                 (defeats the discovery-cost measurement)",
+                t.id,
+                gold
+            );
+        }
+    }
+
+    // Categories represented (subset OK; we don't require all 5).
+    let mut cats: std::collections::BTreeSet<TaskCategory> = std::collections::BTreeSet::new();
+    for t in &tasks {
+        if let Some(c) = t.category {
+            cats.insert(c);
+        }
+    }
+    assert!(
+        cats.len() >= 3,
+        "ri_hard_v1 should cover at least 3 distinct categories; got {:?}",
+        cats
     );
 }
 

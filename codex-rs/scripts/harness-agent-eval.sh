@@ -237,14 +237,19 @@ cleanup_arm_workdir() {
   fi
 }
 
-# Trap-installed: sweep every worktree the run still has registered. Runs on
-# any exit path — clean termination, crash, Ctrl-C, set -e propagation.
+# Trap-installed: sweep every worktree the run still has registered. The
+# EXIT pseudosignal fires on clean termination, `exit N`, and `set -e`
+# propagation. SIGTERM (kill, parent-process death), SIGINT (Ctrl-C), and
+# SIGHUP (terminal close) DO NOT fire EXIT by default in bash — they
+# terminate the shell before any pending EXIT trap runs. Trap each
+# explicitly so a `kill` from outside the script still gets us a clean
+# sweep before bash exits.
 cleanup_all_active_worktrees() {
   local count=${#ACTIVE_WORKTREES[@]}
   if [[ "${count}" -eq 0 ]]; then
     return
   fi
-  echo "trap EXIT: force-removing ${count} orphan worktree(s)" >&2
+  echo "trap: force-removing ${count} orphan worktree(s)" >&2
   for wt in ${ACTIVE_WORKTREES[@]+"${ACTIVE_WORKTREES[@]}"}; do
     if [[ -n "${REPO_ROOT}" ]]; then
       git -C "${REPO_ROOT}" worktree remove --force "${wt}" 2>/dev/null || true
@@ -253,7 +258,7 @@ cleanup_all_active_worktrees() {
   done
   ACTIVE_WORKTREES=()
 }
-trap cleanup_all_active_worktrees EXIT
+trap cleanup_all_active_worktrees EXIT TERM INT HUP
 
 # Ensure the safe codex binary still exists. If an agent in some arm wiped
 # the source tree's target/, the copy under SAFE_CODEX_BIN_DIR survives
@@ -475,6 +480,9 @@ write_record() {
   RECORD_TOOL_CALL_COUNT="${RECORD_TOOL_CALL_COUNT:-}" \
   RECORD_SHELL_COMMAND_COUNT="${RECORD_SHELL_COMMAND_COUNT:-}" \
   RECORD_FILE_READ_COUNT="${RECORD_FILE_READ_COUNT:-}" \
+  RECORD_DISCOVER_COMMAND_COUNT="${RECORD_DISCOVER_COMMAND_COUNT:-}" \
+  RECORD_EDIT_COMMAND_COUNT="${RECORD_EDIT_COMMAND_COUNT:-}" \
+  RECORD_VERIFY_COMMAND_COUNT="${RECORD_VERIFY_COMMAND_COUNT:-}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -522,6 +530,9 @@ record = {
     "tool_call_count": opt_env_int("RECORD_TOOL_CALL_COUNT"),
     "shell_command_count": opt_env_int("RECORD_SHELL_COMMAND_COUNT"),
     "file_read_count": opt_env_int("RECORD_FILE_READ_COUNT"),
+    "discover_command_count": opt_env_int("RECORD_DISCOVER_COMMAND_COUNT"),
+    "edit_command_count": opt_env_int("RECORD_EDIT_COMMAND_COUNT"),
+    "verify_command_count": opt_env_int("RECORD_VERIFY_COMMAND_COUNT"),
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
     "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
     "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
@@ -596,9 +607,18 @@ print(count)
 PY
 }
 
-# Tally tool/shell/file-read activity from events.jsonl. Emits three lines:
-# tool_call_count, shell_command_count, file_read_count. Heuristic mirrors
-# `agent_eval::count_activity_from_exec_jsonl` for cross-checking.
+# Tally tool/shell activity + per-phase shell breakdown from events.jsonl.
+# Emits six lines (in order):
+#   tool_call_count
+#   shell_command_count
+#   file_read_count        (= read phase)
+#   discover_command_count
+#   edit_command_count
+#   verify_command_count
+# Heuristic mirrors `agent_eval::classify_shell_phase` /
+# `count_activity_from_exec_jsonl` so the bash-emitted and Rust-parsed
+# counts agree on the same events.jsonl. Phase sums equal shell_command
+# count minus an unrecorded "other" residual.
 count_activity() {
   local events="$1"
   python3 - "${events}" <<'PY'
@@ -618,38 +638,104 @@ def first_token(raw: str) -> str:
     parts = s.split()
     return parts[0] if parts else ""
 
+def strip_leading_cd_chains(cmd: str) -> str:
+    """Skip every leading `cd <path> && ` segment so we classify the
+    *real* command, not the navigation prefix. Mirrors the Rust
+    `strip_leading_cd_chains` helper.
+    """
+    s = cmd.strip()
+    for prefix in SHELL_WRAPPERS:
+        if s.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    s = s.strip("'\"")
+    while s.lstrip().startswith("cd "):
+        idx = s.find("&&")
+        if idx < 0: break
+        s = s[idx + 2:].lstrip()
+    return s
+
+def _has_joined_grep_context(lc: str) -> bool:
+    """Detect joined grep context flags like `-A5`, `-B5`, `-C5`."""
+    import re
+    return bool(re.search(r" -[abc]\d", lc))
+
+def classify_phase(cmd: str) -> str:
+    normalized = strip_leading_cd_chains(cmd)
+    first = first_token(normalized)
+    if first in ("find", "ls", "tree", "locate", "fd"):
+        return "discover"
+    if first in FILE_READ_COMMANDS:
+        return "read"
+    if first in ("grep", "rg", "ack"):
+        lc = normalized.lower()
+        # Context flags → post-edit verification rather than discovery.
+        # Match BOTH spaced (`-A 3`) and joined (`-A3`) variants, plus
+        # long forms.
+        if any(m in lc for m in (
+            " -a ", " -b ", " -c ", " -a=", " -b=", " -c=",
+            " --after-context", " --before-context", " --context",
+        )) or _has_joined_grep_context(lc):
+            return "verify"
+        return "discover"
+    if first == "sed":
+        return "edit" if "-i" in normalized else "other"
+    if first == "perl":
+        return "edit" if "-i" in normalized else "other"
+    if first == "awk":
+        if "inplace" in normalized: return "edit"
+        if "print" in normalized: return "verify"
+        return "other"
+    if first in ("echo", "printf"):
+        return "edit" if ">" in normalized else "other"
+    if first in ("mv", "cp", "rm", "mkdir", "touch", "rmdir", "ln"):
+        return "edit"
+    if first == "diff":
+        return "verify"
+    if first == "git":
+        lc = normalized.lower()
+        if " diff" in lc or " log" in lc or " show" in lc: return "verify"
+        if " status" in lc or " ls-files" in lc or " branch" in lc: return "discover"
+        return "other"
+    return "other"
+
 events_path = Path(sys.argv[1])
 tool_calls = 0
 shell_cmds = 0
 file_reads = 0
+discover = 0
+edit = 0
+verify = 0
 if events_path.exists():
     with events_path.open(encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") != "item.completed":
-                continue
+            if not line: continue
+            try: ev = json.loads(line)
+            except json.JSONDecodeError: continue
+            if ev.get("type") != "item.completed": continue
             tool_calls += 1
             item = ev.get("item") or {}
-            if item.get("type") != "command_execution":
-                continue
+            if item.get("type") != "command_execution": continue
             shell_cmds += 1
             cmd = item.get("command")
-            if isinstance(cmd, list):
-                cmd = " ".join(cmd)
-            elif not isinstance(cmd, str):
-                cmd = ""
-            if first_token(cmd) in FILE_READ_COMMANDS:
-                file_reads += 1
+            if isinstance(cmd, list): cmd = " ".join(cmd)
+            elif not isinstance(cmd, str): cmd = ""
+            # Derive every phase counter (including file_reads) from
+            # classify_phase so they all agree on `cd $X && <real>` chains.
+            phase = classify_phase(cmd)
+            if phase == "discover": discover += 1
+            elif phase == "read":     file_reads += 1
+            elif phase == "edit":     edit += 1
+            elif phase == "verify":   verify += 1
+            # "other" implicit.
 
 print(tool_calls)
 print(shell_cmds)
 print(file_reads)
+print(discover)
+print(edit)
+print(verify)
 PY
 }
 
@@ -724,10 +810,14 @@ ${task_text}"
     read -r tokens_total
   } < <(count_tokens "${events}")
   local tool_call_count shell_command_count file_read_count
+  local discover_command_count edit_command_count verify_command_count
   {
     read -r tool_call_count
     read -r shell_command_count
     read -r file_read_count
+    read -r discover_command_count
+    read -r edit_command_count
+    read -r verify_command_count
   } < <(count_activity "${events}")
   local validity
   validity="$(classify_run_validity "${events}" "${exec_exit}")"
@@ -745,6 +835,9 @@ ${task_text}"
   RECORD_TOOL_CALL_COUNT="${tool_call_count}" \
   RECORD_SHELL_COMMAND_COUNT="${shell_command_count}" \
   RECORD_FILE_READ_COUNT="${file_read_count}" \
+  RECORD_DISCOVER_COMMAND_COUNT="${discover_command_count}" \
+  RECORD_EDIT_COMMAND_COUNT="${edit_command_count}" \
+  RECORD_VERIFY_COMMAND_COUNT="${verify_command_count}" \
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
     "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
@@ -757,7 +850,7 @@ ${task_text}"
   # Format duration in seconds for the log line; one-decimal precision.
   local duration_s
   duration_s="$(python3 -c "print(f'{${duration_ms}/1000:.1f}')")"
-  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} duration=${duration_s}s shell=${shell_command_count} reads=${file_read_count} cargo_target=${target_size}"
+  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} duration=${duration_s}s shell=${shell_command_count} (d=${discover_command_count}/r=${file_read_count}/e=${edit_command_count}/v=${verify_command_count}) cargo_target=${target_size}"
 }
 
 resolve_codex_bin

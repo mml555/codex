@@ -121,6 +121,16 @@ pub struct AgentRunRecord {
     /// loads via codex's structured file-read tool, if any.
     #[serde(default)]
     pub file_read_count: Option<u32>,
+    /// Phase-classified shell command counts. See [`classify_shell_phase`]
+    /// for the heuristic. Sum of all four phase counts (discover + read +
+    /// edit + verify) plus an unrecorded "other" residual equals
+    /// `shell_command_count`. None for pre-phase-instrumentation records.
+    #[serde(default)]
+    pub discover_command_count: Option<u32>,
+    #[serde(default)]
+    pub edit_command_count: Option<u32>,
+    #[serde(default)]
+    pub verify_command_count: Option<u32>,
     /// True when this arm ran in a worktree that was not shared with any other
     /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
     /// was set; for `calculator` workdirs the arm always gets a fresh
@@ -215,6 +225,13 @@ pub struct AgentRunScore {
     /// Diagnostic: shell commands whose first executable is `cat`/`head`/
     /// `tail`/`less`/`more`. Coarse signal for "model wandering the repo".
     pub file_read_count: Option<u32>,
+    /// Phase-classified shell command counts, propagated from
+    /// `AgentRunRecord`. The cost-table renderer surfaces these
+    /// separately so a reviewer can see, e.g., "RI cut discovery -2 but
+    /// added +4 verify" instead of just the aggregate.
+    pub discover_command_count: Option<u32>,
+    pub edit_command_count: Option<u32>,
+    pub verify_command_count: Option<u32>,
 }
 
 /// Comparison verdict for a (vanilla, treatment) pair on one task.
@@ -411,6 +428,9 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         tool_call_count: record.tool_call_count,
         shell_command_count: record.shell_command_count,
         file_read_count: record.file_read_count,
+        discover_command_count: record.discover_command_count,
+        edit_command_count: record.edit_command_count,
+        verify_command_count: record.verify_command_count,
     }
 }
 
@@ -642,28 +662,118 @@ pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenU
 }
 
 /// Per-arm activity counts derived from a `codex exec --json` events stream.
-/// All three counters are coarse, post-hoc, and meant for visibility — not
+/// All counters are coarse, post-hoc, and meant for visibility — not
 /// scoring. The point is to surface "did the model wander the repo?" so a
 /// reviewer can read the cost table next to the result table and tell
 /// whether RI moved work out of the model loop.
+///
+/// Q8 rehearsal (2026-05-25) showed that the aggregate shell-command count
+/// can MISLEAD: RI may save 2 discovery commands but lose 4 to edit/verify
+/// churn, and the aggregate just shows "+2 total" without exposing which
+/// phase moved. Hence the per-phase classification below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AgentActivityCounts {
     /// Every `item.completed` event the run emitted, regardless of item type.
     /// Coarse proxy for "how many tool turns did the model take".
     pub tool_calls: u32,
     /// `item.completed` events whose `item.type == "command_execution"`.
+    /// Equal to `discover + read + edit + verify + other`.
     pub shell_commands: u32,
-    /// Shell commands whose first executable token is `cat`/`head`/`tail`/
-    /// `less`/`more` (heuristic). The agent's `/bin/zsh -lc '<cmd>'`
-    /// wrapping is unpeeled before matching. Misses structured file-read
-    /// tools (if any) and counts `cat heredoc <<EOF` style write-via-cat
-    /// invocations as reads — accept those tradeoffs for v1.
+    /// Repo navigation: `find`, `ls`, `tree`, `locate`, `fd`, plain `grep`
+    /// (no context flags), `git status`.
+    pub discover_commands: u32,
+    /// File reading: `cat`, `head`, `tail`, `less`, `more`. (Same set as
+    /// the existing `file_read_count` to keep the bash↔Rust mirror simple.)
     pub file_reads: u32,
+    /// Code modification: `sed -i`, `perl -i`, `awk` with `inplace`,
+    /// `echo` with `>`/`>>` redirects, `mv`, `cp`, `rm`, `mkdir`, `touch`.
+    pub edit_commands: u32,
+    /// Post-edit confirmation: `grep` with `-A`/`-B`/`-C`/`-c` context
+    /// flags, `diff`, `git diff`, `awk` with print-only patterns.
+    pub verify_commands: u32,
 }
 
-const FILE_READ_COMMANDS: &[&str] = &["cat", "head", "tail", "less", "more"];
 
-/// Parse `events.jsonl` and count tool/shell/file-read activity.
+/// Coarse classification of a single shell command into one of five phases.
+/// Returned as a static slug for both Rust scoring and the bash mirror.
+///
+/// Limitations: stateless (can't tell "cat before edit" from "cat after"),
+/// and a single command can serve multiple purposes (`grep -n` is discover;
+/// `grep -A 3` is verify). The heuristic favors the most common case for
+/// each shell tool as observed in q8 / qwen3-coder traces. Two refinements
+/// from the 2026-05-25 rehearsal:
+///
+/// 1. `cd <dir> && <real_cmd>` chains: agents often prefix every shell with
+///    `cd $WORKTREE && ...`. We strip every leading `cd ... &&` segment and
+///    classify by the actual command that follows.
+/// 2. `grep -A5` (no space between flag and number) counts as verify, same
+///    as `grep -A 5`.
+pub fn classify_shell_phase(command: &str) -> &'static str {
+    let normalized = strip_leading_cd_chains(command);
+    let first = first_executable_token(&normalized);
+    match first {
+        "find" | "ls" | "tree" | "locate" | "fd" => "discover",
+        "cat" | "head" | "tail" | "less" | "more" => "read",
+        "grep" | "rg" | "ack" => {
+            // Context flags indicate post-edit verify, not discovery.
+            // Match BOTH spaced (`-A 3`) and joined (`-A3`) variants, plus
+            // long forms. Use lowercase for case-insensitivity.
+            let lc = normalized.to_ascii_lowercase();
+            let has_context = lc.contains(" -a ")
+                || lc.contains(" -b ")
+                || lc.contains(" -c ")
+                || lc.contains(" -a=")
+                || lc.contains(" -b=")
+                || lc.contains(" -c=")
+                || lc.contains(" --after-context")
+                || lc.contains(" --before-context")
+                || lc.contains(" --context")
+                // -A5 / -B5 / -C5 (joined form). Single-digit suffix matched
+                // by checking " -A<d>" / " -B<d>" / " -C<d>" where d is a
+                // digit. Cheap byte scan; no regex dependency.
+                || has_joined_context_flag(&lc);
+            if has_context { "verify" } else { "discover" }
+        }
+        "sed" => {
+            if command.contains("-i") { "edit" } else { "other" }
+        }
+        "perl" => {
+            if command.contains("-i") { "edit" } else { "other" }
+        }
+        "awk" => {
+            if command.contains("inplace") {
+                "edit"
+            } else if command.contains("print") {
+                // Bare `awk '... {print ...}'` is almost always used to
+                // print a specific line for verify in agent traces.
+                "verify"
+            } else {
+                "other"
+            }
+        }
+        "echo" | "printf" => {
+            // `echo X > file` / `echo X >> file` is an edit.
+            if command.contains('>') { "edit" } else { "other" }
+        }
+        "mv" | "cp" | "rm" | "mkdir" | "touch" | "rmdir" | "ln" => "edit",
+        "diff" => "verify",
+        "git" => {
+            // `git diff`, `git log -p` etc. are verify; `git status` /
+            // `git ls-files` etc. are discover.
+            let lc = command.to_ascii_lowercase();
+            if lc.contains(" diff") || lc.contains(" log") || lc.contains(" show") {
+                "verify"
+            } else if lc.contains(" status") || lc.contains(" ls-files") || lc.contains(" branch") {
+                "discover"
+            } else {
+                "other"
+            }
+        }
+        _ => "other",
+    }
+}
+
+/// Parse `events.jsonl` and count tool/shell/per-phase activity.
 pub fn count_activity_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<AgentActivityCounts> {
     let mut counts = AgentActivityCounts::default();
     for line in std::str::from_utf8(bytes)?.lines() {
@@ -687,13 +797,19 @@ pub fn count_activity_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<AgentActiv
             continue;
         }
         counts.shell_commands = counts.shell_commands.saturating_add(1);
-        // Look at the first executable token; codex usually wraps shell
-        // commands as `/bin/zsh -lc '<inner>'`. Unpeel that one layer so
-        // the heuristic sees `cat`, not `zsh`.
         let raw = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let first = first_executable_token(raw);
-        if FILE_READ_COMMANDS.iter().any(|cmd| *cmd == first) {
-            counts.file_reads = counts.file_reads.saturating_add(1);
+        // Derive ALL phase counts (including file_reads) from
+        // `classify_shell_phase` so they agree on `cd $X && <real_cmd>`
+        // and other chained shapes. Doing the read-check separately via
+        // `first_executable_token` was misclassifying every chained
+        // `cd && cat ...` as a non-read.
+        match classify_shell_phase(raw) {
+            "discover" => counts.discover_commands = counts.discover_commands.saturating_add(1),
+            "read" => counts.file_reads = counts.file_reads.saturating_add(1),
+            "edit" => counts.edit_commands = counts.edit_commands.saturating_add(1),
+            "verify" => counts.verify_commands = counts.verify_commands.saturating_add(1),
+            // "other" — implicit; equals shell - (d + r + e + v).
+            _ => {}
         }
     }
     Ok(counts)
@@ -716,6 +832,56 @@ fn first_executable_token(cmd: &str) -> &str {
     };
     let unquoted = inner.trim_start_matches(['\'', '"']);
     unquoted.split_ascii_whitespace().next().unwrap_or("")
+}
+
+/// Skip every leading `cd <something> && ` segment. Agents commonly prefix
+/// every shell command with `cd $WORKTREE && <real_cmd>`; classifying by
+/// the leading `cd` mislabels everything as "other". Returns a slice
+/// starting at the first non-`cd` real command.
+fn strip_leading_cd_chains(command: &str) -> String {
+    // Unpeel any shell wrapper first so we see the actual command body.
+    let trimmed = command.trim();
+    let body = if let Some(rest) = trimmed.strip_prefix("/bin/zsh -lc ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("/bin/bash -c ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("zsh -lc ") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("bash -c ") {
+        rest
+    } else {
+        trimmed
+    };
+    let body = body.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"']);
+
+    let mut remaining = body.to_string();
+    loop {
+        let lead = remaining.trim_start();
+        if !lead.starts_with("cd ") {
+            break;
+        }
+        let Some(idx) = lead.find("&&") else { break };
+        remaining = lead[idx + 2..].trim_start().to_string();
+    }
+    remaining
+}
+
+/// Returns true if the lowercased command contains `-A<digit>`, `-B<digit>`,
+/// or `-C<digit>` (the joined-flag form of grep context options). Used by
+/// the verify-phase classifier when no space-separated flag is found.
+fn has_joined_context_flag(lc: &str) -> bool {
+    let bytes = lc.as_bytes();
+    for i in 0..bytes.len().saturating_sub(3) {
+        // Look for " -X<d>" with X in {a,b,c} and d a digit.
+        if bytes[i] == b' ' && bytes[i + 1] == b'-' {
+            let flag = bytes[i + 2];
+            let digit = bytes[i + 3];
+            if matches!(flag, b'a' | b'b' | b'c') && digit.is_ascii_digit() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Parse changed paths from `git diff --name-only` output.
@@ -780,13 +946,15 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         "Time V/RI",
         "Result",
     ];
-    const COST_HEADERS: [&str; 6] = [
+    const COST_HEADERS: [&str; 8] = [
         "Task",
         "Tokens V/RI",
         "Token Δ",
         "Tool calls V/RI",
-        "Shell V/RI",
-        "File reads V/RI",
+        "Discover V/RI",
+        "Read V/RI",
+        "Edit V/RI",
+        "Verify V/RI",
     ];
 
     let comparisons: Vec<(Option<TaskCategory>, &AgentEvalComparison)> = report
@@ -1002,10 +1170,12 @@ fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
     ]
 }
 
-fn format_cost_row(row: &AgentEvalComparison) -> [String; 6] {
+fn format_cost_row(row: &AgentEvalComparison) -> [String; 8] {
     if !row.valid_for_comparison {
         return [
             row.task_id.clone(),
+            DASH.to_string(),
+            DASH.to_string(),
             DASH.to_string(),
             DASH.to_string(),
             DASH.to_string(),
@@ -1040,23 +1210,35 @@ fn format_cost_row(row: &AgentEvalComparison) -> [String; 6] {
         option_cell(row.vanilla.tool_call_count),
         option_cell(row.treatment.tool_call_count),
     );
-    let shells = format!(
+    let discover = format!(
         "{}/{}",
-        option_cell(row.vanilla.shell_command_count),
-        option_cell(row.treatment.shell_command_count),
+        option_cell(row.vanilla.discover_command_count),
+        option_cell(row.treatment.discover_command_count),
     );
     let reads = format!(
         "{}/{}",
         option_cell(row.vanilla.file_read_count),
         option_cell(row.treatment.file_read_count),
     );
+    let edits = format!(
+        "{}/{}",
+        option_cell(row.vanilla.edit_command_count),
+        option_cell(row.treatment.edit_command_count),
+    );
+    let verifies = format!(
+        "{}/{}",
+        option_cell(row.vanilla.verify_command_count),
+        option_cell(row.treatment.verify_command_count),
+    );
     [
         row.task_id.clone(),
         tokens,
         token_delta,
         tool_calls,
-        shells,
+        discover,
         reads,
+        edits,
+        verifies,
     ]
 }
 
@@ -1144,6 +1326,9 @@ mod tests {
             tool_call_count: None,
             shell_command_count: None,
             file_read_count: None,
+            discover_command_count: None,
+            edit_command_count: None,
+            verify_command_count: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -1188,6 +1373,9 @@ mod tests {
                 tool_call_count: Some(3),
                 shell_command_count: Some(1),
                 file_read_count: Some(0),
+                discover_command_count: None,
+                edit_command_count: None,
+                verify_command_count: None,
             }
         );
     }
@@ -1424,6 +1612,9 @@ mod tests {
             tool_call_count: None,
             shell_command_count: None,
             file_read_count: None,
+            discover_command_count: None,
+            edit_command_count: None,
+            verify_command_count: None,
         }
     }
 
@@ -1747,16 +1938,85 @@ mod tests {
     }
 
     #[test]
-    fn count_activity_from_exec_jsonl_tallies_tool_shell_and_file_reads() {
+    fn count_activity_from_exec_jsonl_tallies_tool_shell_phases_and_reads() {
         let jsonl = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'find . -name *.rs'"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'grep -n pattern foo.rs'"}}
 {"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'cat README.md'"}}
 {"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'sed -i \"\" 1d foo.rs'"}}
 {"type":"item.completed","item":{"type":"agent_message","text":"done"}}
-{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'head -n 5 bar.rs'"}}"#;
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'head -n 5 bar.rs'"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'grep -A 3 pattern foo.rs'"}}"#;
         let counts = count_activity_from_exec_jsonl(jsonl.as_bytes()).unwrap();
-        assert_eq!(counts.tool_calls, 4, "every item.completed counts");
-        assert_eq!(counts.shell_commands, 3, "command_execution items only");
-        assert_eq!(counts.file_reads, 2, "cat + head are reads; sed is not");
+        assert_eq!(counts.tool_calls, 7, "every item.completed counts");
+        assert_eq!(counts.shell_commands, 6, "command_execution items only");
+        assert_eq!(counts.file_reads, 2, "cat + head");
+        assert_eq!(counts.discover_commands, 2, "find + plain grep");
+        assert_eq!(counts.edit_commands, 1, "sed -i");
+        assert_eq!(counts.verify_commands, 1, "grep -A is verify");
+        // discover + read + edit + verify = 6, equal to shell_commands → no `other`.
+    }
+
+    #[test]
+    fn classify_shell_phase_unpeels_cd_and_chained_commands() {
+        // The q8 rehearsal showed agents prefix every shell with
+        // `cd $WORKTREE && <real_cmd>`. The classifier must look past the
+        // `cd` prefix to the actual command after `&&`.
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'cd /tmp/foo && sed -i \"\" 1d bar.rs'"),
+            "edit"
+        );
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'cd /tmp/foo && cat baz.rs'"),
+            "read"
+        );
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'cd /tmp/foo && grep -A 3 pattern bar.rs'"),
+            "verify"
+        );
+        // Chained: cd && cd && real cmd — both `cd ... &&` prefixes stripped.
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'cd /tmp && cd /tmp/foo && find . -name *.rs'"),
+            "discover"
+        );
+        // Bare `cd` with no `&&` chain is still "other".
+        assert_eq!(classify_shell_phase("cd /tmp/foo"), "other");
+    }
+
+    #[test]
+    fn classify_shell_phase_detects_joined_grep_context_flags() {
+        // Q8 rehearsal: `grep -A5 -B5` (no space) was misclassified as
+        // discover. Joined flag forms must count as verify.
+        assert_eq!(classify_shell_phase("grep -A5 pattern foo.rs"), "verify");
+        assert_eq!(classify_shell_phase("grep -B5 pattern foo.rs"), "verify");
+        assert_eq!(classify_shell_phase("grep -C3 pattern foo.rs"), "verify");
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'grep -n -A5 -B5 thing foo.rs'"),
+            "verify"
+        );
+        // No context flag → discover.
+        assert_eq!(classify_shell_phase("grep -n pattern foo.rs"), "discover");
+    }
+
+    #[test]
+    fn classify_shell_phase_covers_common_cases() {
+        // Wrapped form (`/bin/zsh -lc '<inner>'`) and bare form should agree.
+        assert_eq!(classify_shell_phase("/bin/zsh -lc 'find . -name *.rs'"), "discover");
+        assert_eq!(classify_shell_phase("find . -name '*.rs'"), "discover");
+        assert_eq!(classify_shell_phase("ls -la"), "discover");
+        assert_eq!(classify_shell_phase("/bin/zsh -lc 'grep -n install foo.rs'"), "discover");
+        assert_eq!(classify_shell_phase("grep -A 3 pattern foo.rs"), "verify");
+        assert_eq!(classify_shell_phase("grep -B 2 pattern foo.rs"), "verify");
+        assert_eq!(classify_shell_phase("cat README.md"), "read");
+        assert_eq!(classify_shell_phase("head -n 5 foo.rs"), "read");
+        assert_eq!(classify_shell_phase("sed -i '' '1d' foo.rs"), "edit");
+        assert_eq!(classify_shell_phase("perl -i -pe 's/old/new/' foo.rs"), "edit");
+        assert_eq!(classify_shell_phase("awk 'NR==180{print}' foo.rs"), "verify");
+        assert_eq!(classify_shell_phase("echo content > newfile.rs"), "edit");
+        assert_eq!(classify_shell_phase("mv old.rs new.rs"), "edit");
+        assert_eq!(classify_shell_phase("git status"), "discover");
+        assert_eq!(classify_shell_phase("git diff HEAD"), "verify");
+        assert_eq!(classify_shell_phase("python -m pytest tests/foo.py"), "other");
     }
 
     #[test]
@@ -1783,6 +2043,9 @@ mod tests {
             tool_call_count: Some(15),
             shell_command_count: Some(10),
             file_read_count: Some(5),
+            discover_command_count: Some(2),
+            edit_command_count: Some(1),
+            verify_command_count: Some(2),
             ..synthetic_record(AgentArm::Vanilla, &task.id)
         };
         let treatment = AgentRunRecord {
@@ -1797,6 +2060,9 @@ mod tests {
             tool_call_count: Some(7),
             shell_command_count: Some(4),
             file_read_count: Some(1),
+            discover_command_count: Some(0),
+            edit_command_count: Some(2),
+            verify_command_count: Some(1),
             ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
         };
         let row = compare_task(&task, &vanilla, &treatment);
@@ -1804,8 +2070,10 @@ mod tests {
         assert_eq!(cells[0], "calculator_fix");
         assert_eq!(cells[1], "401000/405800");
         assert_eq!(cells[2], "+4800", "Token Δ should be signed; RI +4800 tokens");
-        assert_eq!(cells[3], "15/7");
-        assert_eq!(cells[4], "10/4");
-        assert_eq!(cells[5], "5/1");
+        assert_eq!(cells[3], "15/7", "tool calls V/RI");
+        assert_eq!(cells[4], "2/0", "discover V/RI");
+        assert_eq!(cells[5], "5/1", "read V/RI");
+        assert_eq!(cells[6], "1/2", "edit V/RI");
+        assert_eq!(cells[7], "2/1", "verify V/RI");
     }
 }
