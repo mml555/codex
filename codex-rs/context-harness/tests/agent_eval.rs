@@ -43,6 +43,7 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         diff_changed_files: Vec::new(),
         formatter_changed_files: Vec::new(),
         harness_prewarm_ms: None,
+        codex_build_profile: None,
         worktree_isolated: false,
         base_ref: None,
         worktree_path: None,

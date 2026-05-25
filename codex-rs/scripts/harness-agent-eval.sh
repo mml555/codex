@@ -31,6 +31,9 @@ CLOUD_EXTRA_ARGS=()
 # Resilience guards (added after Run 1 / Run 2 post-mortems):
 EVAL_CARGO_TARGET_DIR=""       # --cargo-target-dir; default /tmp/codex-ri-eval-cargo-target
 SAFE_CODEX_BIN_DIR=""          # holds a write-protected copy of codex; survives target/ wipes
+CODEX_BUILD_PROFILE=""         # "release" / "debug"; populated by resolve_codex_bin.
+                               # Recorded on each AgentRunRecord so reviewers can tell
+                               # which build profile produced a wall-clock number.
 SHARED_REPO_MAP_PATH=""        # prewarmed RepoMap JSON; threaded into each codex exec call
                                # via CODEX_REPO_INTELLIGENCE_CACHED_MAP so the RI extension
                                # skips the ~170s repo-index build inside each arm.
@@ -340,12 +343,23 @@ resolve_codex_bin() {
   if [[ -n "${CODEX_BIN}" ]]; then
     return
   fi
-  local built="${CODEX_RS_ROOT}/target/debug/codex"
+  # Build the codex binary in RELEASE mode for eval runs.
+  #
+  # The cached-pair diagnosis (commit f6f8a597f) showed that a
+  # debug-mode binary inflates the RI extension's in-session
+  # `build_context_packet` cost from ~12s (release) to ~80-88s
+  # (debug) on the codex-rs map. The previously reported RI
+  # wall-clock penalty was almost entirely this debug-mode
+  # amplification, not real model behavior. Release mode is the
+  # right baseline for measuring whether RI actually changes
+  # model-loop economics.
+  CODEX_BUILD_PROFILE="release"
+  local built="${CODEX_RS_ROOT}/target/release/codex"
   if [[ -x "${built}" ]]; then
     CODEX_BIN="${built}"
     return
   fi
-  (cd "${CODEX_RS_ROOT}" && cargo build -p codex-cli -q)
+  (cd "${CODEX_RS_ROOT}" && cargo build -p codex-cli --release -q)
   CODEX_BIN="${built}"
 }
 
@@ -755,6 +769,7 @@ write_record() {
   RECORD_VERIFY_COMMAND_COUNT="${RECORD_VERIFY_COMMAND_COUNT:-}" \
   RECORD_WARNINGS="${RECORD_WARNINGS:-}" \
   RECORD_HARNESS_PREWARM_MS="${RECORD_HARNESS_PREWARM_MS:-}" \
+  RECORD_CODEX_BUILD_PROFILE="${RECORD_CODEX_BUILD_PROFILE:-}" \
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events}")" \
@@ -819,6 +834,12 @@ record = {
     # remains the per-arm `codex exec` wall-clock and is what the
     # model-loop comparison should use.
     "harness_prewarm_ms": opt_env_int("RECORD_HARNESS_PREWARM_MS"),
+    # Build profile of the codex binary used for this run. Currently
+    # always "release" (resolve_codex_bin enforces it); recorded
+    # explicitly so future reviewers cannot mistake a debug-mode
+    # wall-clock number for a release-mode one. Pre-instrumentation
+    # records load as None via serde(default).
+    "codex_build_profile": opt_str(os.environ.get("RECORD_CODEX_BUILD_PROFILE", "")),
     # RI-surfaced file lists. Each env var is a \n-joined block from
     # `extract_ri_surfaced_files`. Empty for vanilla arms and for
     # pre-split rollouts that used the legacy single-section header.
@@ -1249,6 +1270,7 @@ ${task_text}"
   RECORD_WORKTREE_PATH="${workdir}" \
   RECORD_DURATION_MS="${duration_ms}" \
   RECORD_HARNESS_PREWARM_MS="${HARNESS_PREWARM_MS:-}" \
+  RECORD_CODEX_BUILD_PROFILE="${CODEX_BUILD_PROFILE:-}" \
   RECORD_TOOL_CALL_COUNT="${tool_call_count}" \
   RECORD_SHELL_COMMAND_COUNT="${shell_command_count}" \
   RECORD_FILE_READ_COUNT="${file_read_count}" \

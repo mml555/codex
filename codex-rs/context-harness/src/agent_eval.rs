@@ -120,6 +120,15 @@ pub struct AgentRunRecord {
     /// that this prewarm path is designed to eliminate.
     #[serde(default)]
     pub harness_prewarm_ms: Option<u64>,
+    /// Build profile of the codex binary that produced this record
+    /// — "release" or "debug". The cached-pair diagnosis (Run 3)
+    /// showed `build_context_packet` runs ~7× slower in debug
+    /// (~85s vs ~12s for the codex-rs map), enough to dominate any
+    /// model-loop comparison. Recording the profile prevents future
+    /// reviewers from comparing wall-clock numbers across mixed
+    /// builds. `None` for pre-instrumentation records.
+    #[serde(default)]
+    pub codex_build_profile: Option<String>,
     /// Count of `item.completed` events of any item type. A coarse proxy
     /// for "how many tool calls did the model make this turn".
     #[serde(default)]
@@ -1655,6 +1664,7 @@ mod tests {
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
+            codex_build_profile: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2638,6 +2648,7 @@ mod tests {
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
+            codex_build_profile: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2700,6 +2711,7 @@ mod tests {
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
+            codex_build_profile: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
