@@ -15,6 +15,7 @@ FIXTURE_EXPLICIT=0
 CODEX_BIN=""
 ARTIFACTS_DIR=""
 RUN_AGENT=0
+RESCORE_ARTIFACTS_DIR=""
 SESSION_INJECTION=0
 VERBOSE=0
 ISOLATED_WORKTREES=0
@@ -22,6 +23,11 @@ BASE_REF="HEAD"
 BASE_REF_SHA=""
 REPO_ROOT=""
 OSS_ARGS=()
+# Extra args passed verbatim to every `codex exec` call. Used by --cloud-args
+# to inject `-c model_provider=azure -m gpt-5.3-codex` (or any other config
+# override) without flipping codex's --oss path. Empty unless --cloud-args
+# is set.
+CLOUD_EXTRA_ARGS=()
 # Resilience guards (added after Run 1 / Run 2 post-mortems):
 EVAL_CARGO_TARGET_DIR=""       # --cargo-target-dir; default /tmp/codex-ri-eval-cargo-target
 SAFE_CODEX_BIN_DIR=""          # holds a write-protected copy of codex; survives target/ wipes
@@ -111,6 +117,16 @@ while [[ $# -gt 0 ]]; do
       RUN_AGENT=1
       shift
       ;;
+    --rescore-artifacts)
+      # Re-classify existing record.json files under DIR using the
+      # current classifier (validity, visibility, activity) WITHOUT
+      # re-running codex. DIR is expected to mirror the artifacts
+      # layout: DIR/<task_id>/<arm>/{events.jsonl, record.json}.
+      # Use this after instrumentation fixes to backfill artifacts
+      # produced by an older runner.
+      RESCORE_ARTIFACTS_DIR="$2"
+      shift 2
+      ;;
     --session-injection)
       SESSION_INJECTION=1
       shift
@@ -142,9 +158,28 @@ while [[ $# -gt 0 ]]; do
         case "$1" in
           --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
             | --isolated-worktrees | --base-ref | --cargo-target-dir | --max-target-dir-gb \
+            | --cloud-args \
             | --verbose | -h | --help) break ;;
           *)
             OSS_ARGS+=("$1")
+            shift
+            ;;
+        esac
+      done
+      ;;
+    --cloud-args)
+      # Collect every following token until a known flag is hit (same
+      # parser shape as --oss, but does NOT prepend --oss itself).
+      # Example: --cloud-args -c model_provider=azure -m gpt-5.3-codex
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
+            | --isolated-worktrees | --base-ref | --cargo-target-dir | --max-target-dir-gb \
+            | --oss \
+            | --verbose | -h | --help) break ;;
+          *)
+            CLOUD_EXTRA_ARGS+=("$1")
             shift
             ;;
         esac
@@ -314,48 +349,67 @@ harness_context_visible_for_run() {
   local events="$1"
   local codex_home="${CODEX_HOME:-${HOME}/.codex}"
   python3 - "${events}" "${codex_home}" <<'PY'
+# Detect whether the harness directive marker reached the model as PROMPT
+# context (input message), not as TOOL OUTPUT echoed back from a shell
+# grep over codex source files.
+#
+# The legacy "scan events.jsonl + raw rollout text" approach matched the
+# marker anywhere it appeared, including in `function_call_output`
+# payloads emitted when agents shell-grep'd the renderer source for the
+# `HARNESS_MARKER` constant. That's a false positive: the model saw the
+# marker because it searched for it, not because the harness injected it.
+#
+# Prompt-only rule: the marker only counts when it appears in a
+# `response_item` whose `payload.type == "message"` and whose `role` is
+# one of {user, developer, system}. Other payload types — including
+# function_call_output, function_call, reasoning, custom_tool_call — do
+# NOT count.
 import json
 import sys
 from pathlib import Path
 
-needle = "Harness repo intelligence:"
+NEEDLE = "Harness repo intelligence:"
+PROMPT_ROLES = {"user", "developer", "system"}
+
 events_path = Path(sys.argv[1])
 codex_home = Path(sys.argv[2])
 
-def visible_in_events() -> bool:
-    try:
-        with events_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if needle in json.dumps(ev, ensure_ascii=False):
+def _content_carries_needle(payload) -> bool:
+    """Return True iff the `content` field of a message payload contains
+    the harness directive marker. `content` is either a flat string or
+    an array of structured parts (e.g. `{"type":"input_text","text":...}`).
+    """
+    content = payload.get("content")
+    if isinstance(content, str):
+        return NEEDLE in content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, str) and NEEDLE in part:
+                return True
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and NEEDLE in text:
                     return True
-    except FileNotFoundError:
-        pass
     return False
 
-def visible_in_rollout() -> bool:
-    thread_id = None
-    try:
-        with events_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") == "thread.started":
-                    thread_id = ev.get("thread_id")
-                    break
-    except FileNotFoundError:
-        return False
+def thread_id_from_events() -> str:
+    if not events_path.exists():
+        return ""
+    with events_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "thread.started":
+                return ev.get("thread_id") or ""
+    return ""
+
+def visible_in_rollout_prompt() -> bool:
+    thread_id = thread_id_from_events()
     if not thread_id:
         return False
     sessions = codex_home / "sessions"
@@ -363,14 +417,30 @@ def visible_in_rollout() -> bool:
         return False
     for rollout in sessions.rglob(f"*{thread_id}*.jsonl"):
         try:
-            text = rollout.read_text(encoding="utf-8", errors="ignore")
+            with rollout.open(encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") != "response_item":
+                        continue
+                    payload = ev.get("payload") or {}
+                    if payload.get("type") != "message":
+                        continue
+                    role = payload.get("role") or ""
+                    if role not in PROMPT_ROLES:
+                        continue
+                    if _content_carries_needle(payload):
+                        return True
         except OSError:
             continue
-        if needle in text:
-            return True
     return False
 
-print("true" if visible_in_events() or visible_in_rollout() else "false")
+print("true" if visible_in_rollout_prompt() else "false")
 PY
 }
 
@@ -396,12 +466,21 @@ def classify_provider_error(message: str):
     return None
 
 if not events_path.exists():
-    print("false\tmissing_events")
+    # Three fields separated by ASCII Unit Separator (\x1f):
+    #   <valid> \x1f <invalid_reason> \x1f <warnings_csv>
+    # warnings_csv is comma-separated, empty when no warnings. We avoid
+    # tab here because bash `read -r a b c` with IFS=$'\t' collapses
+    # adjacent tabs (tab is IFS-whitespace), so `true\t\twarn` would
+    # parse as 2 fields and lose the warning. \x1f is non-whitespace,
+    # which preserves empty fields between separators.
+    print("false\x1fmissing_events\x1f")
     raise SystemExit(0)
 
 has_turn_completed = False
 has_turn_failed = False
+turn_failed_messages = []
 error_messages = []
+non_fatal_messages = []
 has_thread_started = False
 has_turn_started = False
 
@@ -424,28 +503,60 @@ for raw in events_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         has_turn_failed = True
         message = ((event.get("error") or {}).get("message")) or ""
         if message:
+            turn_failed_messages.append(message)
             error_messages.append(message)
     elif kind == "error":
+        # `error` events fire mid-stream (e.g. provider_network_error during
+        # a Responses stream that codex then auto-reconnects through). They
+        # are NOT terminal; only co-occurrence with turn.failed or missing
+        # turn.completed promotes them to a hard failure.
         message = event.get("message") or ""
         if message:
+            non_fatal_messages.append(message)
             error_messages.append(message)
 
-for message in error_messages:
+warnings = []
+
+# Terminal failure dominates: if a turn.failed event carries a provider
+# error, classify by that reason. (provider_usage_limit, auth, network)
+for message in turn_failed_messages:
     reason = classify_provider_error(message)
     if reason:
-        print(f"false\t{reason}")
+        print(f"false\x1f{reason}\x1f")
         raise SystemExit(0)
 
+# Hard runner failures: no turn ever completed.
 if has_turn_failed:
-    print("false\tturn_failed")
-elif not has_thread_started or not has_turn_started:
-    print("false\tmissing_events")
-elif not has_turn_completed:
-    print("false\tmissing_events")
-elif exec_exit != 0:
-    print("false\trunner_error")
-else:
-    print("true\t")
+    print("false\x1fturn_failed\x1f")
+    raise SystemExit(0)
+if not has_thread_started or not has_turn_started:
+    print("false\x1fmissing_events\x1f")
+    raise SystemExit(0)
+if not has_turn_completed:
+    # Mid-stream error events without recovery → still terminal. Surface
+    # the most specific reason we can derive.
+    for message in non_fatal_messages:
+        reason = classify_provider_error(message)
+        if reason:
+            print(f"false\x1f{reason}\x1f")
+            raise SystemExit(0)
+    print("false\x1fmissing_events\x1f")
+    raise SystemExit(0)
+if exec_exit != 0:
+    print("false\x1frunner_error\x1f")
+    raise SystemExit(0)
+
+# At this point: thread.started + turn.started + turn.completed + exit 0.
+# That's a behaviorally complete run. If any mid-stream `error` event
+# fired for a recoverable reason and codex still drove the turn to
+# completion, record it as a NON-FATAL warning on an otherwise valid run.
+for message in non_fatal_messages:
+    reason = classify_provider_error(message)
+    if reason == "provider_network_error":
+        warnings.append("provider_network_error_recovered")
+        break  # one warning per category is enough
+
+print(f"true\x1f\x1f{','.join(warnings)}")
 PY
 }
 
@@ -483,6 +594,7 @@ write_record() {
   RECORD_DISCOVER_COMMAND_COUNT="${RECORD_DISCOVER_COMMAND_COUNT:-}" \
   RECORD_EDIT_COMMAND_COUNT="${RECORD_EDIT_COMMAND_COUNT:-}" \
   RECORD_VERIFY_COMMAND_COUNT="${RECORD_VERIFY_COMMAND_COUNT:-}" \
+  RECORD_WARNINGS="${RECORD_WARNINGS:-}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -533,6 +645,10 @@ record = {
     "discover_command_count": opt_env_int("RECORD_DISCOVER_COMMAND_COUNT"),
     "edit_command_count": opt_env_int("RECORD_EDIT_COMMAND_COUNT"),
     "verify_command_count": opt_env_int("RECORD_VERIFY_COMMAND_COUNT"),
+    # Warnings: comma-separated slugs in RECORD_WARNINGS, emitted as a
+    # JSON string array. Reviewer-facing only — the validity classifier
+    # has already cleared this run as behaviorally valid.
+    "warnings": [w for w in os.environ.get("RECORD_WARNINGS", "").split(",") if w],
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
     "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
     "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
@@ -716,7 +832,17 @@ if events_path.exists():
             if ev.get("type") != "item.completed": continue
             tool_calls += 1
             item = ev.get("item") or {}
-            if item.get("type") != "command_execution": continue
+            item_type = item.get("type")
+            # Frontier models edit via the `apply_patch` custom tool, which
+            # codex surfaces as `file_change` items (NOT as command_execution
+            # shells). Without this branch the cost-table `edit` column
+            # reads e=0 even when multiple files changed. Count file_change
+            # as an edit but do NOT inflate shell_commands — that counter
+            # is reserved for command_execution.
+            if item_type == "file_change":
+                edit += 1
+                continue
+            if item_type != "command_execution": continue
             shell_cmds += 1
             cmd = item.get("command")
             if isinstance(cmd, list): cmd = " ".join(cmd)
@@ -777,7 +903,7 @@ ${task_text}"
   local start_ms end_ms duration_ms
   start_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
   set +e
-  "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
+  "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${CLOUD_EXTRA_ARGS[@]+"${CLOUD_EXTRA_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
     --dangerously-bypass-approvals-and-sandbox \
     --json \
     "${prompt}" </dev/null >"${events}" 2>/dev/null
@@ -821,10 +947,15 @@ ${task_text}"
   } < <(count_activity "${events}")
   local validity
   validity="$(classify_run_validity "${events}" "${exec_exit}")"
-  local run_valid
-  run_valid="${validity%%$'\t'*}"
-  local invalid_reason
-  invalid_reason="${validity#*$'\t'}"
+  # classify_run_validity emits THREE fields delimited by ASCII Unit
+  # Separator (\x1f):
+  #   <run_valid> \x1f <invalid_reason> \x1f <warnings_csv>
+  # Fix #1 added the third field. We use \x1f (not \t) because bash
+  # `read -r a b c` with IFS=$'\t' treats tab as IFS-whitespace and
+  # collapses adjacent tabs — `true\t\twarn` would parse as 2 fields
+  # and drop the warning. \x1f is non-whitespace and preserves empties.
+  local run_valid invalid_reason warnings_csv
+  IFS=$'\x1f' read -r run_valid invalid_reason warnings_csv <<<"${validity}"
   if [[ "${run_valid}" == "true" ]]; then
     invalid_reason=""
   fi
@@ -838,6 +969,7 @@ ${task_text}"
   RECORD_DISCOVER_COMMAND_COUNT="${discover_command_count}" \
   RECORD_EDIT_COMMAND_COUNT="${edit_command_count}" \
   RECORD_VERIFY_COMMAND_COUNT="${verify_command_count}" \
+  RECORD_WARNINGS="${warnings_csv}" \
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
     "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
@@ -852,6 +984,98 @@ ${task_text}"
   duration_s="$(python3 -c "print(f'{${duration_ms}/1000:.1f}')")"
   log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} duration=${duration_s}s shell=${shell_command_count} (d=${discover_command_count}/r=${file_read_count}/e=${edit_command_count}/v=${verify_command_count}) cargo_target=${target_size}"
 }
+
+# Re-classify a single existing record using the live classifier.
+# Reads events.jsonl + record.json from a record_dir, runs validity,
+# visibility, and activity classifiers, then rewrites record.json in
+# place — overwriting only the fields that the classifier owns:
+#   run_valid, invalid_reason, warnings, harness_context_visible,
+#   tool_call_count, shell_command_count, file_read_count,
+#   discover_command_count, edit_command_count, verify_command_count
+# All other fields (changed_files, tokens_*, duration_ms, worktree_*,
+# tests_passed, turn_count, exec_exit_code, repo_intelligence_enabled,
+# arm, task_id) are preserved exactly. Side effect-free if events.jsonl
+# is absent.
+rescore_record() {
+  local record_dir="$1"
+  local record_path="${record_dir}/record.json"
+  local events_path="${record_dir}/events.jsonl"
+  if [[ ! -f "${record_path}" || ! -f "${events_path}" ]]; then
+    return 0
+  fi
+  # Pull exec_exit from the existing record so the validity classifier
+  # has the same signal it had at original write time.
+  local exec_exit
+  exec_exit="$(python3 -c "import json,sys; r=json.load(open('${record_path}',encoding='utf-8')); print(r.get('exec_exit_code') if r.get('exec_exit_code') is not None else 0)")"
+  local validity
+  validity="$(classify_run_validity "${events_path}" "${exec_exit}")"
+  local run_valid invalid_reason warnings_csv
+  IFS=$'\x1f' read -r run_valid invalid_reason warnings_csv <<<"${validity}"
+  if [[ "${run_valid}" == "true" ]]; then
+    invalid_reason=""
+  fi
+  local harness_visible
+  harness_visible="$(harness_context_visible_for_run "${events_path}")"
+  local tool_call_count shell_command_count file_read_count
+  local discover_command_count edit_command_count verify_command_count
+  {
+    read -r tool_call_count
+    read -r shell_command_count
+    read -r file_read_count
+    read -r discover_command_count
+    read -r edit_command_count
+    read -r verify_command_count
+  } < <(count_activity "${events_path}")
+  python3 - "${record_path}" "${run_valid}" "${invalid_reason}" "${warnings_csv}" "${harness_visible}" \
+    "${tool_call_count}" "${shell_command_count}" "${file_read_count}" \
+    "${discover_command_count}" "${edit_command_count}" "${verify_command_count}" <<'PY'
+import json, sys
+(
+    path, run_valid, invalid_reason, warnings_csv, harness_visible,
+    tool_call, shell_cmd, file_read, discover, edit, verify,
+) = sys.argv[1:12]
+with open(path, encoding="utf-8") as f:
+    rec = json.load(f)
+rec["run_valid"] = run_valid == "true"
+rec["invalid_reason"] = invalid_reason or None
+rec["warnings"] = [w for w in warnings_csv.split(",") if w]
+rec["harness_context_visible"] = harness_visible == "true"
+def _i(v):
+    return int(v) if v not in ("", "null") else None
+rec["tool_call_count"] = _i(tool_call)
+rec["shell_command_count"] = _i(shell_cmd)
+rec["file_read_count"] = _i(file_read)
+rec["discover_command_count"] = _i(discover)
+rec["edit_command_count"] = _i(edit)
+rec["verify_command_count"] = _i(verify)
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(rec, f, indent=2)
+    f.write("\n")
+PY
+}
+
+# Re-classify every record.json under DIR. Layout assumption matches the
+# in-tree write_record path: DIR/<task_id>/<arm>/{events.jsonl,record.json}.
+rescore_artifacts_tree() {
+  local root="$1"
+  if [[ ! -d "${root}" ]]; then
+    echo "rescore: directory not found: ${root}" >&2
+    return 2
+  fi
+  local count=0
+  while IFS= read -r -d '' record; do
+    rescore_record "$(dirname "${record}")"
+    count=$((count + 1))
+  done < <(find "${root}" -mindepth 3 -maxdepth 3 -name record.json -print0)
+  log "rescored ${count} record(s) under ${root}"
+}
+
+if [[ -n "${RESCORE_ARTIFACTS_DIR}" ]]; then
+  RESCORE_ARTIFACTS_DIR="$(cd "${RESCORE_ARTIFACTS_DIR}" && pwd)"
+  rescore_artifacts_tree "${RESCORE_ARTIFACTS_DIR}"
+  echo "rescored: ${RESCORE_ARTIFACTS_DIR}"
+  exit 0
+fi
 
 resolve_codex_bin
 resolve_isolation_base

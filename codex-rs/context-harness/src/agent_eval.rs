@@ -131,6 +131,14 @@ pub struct AgentRunRecord {
     pub edit_command_count: Option<u32>,
     #[serde(default)]
     pub verify_command_count: Option<u32>,
+    /// Non-fatal observations about this run that do NOT invalidate it.
+    /// Populated by the bash runner when, e.g., a `provider_network_error`
+    /// event appears mid-stream but codex auto-reconnects and the turn
+    /// still completes. Reviewer-facing flag, not used by the classifier.
+    ///
+    /// Pre-warning records load with an empty Vec via `serde(default)`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// True when this arm ran in a worktree that was not shared with any other
     /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
     /// was set; for `calculator` workdirs the arm always gets a fresh
@@ -225,13 +233,21 @@ pub struct AgentRunScore {
     /// Diagnostic: shell commands whose first executable is `cat`/`head`/
     /// `tail`/`less`/`more`. Coarse signal for "model wandering the repo".
     pub file_read_count: Option<u32>,
-    /// Phase-classified shell command counts, propagated from
-    /// `AgentRunRecord`. The cost-table renderer surfaces these
-    /// separately so a reviewer can see, e.g., "RI cut discovery -2 but
-    /// added +4 verify" instead of just the aggregate.
+    /// Phase-classified counts, propagated from `AgentRunRecord`. The
+    /// cost-table renderer surfaces these separately so a reviewer can
+    /// see, e.g., "RI cut discovery -2 but added +4 verify" instead of
+    /// just the aggregate.
+    ///
+    /// `edit_command_count` includes both shell-based edits (sed -i,
+    /// perl -i, etc.) AND structured `file_change` / apply_patch items
+    /// from the events stream — otherwise frontier models that edit via
+    /// apply_patch render as `e=0` even though they made changes.
     pub discover_command_count: Option<u32>,
     pub edit_command_count: Option<u32>,
     pub verify_command_count: Option<u32>,
+    /// Non-fatal observations carried over from `AgentRunRecord`.
+    /// Surfaced in the Main table's Valid? cell as `valid (warning)`.
+    pub warnings: Vec<String>,
 }
 
 /// Comparison verdict for a (vanilla, treatment) pair on one task.
@@ -431,6 +447,7 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         discover_command_count: record.discover_command_count,
         edit_command_count: record.edit_command_count,
         verify_command_count: record.verify_command_count,
+        warnings: record.warnings.clone(),
     }
 }
 
@@ -661,6 +678,71 @@ pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenU
     }))
 }
 
+/// Detect whether the harness directive marker appears in the model's
+/// prompt input (NOT in tool outputs the agent shell-grepped back).
+///
+/// Codex's session rollout (`~/.codex/sessions/.../rollout-*.jsonl`) emits
+/// `response_item` entries whose `payload.type` distinguishes:
+///   - `message`            (with `role` in {user, developer, assistant})
+///   - `function_call`      (tool the model invoked)
+///   - `function_call_output` (tool's output echoed back as context)
+///   - `reasoning`, `custom_tool_call`, ...
+///
+/// The harness directive packet appears as a `message` with `role` ==
+/// `user` or `developer`. It can ALSO appear as text inside
+/// `function_call_output` payloads whenever the agent grepped a source
+/// file containing the `HARNESS_MARKER` constant — that's a false
+/// positive. This helper only inspects message-role payloads.
+///
+/// Returns `true` iff the literal marker appears in at least one
+/// `payload.type == "message"` entry whose role is in `{user, developer}`.
+pub fn rollout_carries_harness_directive(rollout_jsonl: &str) -> bool {
+    const MARKER: &str = "Harness repo intelligence:";
+    for line in rollout_jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(ev): Result<serde_json::Value, _> = serde_json::from_str(line) else {
+            continue;
+        };
+        // Only response_item entries.
+        if ev.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = ev.get("payload") else {
+            continue;
+        };
+        // Only message-typed payloads with user/system role.
+        if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(role, "user" | "developer" | "system") {
+            continue;
+        }
+        // Search ONLY the message content, not the full payload (which
+        // could include metadata fields that happen to mention the
+        // marker). content is typically a string or an array of parts.
+        let needle_found = match payload.get("content") {
+            Some(serde_json::Value::String(s)) => s.contains(MARKER),
+            Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
+                p.as_str().map(|s| s.contains(MARKER)).unwrap_or_else(|| {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.contains(MARKER))
+                        .unwrap_or(false)
+                })
+            }),
+            _ => false,
+        };
+        if needle_found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Per-arm activity counts derived from a `codex exec --json` events stream.
 /// All counters are coarse, post-hoc, and meant for visibility — not
 /// scoring. The point is to surface "did the model wander the repo?" so a
@@ -793,12 +875,23 @@ pub fn count_activity_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<AgentActiv
             continue;
         };
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Frontier models edit via structured tools (`file_change`,
+        // `apply_patch` via custom_tool_call), NOT shell commands. Without
+        // this branch the cost-table edit column reads `e=0` even though
+        // multiple files changed. Count them as edits but NOT as shell
+        // commands — shell_commands is reserved for command_execution.
+        if item_type == "file_change" {
+            counts.edit_commands = counts.edit_commands.saturating_add(1);
+            continue;
+        }
+
         if item_type != "command_execution" {
             continue;
         }
         counts.shell_commands = counts.shell_commands.saturating_add(1);
         let raw = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        // Derive ALL phase counts (including file_reads) from
+        // Derive ALL shell phase counts (including file_reads) from
         // `classify_shell_phase` so they agree on `cd $X && <real_cmd>`
         // and other chained shapes. Doing the read-check separately via
         // `first_executable_token` was misclassifying every chained
@@ -1160,7 +1253,7 @@ fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
 
     [
         row.task_id.clone(),
-        "valid".to_string(),
+        format_valid_cell(row),
         ri_visible,
         target,
         extra,
@@ -1168,6 +1261,31 @@ fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
         time,
         result,
     ]
+}
+
+/// Render the Main table's Valid? cell for a comparison row that
+/// classified as `valid_for_comparison`. When either arm carries
+/// `warnings` (e.g. `provider_network_error_recovered`) we surface them
+/// inline so reviewers can tell a clean turn from one that auto-reconnected
+/// mid-stream. Format: `valid` for clean pairs, `valid (warning1; warning2)`
+/// otherwise. Arm prefix `V:` / `RI:` only when warnings differ between arms.
+fn format_valid_cell(row: &AgentEvalComparison) -> String {
+    let v = &row.vanilla.warnings;
+    let t = &row.treatment.warnings;
+    if v.is_empty() && t.is_empty() {
+        return "valid".to_string();
+    }
+    if v == t {
+        return format!("valid ({})", v.join("; "));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !v.is_empty() {
+        parts.push(format!("V: {}", v.join("; ")));
+    }
+    if !t.is_empty() {
+        parts.push(format!("RI: {}", t.join("; ")));
+    }
+    format!("valid ({})", parts.join(" / "))
 }
 
 fn format_cost_row(row: &AgentEvalComparison) -> [String; 8] {
@@ -1329,6 +1447,7 @@ mod tests {
             discover_command_count: None,
             edit_command_count: None,
             verify_command_count: None,
+            warnings: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -1376,6 +1495,7 @@ mod tests {
                 discover_command_count: None,
                 edit_command_count: None,
                 verify_command_count: None,
+                warnings: Vec::new(),
             }
         );
     }
@@ -1615,6 +1735,7 @@ mod tests {
             discover_command_count: None,
             edit_command_count: None,
             verify_command_count: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -2075,5 +2196,117 @@ mod tests {
         assert_eq!(cells[5], "5/1", "read V/RI");
         assert_eq!(cells[6], "1/2", "edit V/RI");
         assert_eq!(cells[7], "2/1", "verify V/RI");
+    }
+
+    #[test]
+    fn count_activity_counts_file_change_as_edit_not_shell() {
+        // Frontier (gpt-5.x-codex) edits via `apply_patch` / `file_change`
+        // structured tool output rather than running `sed`/`perl` shells.
+        // Without this branch, the cost-table `edit` column reads e=0 for
+        // a session that touched three files. Verify file_change items
+        // increment edit_commands but NOT shell_commands.
+        let jsonl = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"type":"file_change","path":"a.rs"}}
+{"type":"item.completed","item":{"type":"file_change","path":"b.rs"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'ls'"}}
+{"type":"item.completed","item":{"type":"file_change","path":"c.rs"}}"#;
+        let counts = count_activity_from_exec_jsonl(jsonl.as_bytes()).unwrap();
+        assert_eq!(counts.tool_calls, 4, "every item.completed counts");
+        assert_eq!(
+            counts.shell_commands, 1,
+            "file_change must NOT inflate shell_commands"
+        );
+        assert_eq!(counts.edit_commands, 3, "3 file_change items → 3 edits");
+        assert_eq!(counts.discover_commands, 1, "the lone `ls` is discover");
+        assert_eq!(counts.file_reads, 0);
+        assert_eq!(counts.verify_commands, 0);
+    }
+
+    #[test]
+    fn rollout_visibility_detects_marker_in_user_message_only() {
+        // The directive packet rides in as a `message` payload with role
+        // `user` or `developer`. That's the only place that should count.
+        let rollout = r#"{"type":"session_meta","payload":{}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"Harness repo intelligence: inspect a.rs"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":"OK"}}"#;
+        assert!(rollout_carries_harness_directive(rollout));
+    }
+
+    #[test]
+    fn rollout_visibility_ignores_marker_in_function_call_output() {
+        // Source-code grep leaks: an agent ran `grep HARNESS_MARKER
+        // renderer.rs`, codex echoed the file content back as a
+        // function_call_output payload. That is NOT the model receiving
+        // the directive — it's the model SEARCHING the codebase for the
+        // string. Pre-fix, the legacy text-scan-based detector returned
+        // `vis=True` here; we now require message-role context.
+        let rollout = r#"{"type":"session_meta","payload":{}}
+{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}
+{"type":"response_item","payload":{"type":"function_call_output","output":"renderer.rs:42: const HARNESS_MARKER: &str = \"Harness repo intelligence:\";"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":"Found it in renderer.rs"}}"#;
+        assert!(
+            !rollout_carries_harness_directive(rollout),
+            "marker appearing only in function_call_output must NOT count as visibility"
+        );
+    }
+
+    #[test]
+    fn rollout_visibility_accepts_developer_role_and_content_array() {
+        // Codex emits the directive as a `developer` (system-style)
+        // message in some configurations, and content may be an array of
+        // structured parts rather than a flat string. Both forms must
+        // count.
+        let rollout = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Harness repo intelligence: prelude"}]}}"#;
+        assert!(rollout_carries_harness_directive(rollout));
+
+        let rollout_string = r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":"Harness repo intelligence: prelude"}}"#;
+        assert!(rollout_carries_harness_directive(rollout_string));
+    }
+
+    #[test]
+    fn valid_cell_renders_warnings_when_present_and_plain_when_absent() {
+        // Clean pair: just "valid".
+        let task = calculator_task();
+        let vanilla = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
+        };
+        let treatment = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
+        };
+        let row = compare_task(&task, &vanilla, &treatment);
+        assert!(row.valid_for_comparison);
+        assert_eq!(format_valid_cell(&row), "valid");
+
+        // Both arms carry the same recovered-network warning: collapse.
+        let v_warn = AgentRunRecord {
+            warnings: vec!["provider_network_error_recovered".to_string()],
+            ..vanilla.clone()
+        };
+        let t_warn = AgentRunRecord {
+            warnings: vec!["provider_network_error_recovered".to_string()],
+            ..treatment.clone()
+        };
+        let row = compare_task(&task, &v_warn, &t_warn);
+        assert_eq!(
+            format_valid_cell(&row),
+            "valid (provider_network_error_recovered)"
+        );
+
+        // Only RI arm carries a warning: prefix the arm.
+        let t_only = AgentRunRecord {
+            warnings: vec!["provider_network_error_recovered".to_string()],
+            ..treatment.clone()
+        };
+        let row = compare_task(&task, &vanilla, &t_only);
+        assert_eq!(
+            format_valid_cell(&row),
+            "valid (RI: provider_network_error_recovered)"
+        );
     }
 }

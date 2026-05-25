@@ -36,6 +36,7 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         discover_command_count: None,
         edit_command_count: None,
         verify_command_count: None,
+        warnings: Vec::new(),
         worktree_isolated: false,
         base_ref: None,
         worktree_path: None,
