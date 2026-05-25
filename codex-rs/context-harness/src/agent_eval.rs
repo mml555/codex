@@ -101,6 +101,26 @@ pub struct AgentRunRecord {
     pub tokens_output: Option<u64>,
     #[serde(default)]
     pub tokens_total: Option<u64>,
+    /// Wall-clock duration of the `codex exec` invocation in milliseconds.
+    /// `None` for pre-duration records (`serde(default)`). The point of
+    /// recording this is that *time* is part of the RI claim — if RI adds
+    /// prompt tokens but avoids file-search turns, it can still be a net win
+    /// on the metric users actually feel.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// Count of `item.completed` events of any item type. A coarse proxy
+    /// for "how many tool calls did the model make this turn".
+    #[serde(default)]
+    pub tool_call_count: Option<u32>,
+    /// Count of `item.completed` events with `item.type == "command_execution"`.
+    /// Direct measure of how many shell commands the agent fired.
+    #[serde(default)]
+    pub shell_command_count: Option<u32>,
+    /// Heuristic count of file-read shell commands (`cat`/`head`/`tail`/
+    /// `less`/`more`). Diagnostic — captures "stupid file-finding" but not
+    /// loads via codex's structured file-read tool, if any.
+    #[serde(default)]
+    pub file_read_count: Option<u32>,
     /// True when this arm ran in a worktree that was not shared with any other
     /// arm or task. For `codex_rs` workdirs that means `--isolated-worktrees`
     /// was set; for `calculator` workdirs the arm always gets a fresh
@@ -185,6 +205,16 @@ pub struct AgentRunScore {
     pub tokens_input: Option<u64>,
     pub tokens_output: Option<u64>,
     pub tokens_total: Option<u64>,
+    /// Wall-clock duration in ms (from the script-side bracket around
+    /// `codex exec`). Used by the classifier between `turns` and `tokens`.
+    pub duration_ms: Option<u64>,
+    /// Diagnostic: total `item.completed` events the agent emitted.
+    pub tool_call_count: Option<u32>,
+    /// Diagnostic: `item.completed` events with `command_execution` items.
+    pub shell_command_count: Option<u32>,
+    /// Diagnostic: shell commands whose first executable is `cat`/`head`/
+    /// `tail`/`less`/`more`. Coarse signal for "model wandering the repo".
+    pub file_read_count: Option<u32>,
 }
 
 /// Comparison verdict for a (vanilla, treatment) pair on one task.
@@ -202,13 +232,21 @@ pub enum AgentEvalResult {
 }
 
 /// First-dimension-of-divergence label. Priority order (highest first):
-/// file_targeting → fewer_extra_files → fewer_turns → fewer_tokens.
+/// file_targeting → fewer_extra_files → fewer_turns → faster_wall_clock →
+/// fewer_tokens.
+///
+/// The `faster_wall_clock` tier was added when the project thesis sharpened
+/// to "move file-discovery work out of the paid model loop into the
+/// harness." Time is what users feel; tokens are what they pay. Both
+/// matter, but a cheaper wrong/slower answer is never preferred over a
+/// faster correct one — hence time sits below turns/waste/targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultReason {
     FileTargeting,
     FewerExtraFiles,
     FewerTurns,
+    FasterWallClock,
     FewerTokens,
 }
 
@@ -218,6 +256,7 @@ impl ResultReason {
             Self::FileTargeting => "file_targeting",
             Self::FewerExtraFiles => "fewer_extra_files",
             Self::FewerTurns => "fewer_turns",
+            Self::FasterWallClock => "faster_wall_clock",
             Self::FewerTokens => "fewer_tokens",
         }
     }
@@ -368,6 +407,10 @@ pub fn score_run(record: &AgentRunRecord, task: &AgentEvalTask) -> AgentRunScore
         tokens_input: record.tokens_input,
         tokens_output: record.tokens_output,
         tokens_total: record.tokens_total,
+        duration_ms: record.duration_ms,
+        tool_call_count: record.tool_call_count,
+        shell_command_count: record.shell_command_count,
+        file_read_count: record.file_read_count,
     }
 }
 
@@ -418,6 +461,19 @@ pub fn classify_result(
         if tt > vt {
             return AgentEvalResult::RiWorse {
                 reason: ResultReason::FewerTurns,
+            };
+        }
+    }
+
+    if let (Some(vd), Some(td)) = (vanilla.duration_ms, treatment.duration_ms) {
+        if td < vd {
+            return AgentEvalResult::RiBetter {
+                reason: ResultReason::FasterWallClock,
+            };
+        }
+        if td > vd {
+            return AgentEvalResult::RiWorse {
+                reason: ResultReason::FasterWallClock,
             };
         }
     }
@@ -585,6 +641,83 @@ pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenU
     }))
 }
 
+/// Per-arm activity counts derived from a `codex exec --json` events stream.
+/// All three counters are coarse, post-hoc, and meant for visibility — not
+/// scoring. The point is to surface "did the model wander the repo?" so a
+/// reviewer can read the cost table next to the result table and tell
+/// whether RI moved work out of the model loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentActivityCounts {
+    /// Every `item.completed` event the run emitted, regardless of item type.
+    /// Coarse proxy for "how many tool turns did the model take".
+    pub tool_calls: u32,
+    /// `item.completed` events whose `item.type == "command_execution"`.
+    pub shell_commands: u32,
+    /// Shell commands whose first executable token is `cat`/`head`/`tail`/
+    /// `less`/`more` (heuristic). The agent's `/bin/zsh -lc '<cmd>'`
+    /// wrapping is unpeeled before matching. Misses structured file-read
+    /// tools (if any) and counts `cat heredoc <<EOF` style write-via-cat
+    /// invocations as reads — accept those tradeoffs for v1.
+    pub file_reads: u32,
+}
+
+const FILE_READ_COMMANDS: &[&str] = &["cat", "head", "tail", "less", "more"];
+
+/// Parse `events.jsonl` and count tool/shell/file-read activity.
+pub fn count_activity_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<AgentActivityCounts> {
+    let mut counts = AgentActivityCounts::default();
+    for line in std::str::from_utf8(bytes)?.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if kind != "item.completed" {
+            continue;
+        }
+        counts.tool_calls = counts.tool_calls.saturating_add(1);
+        let Some(item) = value.get("item") else {
+            continue;
+        };
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if item_type != "command_execution" {
+            continue;
+        }
+        counts.shell_commands = counts.shell_commands.saturating_add(1);
+        // Look at the first executable token; codex usually wraps shell
+        // commands as `/bin/zsh -lc '<inner>'`. Unpeel that one layer so
+        // the heuristic sees `cat`, not `zsh`.
+        let raw = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let first = first_executable_token(raw);
+        if FILE_READ_COMMANDS.iter().any(|cmd| *cmd == first) {
+            counts.file_reads = counts.file_reads.saturating_add(1);
+        }
+    }
+    Ok(counts)
+}
+
+fn first_executable_token(cmd: &str) -> &str {
+    let trimmed = cmd.trim();
+    // Strip the `/bin/zsh -lc '...'` / `bash -c "..."` shell-wrapping if
+    // present so we see the actual user command.
+    let inner = if let Some(rest) = trimmed.strip_prefix("/bin/zsh -lc ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("/bin/bash -c ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("zsh -lc ") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("bash -c ") {
+        rest.trim_start()
+    } else {
+        trimmed
+    };
+    let unquoted = inner.trim_start_matches(['\'', '"']);
+    unquoted.split_ascii_whitespace().next().unwrap_or("")
+}
+
 /// Parse changed paths from `git diff --name-only` output.
 pub fn changed_files_from_git_diff(diff_output: &str) -> Vec<String> {
     diff_output
@@ -619,62 +752,53 @@ impl AgentEvalTask {
     }
 }
 
-/// Render the eval report as the single 8-column table that makes or breaks
-/// the repo-intelligence claim:
+/// Render the eval report as two grouped tables:
 ///
-/// `Task | Valid? | RI visible? | Target files V/RI | Extra files V/RI |
-///  Turns V/RI | Tokens V/RI | Result`
+/// **Main** (one row per task — the "did RI help" answer):
+///   `Task | Valid? | RI visible? | Target files V/RI | Extra files V/RI |
+///    Turns V/RI | Time V/RI | Result`
 ///
-/// Rows are grouped by [`TaskCategory`] with a `== <category> ==` header and
-/// a per-group `Group: <category> — N ri_better / N ri_worse / ...` summary
-/// line. Column widths are computed across the whole report so columns line
-/// up vertically across groups. Missing dimensions render as `—`. Excluded
-/// pairs render `—` across every data column.
+/// **Cost** (one row per task — the "at what price" answer):
+///   `Task | Tokens V/RI | Token Δ | Tool calls V/RI | Shell V/RI |
+///    File reads V/RI`
+///
+/// Both tables group rows by [`TaskCategory`] with `== <category> ==`
+/// headers; the Main table adds a per-group `Group: <category> — N
+/// ri_better / ...` summary line. Column widths within each table are
+/// computed once across all rows so columns line up vertically across
+/// groups; widths are independent across the two tables. Missing
+/// dimensions render as `—`. Excluded pairs render `—` across every
+/// data column.
 pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
-    const HEADERS: [&str; 8] = [
+    const MAIN_HEADERS: [&str; 8] = [
         "Task",
         "Valid?",
         "RI visible?",
         "Target files V/RI",
         "Extra files V/RI",
         "Turns V/RI",
-        "Tokens V/RI",
+        "Time V/RI",
         "Result",
     ];
+    const COST_HEADERS: [&str; 6] = [
+        "Task",
+        "Tokens V/RI",
+        "Token Δ",
+        "Tool calls V/RI",
+        "Shell V/RI",
+        "File reads V/RI",
+    ];
 
-    // Build all rows once; we need widths up front for the entire report.
-    let formatted: Vec<(Option<TaskCategory>, &AgentEvalComparison, [String; 8])> = report
+    let comparisons: Vec<(Option<TaskCategory>, &AgentEvalComparison)> = report
         .comparisons
         .iter()
-        .map(|row| (row.category, row, format_table_row(row)))
+        .map(|row| (row.category, row))
         .collect();
 
-    let mut widths = [0usize; 8];
-    for (i, header) in HEADERS.iter().enumerate() {
-        widths[i] = header.len();
-    }
-    for (_, _, cells) in &formatted {
-        for (i, cell) in cells.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
-    }
-
-    let render_row = |cells: &[String; 8]| -> String {
-        let parts: Vec<String> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, cell)| format!("{cell:<width$}", width = widths[i]))
-            .collect();
-        parts.join(" | ")
-    };
-    let header_cells: [String; 8] = HEADERS.map(str::to_string);
-    let separator_cells: [String; 8] = std::array::from_fn(|i| "-".repeat(widths[i]));
-
-    // Group by category. None goes last under `uncategorized`. Within a
-    // group rows keep their original order so callers can pre-sort by id.
+    // Sort once; both tables walk the same ordering. None category goes last.
     let category_order: Vec<Option<TaskCategory>> = {
         let mut seen: Vec<Option<TaskCategory>> = Vec::new();
-        for (cat, _, _) in &formatted {
+        for (cat, _) in &comparisons {
             if !seen.contains(cat) {
                 seen.push(*cat);
             }
@@ -701,8 +825,78 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
         lines.push(format!("Invalid reasons: {}", reasons.join(", ")));
     }
 
-    for category in &category_order {
-        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, [String; 8])> = formatted
+    // ----- Main table -----
+    let main_rows: Vec<(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> = comparisons
+        .iter()
+        .map(|(cat, row)| (*cat, *row, format_main_row(row).to_vec()))
+        .collect();
+    lines.push(String::new());
+    lines.push("==== Main ====".to_string());
+    render_grouped_table(
+        &MAIN_HEADERS,
+        &main_rows,
+        &category_order,
+        /* include_group_summary */ true,
+        &mut lines,
+    );
+
+    // ----- Cost table -----
+    let cost_rows: Vec<(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> = comparisons
+        .iter()
+        .map(|(cat, row)| (*cat, *row, format_cost_row(row).to_vec()))
+        .collect();
+    lines.push(String::new());
+    lines.push("==== Cost ====".to_string());
+    render_grouped_table(
+        &COST_HEADERS,
+        &cost_rows,
+        &category_order,
+        /* include_group_summary */ false,
+        &mut lines,
+    );
+
+    lines.join("\n")
+}
+
+/// Render one grouped table into `out`. Column widths are computed across
+/// every row (so headers line up across category groups within the table)
+/// but independent of any other table. When `include_group_summary` is
+/// true, append a `Group: <category> — N ri_better / ...` line under each
+/// category's rows.
+fn render_grouped_table(
+    headers: &[&str],
+    rows: &[(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)],
+    category_order: &[Option<TaskCategory>],
+    include_group_summary: bool,
+    out: &mut Vec<String>,
+) {
+    let n = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for (_, _, cells) in rows {
+        for (i, cell) in cells.iter().enumerate() {
+            if i < n {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+    }
+    let render = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pad = widths.get(i).copied().unwrap_or(0);
+                let cell_len = cell.chars().count();
+                let extra = pad.saturating_sub(cell_len);
+                format!("{cell}{}", " ".repeat(extra))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let separator_cells: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+
+    for category in category_order {
+        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> = rows
             .iter()
             .filter(|(c, _, _)| c == category)
             .collect();
@@ -710,20 +904,20 @@ pub fn render_agent_eval_human(report: &AgentEvalReport) -> String {
             continue;
         }
         let category_label = category.map_or("uncategorized", TaskCategory::slug);
-        lines.push(String::new());
-        lines.push(format!("== {category_label} =="));
-        lines.push(render_row(&header_cells));
-        lines.push(render_row(&separator_cells));
+        out.push(String::new());
+        out.push(format!("== {category_label} =="));
+        out.push(render(&header_cells));
+        out.push(render(&separator_cells));
         for (_, _, cells) in &group {
-            lines.push(render_row(cells));
+            out.push(render(cells));
         }
-        lines.push(format!(
-            "Group: {category_label} — {}",
-            group_summary(group.iter().map(|(_, row, _)| *row)),
-        ));
+        if include_group_summary {
+            out.push(format!(
+                "Group: {category_label} — {}",
+                group_summary(group.iter().map(|(_, row, _)| *row)),
+            ));
+        }
     }
-
-    lines.join("\n")
 }
 
 /// Count `result` outcomes across a slice of comparisons and emit a one-line
@@ -746,7 +940,7 @@ fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) ->
 
 const DASH: &str = "—";
 
-fn format_table_row(row: &AgentEvalComparison) -> [String; 8] {
+fn format_main_row(row: &AgentEvalComparison) -> [String; 8] {
     let result = row.result.slug();
     if !row.valid_for_comparison {
         let valid_cell = format_invalid_cell(row);
@@ -785,10 +979,10 @@ fn format_table_row(row: &AgentEvalComparison) -> [String; 8] {
         option_cell(row.vanilla.turn_count),
         option_cell(row.treatment.turn_count),
     );
-    let tokens = format!(
+    let time = format!(
         "{}/{}",
-        option_cell(row.vanilla.tokens_total),
-        option_cell(row.treatment.tokens_total),
+        duration_cell(row.vanilla.duration_ms),
+        duration_cell(row.treatment.duration_ms),
     );
     let ri_visible = if row.treatment.harness_context_visible {
         "yes".to_string()
@@ -803,9 +997,86 @@ fn format_table_row(row: &AgentEvalComparison) -> [String; 8] {
         target,
         extra,
         turns,
-        tokens,
+        time,
         result,
     ]
+}
+
+fn format_cost_row(row: &AgentEvalComparison) -> [String; 6] {
+    if !row.valid_for_comparison {
+        return [
+            row.task_id.clone(),
+            DASH.to_string(),
+            DASH.to_string(),
+            DASH.to_string(),
+            DASH.to_string(),
+            DASH.to_string(),
+        ];
+    }
+
+    let tokens = format!(
+        "{}/{}",
+        option_cell(row.vanilla.tokens_total),
+        option_cell(row.treatment.tokens_total),
+    );
+    // Token Δ = treatment - vanilla (signed). Positive means RI cost MORE
+    // tokens than vanilla, negative means RI saved tokens. Missing on
+    // either side → dash.
+    let token_delta = match (row.vanilla.tokens_total, row.treatment.tokens_total) {
+        (Some(v), Some(t)) => {
+            let v = v as i128;
+            let t = t as i128;
+            let delta = t - v;
+            if delta > 0 {
+                format!("+{delta}")
+            } else {
+                delta.to_string()
+            }
+        }
+        _ => DASH.to_string(),
+    };
+    let tool_calls = format!(
+        "{}/{}",
+        option_cell(row.vanilla.tool_call_count),
+        option_cell(row.treatment.tool_call_count),
+    );
+    let shells = format!(
+        "{}/{}",
+        option_cell(row.vanilla.shell_command_count),
+        option_cell(row.treatment.shell_command_count),
+    );
+    let reads = format!(
+        "{}/{}",
+        option_cell(row.vanilla.file_read_count),
+        option_cell(row.treatment.file_read_count),
+    );
+    [
+        row.task_id.clone(),
+        tokens,
+        token_delta,
+        tool_calls,
+        shells,
+        reads,
+    ]
+}
+
+/// Format a `duration_ms` value as a compact human cell — seconds if
+/// under 100s, minute+second mm:ss otherwise. `—` for None.
+fn duration_cell(value: Option<u64>) -> String {
+    match value {
+        None => DASH.to_string(),
+        Some(ms) => {
+            let seconds = ms / 1000;
+            if seconds < 100 {
+                let frac = (ms % 1000) / 100;
+                format!("{seconds}.{frac}s")
+            } else {
+                let minutes = seconds / 60;
+                let remainder = seconds % 60;
+                format!("{minutes}m{remainder:02}s")
+            }
+        }
+    }
 }
 
 fn format_invalid_cell(row: &AgentEvalComparison) -> String {
@@ -869,6 +1140,10 @@ mod tests {
             tokens_input: None,
             tokens_output: None,
             tokens_total: None,
+            duration_ms: None,
+            tool_call_count: None,
+            shell_command_count: None,
+            file_read_count: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -886,6 +1161,10 @@ mod tests {
             tokens_input: Some(100),
             tokens_output: Some(50),
             tokens_total: Some(150),
+            duration_ms: Some(42_000),
+            tool_call_count: Some(3),
+            shell_command_count: Some(1),
+            file_read_count: Some(0),
             ..synthetic_record(AgentArm::Harness, &task.id)
         };
         let score = score_run(&record, &task);
@@ -905,6 +1184,10 @@ mod tests {
                 tokens_input: Some(100),
                 tokens_output: Some(50),
                 tokens_total: Some(150),
+                duration_ms: Some(42_000),
+                tool_call_count: Some(3),
+                shell_command_count: Some(1),
+                file_read_count: Some(0),
             }
         );
     }
@@ -1137,6 +1420,10 @@ mod tests {
             tokens_input: None,
             tokens_output: None,
             tokens_total: None,
+            duration_ms: None,
+            tool_call_count: None,
+            shell_command_count: None,
+            file_read_count: None,
         }
     }
 
@@ -1365,20 +1652,160 @@ mod tests {
         assert!(bw_idx < fr_idx, "categories should be alphabetic; bw < fr");
         assert!(fr_idx < uc_idx, "uncategorized must come last");
 
-        // Column widths shared across groups: header line appears under each
-        // category and lines up (same character count).
+        // Column widths shared within each table across category groups.
+        // Two tables × 3 categories = 6 "Task " header lines, with three
+        // identical Main headers and three identical Cost headers (each
+        // table has its own width set).
         let header_lines: Vec<&str> = text
             .lines()
             .filter(|l| l.starts_with("Task "))
             .collect();
-        assert_eq!(header_lines.len(), 3, "one header per group");
-        let first_len = header_lines[0].len();
-        for h in &header_lines[1..] {
-            assert_eq!(
-                h.len(),
-                first_len,
-                "header widths drifted across groups:\n{text}"
-            );
-        }
+        assert_eq!(
+            header_lines.len(),
+            6,
+            "expected 6 'Task ' headers (3 Main + 3 Cost), got {}:\n{text}",
+            header_lines.len()
+        );
+        // Both tables must be present.
+        assert!(text.contains("==== Main ===="), "Main section missing:\n{text}");
+        assert!(text.contains("==== Cost ===="), "Cost section missing:\n{text}");
+    }
+
+    #[test]
+    fn classify_ri_better_by_faster_wall_clock_only_after_turns_tie() {
+        // Targets / extras / turns all tie; RI is faster by wall clock.
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: Some(90_000),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: Some(45_000),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FasterWallClock,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_time_sits_above_tokens_in_priority_order() {
+        // RI is slower BUT cheaper. Time has higher priority than tokens,
+        // so the verdict must be ri_worse:faster_wall_clock (slower), NOT
+        // ri_better:fewer_tokens.
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: Some(40_000),
+            tokens_total: Some(5000),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: Some(80_000),
+            tokens_total: Some(3000),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::FasterWallClock,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_skips_time_tier_when_either_duration_missing() {
+        // Only vanilla has duration; classifier must skip to tokens.
+        let vanilla = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: Some(40_000),
+            tokens_total: Some(5000),
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: 2,
+            turn_count: Some(3),
+            duration_ms: None,
+            tokens_total: Some(3000),
+            ..zero_score()
+        };
+        assert_eq!(
+            classify(vanilla, treatment),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerTokens,
+            }
+        );
+    }
+
+    #[test]
+    fn count_activity_from_exec_jsonl_tallies_tool_shell_and_file_reads() {
+        let jsonl = r#"{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'cat README.md'"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'sed -i \"\" 1d foo.rs'"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'head -n 5 bar.rs'"}}"#;
+        let counts = count_activity_from_exec_jsonl(jsonl.as_bytes()).unwrap();
+        assert_eq!(counts.tool_calls, 4, "every item.completed counts");
+        assert_eq!(counts.shell_commands, 3, "command_execution items only");
+        assert_eq!(counts.file_reads, 2, "cat + head are reads; sed is not");
+    }
+
+    #[test]
+    fn duration_cell_formatting() {
+        assert_eq!(duration_cell(None), "—");
+        assert_eq!(duration_cell(Some(0)), "0.0s");
+        assert_eq!(duration_cell(Some(4_200)), "4.2s");
+        assert_eq!(duration_cell(Some(99_900)), "99.9s");
+        assert_eq!(duration_cell(Some(100_000)), "1m40s");
+        assert_eq!(duration_cell(Some(605_000)), "10m05s");
+    }
+
+    #[test]
+    fn cost_row_emits_signed_token_delta_and_diagnostic_counts() {
+        let task = calculator_task();
+        let vanilla = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            tokens_input: Some(400_000),
+            tokens_output: Some(1_000),
+            tokens_total: Some(401_000),
+            duration_ms: Some(60_000),
+            tool_call_count: Some(15),
+            shell_command_count: Some(10),
+            file_read_count: Some(5),
+            ..synthetic_record(AgentArm::Vanilla, &task.id)
+        };
+        let treatment = AgentRunRecord {
+            changed_files: vec!["src/calculator.py".to_string()],
+            tests_passed: true,
+            turn_count: Some(1),
+            harness_context_visible: true,
+            tokens_input: Some(405_000),
+            tokens_output: Some(800),
+            tokens_total: Some(405_800),
+            duration_ms: Some(50_000),
+            tool_call_count: Some(7),
+            shell_command_count: Some(4),
+            file_read_count: Some(1),
+            ..synthetic_record(AgentArm::RepoIntelligence, &task.id)
+        };
+        let row = compare_task(&task, &vanilla, &treatment);
+        let cells = format_cost_row(&row);
+        assert_eq!(cells[0], "calculator_fix");
+        assert_eq!(cells[1], "401000/405800");
+        assert_eq!(cells[2], "+4800", "Token Δ should be signed; RI +4800 tokens");
+        assert_eq!(cells[3], "15/7");
+        assert_eq!(cells[4], "10/4");
+        assert_eq!(cells[5], "5/1");
     }
 }

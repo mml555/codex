@@ -458,10 +458,9 @@ write_record() {
   local tokens_input="${11}"
   local tokens_output="${12}"
   local tokens_total="${13}"
-  # Worktree metadata: passed via env (RECORD_WORKTREE_ISOLATED /
-  # RECORD_BASE_REF / RECORD_WORKTREE_PATH) to keep the positional surface
-  # bounded. `serde(default)` on the Rust side accepts records that lack
-  # these keys.
+  # Worktree metadata + activity/duration: all passed via env to keep the
+  # positional surface bounded. `serde(default)` on the Rust side accepts
+  # records that lack any of these keys.
   local repo_intel_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
@@ -472,6 +471,10 @@ write_record() {
   RECORD_WORKTREE_ISOLATED="${RECORD_WORKTREE_ISOLATED:-false}" \
   RECORD_BASE_REF="${RECORD_BASE_REF:-}" \
   RECORD_WORKTREE_PATH="${RECORD_WORKTREE_PATH:-}" \
+  RECORD_DURATION_MS="${RECORD_DURATION_MS:-}" \
+  RECORD_TOOL_CALL_COUNT="${RECORD_TOOL_CALL_COUNT:-}" \
+  RECORD_SHELL_COMMAND_COUNT="${RECORD_SHELL_COMMAND_COUNT:-}" \
+  RECORD_FILE_READ_COUNT="${RECORD_FILE_READ_COUNT:-}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -497,6 +500,10 @@ def opt_int(value):
 def opt_str(value):
     return value if value else None
 
+def opt_env_int(name):
+    raw = os.environ.get(name, "")
+    return int(raw) if raw not in ("", "null") else None
+
 record = {
     "arm": arm,
     "task_id": task_id,
@@ -511,6 +518,10 @@ record = {
     "tokens_input": opt_int(tokens_input),
     "tokens_output": opt_int(tokens_output),
     "tokens_total": opt_int(tokens_total),
+    "duration_ms": opt_env_int("RECORD_DURATION_MS"),
+    "tool_call_count": opt_env_int("RECORD_TOOL_CALL_COUNT"),
+    "shell_command_count": opt_env_int("RECORD_SHELL_COMMAND_COUNT"),
+    "file_read_count": opt_env_int("RECORD_FILE_READ_COUNT"),
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
     "base_ref": opt_str(os.environ.get("RECORD_BASE_REF", "")),
     "worktree_path": opt_str(os.environ.get("RECORD_WORKTREE_PATH", "")),
@@ -585,6 +596,63 @@ print(count)
 PY
 }
 
+# Tally tool/shell/file-read activity from events.jsonl. Emits three lines:
+# tool_call_count, shell_command_count, file_read_count. Heuristic mirrors
+# `agent_eval::count_activity_from_exec_jsonl` for cross-checking.
+count_activity() {
+  local events="$1"
+  python3 - "${events}" <<'PY'
+import json, sys
+from pathlib import Path
+
+FILE_READ_COMMANDS = {"cat", "head", "tail", "less", "more"}
+SHELL_WRAPPERS = ("/bin/zsh -lc ", "/bin/bash -c ", "zsh -lc ", "bash -c ")
+
+def first_token(raw: str) -> str:
+    s = raw.strip()
+    for prefix in SHELL_WRAPPERS:
+        if s.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    s = s.lstrip("'\"")
+    parts = s.split()
+    return parts[0] if parts else ""
+
+events_path = Path(sys.argv[1])
+tool_calls = 0
+shell_cmds = 0
+file_reads = 0
+if events_path.exists():
+    with events_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "item.completed":
+                continue
+            tool_calls += 1
+            item = ev.get("item") or {}
+            if item.get("type") != "command_execution":
+                continue
+            shell_cmds += 1
+            cmd = item.get("command")
+            if isinstance(cmd, list):
+                cmd = " ".join(cmd)
+            elif not isinstance(cmd, str):
+                cmd = ""
+            if first_token(cmd) in FILE_READ_COMMANDS:
+                file_reads += 1
+
+print(tool_calls)
+print(shell_cmds)
+print(file_reads)
+PY
+}
+
 run_arm() {
   local arm="$1"
   local task_id="$2"
@@ -620,6 +688,8 @@ ${task_text}"
   fi
   # `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under `set -u`
   # (bash 3.x on macOS treats an empty `${arr[@]}` as unbound).
+  local start_ms end_ms duration_ms
+  start_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
   set +e
   "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
     --dangerously-bypass-approvals-and-sandbox \
@@ -627,6 +697,8 @@ ${task_text}"
     "${prompt}" </dev/null >"${events}" 2>/dev/null
   local exec_exit=$?
   set -e
+  end_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+  duration_ms=$((end_ms - start_ms))
 
   local changed_json
   # Capture both modified tracked files (vs HEAD / base_ref) and untracked
@@ -651,6 +723,12 @@ ${task_text}"
     read -r tokens_output
     read -r tokens_total
   } < <(count_tokens "${events}")
+  local tool_call_count shell_command_count file_read_count
+  {
+    read -r tool_call_count
+    read -r shell_command_count
+    read -r file_read_count
+  } < <(count_activity "${events}")
   local validity
   validity="$(classify_run_validity "${events}" "${exec_exit}")"
   local run_valid
@@ -663,6 +741,10 @@ ${task_text}"
   RECORD_WORKTREE_ISOLATED="${worktree_isolated}" \
   RECORD_BASE_REF="${base_ref}" \
   RECORD_WORKTREE_PATH="${workdir}" \
+  RECORD_DURATION_MS="${duration_ms}" \
+  RECORD_TOOL_CALL_COUNT="${tool_call_count}" \
+  RECORD_SHELL_COMMAND_COUNT="${shell_command_count}" \
+  RECORD_FILE_READ_COUNT="${file_read_count}" \
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
     "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
@@ -672,7 +754,10 @@ ${task_text}"
   if [[ -n "${EVAL_CARGO_TARGET_DIR}" && -d "${EVAL_CARGO_TARGET_DIR}" ]]; then
     target_size="$(du -sh "${EVAL_CARGO_TARGET_DIR}" 2>/dev/null | cut -f1)"
   fi
-  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} cargo_target=${target_size}"
+  # Format duration in seconds for the log line; one-decimal precision.
+  local duration_s
+  duration_s="$(python3 -c "print(f'{${duration_ms}/1000:.1f}')")"
+  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} duration=${duration_s}s shell=${shell_command_count} reads=${file_read_count} cargo_target=${target_size}"
 }
 
 resolve_codex_bin
