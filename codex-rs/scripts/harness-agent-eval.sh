@@ -588,10 +588,24 @@ resolve_codex_bin
 resolve_isolation_base
 if [[ -z "${ARTIFACTS_DIR}" ]]; then
   ARTIFACTS_DIR="$(mktemp -d)"
-  log "artifacts: ${ARTIFACTS_DIR}"
 fi
+# Resolve ARTIFACTS_DIR to an absolute path BEFORE any `cd` happens in run_arm.
+# Otherwise a relative `--artifacts-dir ./foo` resolves inside each isolated
+# worktree at write_record time and `git worktree remove --force` deletes the
+# records along with the worktree.
+mkdir -p "${ARTIFACTS_DIR}"
+ARTIFACTS_DIR="$(cd "${ARTIFACTS_DIR}" && pwd)"
+log "artifacts: ${ARTIFACTS_DIR}"
 if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
   log "isolated worktrees enabled; base_ref=${BASE_REF} (${BASE_REF_SHA}) repo=${REPO_ROOT}"
+fi
+# Reuse the source tree's cargo target/ across isolated worktrees so each
+# arm's `verify_command` (or any agent-initiated `cargo`) hits the existing
+# build cache instead of recompiling the whole workspace fresh. Without this
+# 30 arms × ~11 GB of fresh target/ would need ~330 GB of free disk.
+if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
+  export CARGO_TARGET_DIR="${CODEX_RS_ROOT}/target"
+  log "shared CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then

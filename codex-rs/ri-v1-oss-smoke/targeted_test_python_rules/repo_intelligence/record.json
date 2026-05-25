@@ -1,0 +1,18 @@
+{
+  "arm": "repo_intelligence",
+  "task_id": "targeted_test_python_rules",
+  "changed_files": [],
+  "tests_passed": false,
+  "turn_count": 0,
+  "exec_exit_code": 127,
+  "repo_intelligence_enabled": true,
+  "harness_context_visible": false,
+  "run_valid": false,
+  "invalid_reason": "missing_events",
+  "tokens_input": null,
+  "tokens_output": null,
+  "tokens_total": null,
+  "worktree_isolated": true,
+  "base_ref": "9cfce928c7f20591490300ba492fb22d37c6e924",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.MomVVckN9J/codex-rs"
+}
