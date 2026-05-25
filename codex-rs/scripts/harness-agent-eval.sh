@@ -22,6 +22,13 @@ BASE_REF="HEAD"
 BASE_REF_SHA=""
 REPO_ROOT=""
 OSS_ARGS=()
+# Resilience guards (added after Run 1 / Run 2 post-mortems):
+EVAL_CARGO_TARGET_DIR=""       # --cargo-target-dir; default /tmp/codex-ri-eval-cargo-target
+SAFE_CODEX_BIN_DIR=""          # holds a write-protected copy of codex; survives target/ wipes
+MAX_TARGET_DIR_GB=""           # --max-target-dir-gb N; bail before disk-out
+# Worktrees the current run has created. Populated by create_arm_workdir,
+# deregistered by cleanup_arm_workdir, and force-cleaned on EXIT.
+ACTIVE_WORKTREES=()
 
 usage() {
   cat <<'EOF'
@@ -58,6 +65,19 @@ Isolation:
                          arms are already isolated by `mktemp -d` + `git init`.
   --base-ref REF         Resolved by `git rev-parse REF` against the codex-rs
                          repo root before any arms run. Default: HEAD.
+
+Resilience guards (apply when --isolated-worktrees is set):
+  --cargo-target-dir PATH  Shared CARGO_TARGET_DIR for agent-initiated cargo
+                           runs. Default: /tmp/codex-ri-eval-cargo-target.
+                           MUST NOT be the source tree's target/ — Run 2
+                           died when the agent in one arm wiped the binary
+                           via that shared path.
+  --max-target-dir-gb N    Abort the run before launching an arm if the
+                           cargo target dir already exceeds N GB. Default
+                           is unbounded; set this when disk is tight.
+  trap EXIT                Always installed. Force-removes every worktree
+                           the run registered, on any exit path (crash,
+                           Ctrl-C, normal end).
 
 Without --run: scores existing artifacts only (requires record.json per task/arm).
 With --run: executes both arms via `codex exec --json` (needs a working model provider).
@@ -107,13 +127,22 @@ while [[ $# -gt 0 ]]; do
       BASE_REF="$2"
       shift 2
       ;;
+    --cargo-target-dir)
+      EVAL_CARGO_TARGET_DIR="$2"
+      shift 2
+      ;;
+    --max-target-dir-gb)
+      MAX_TARGET_DIR_GB="$2"
+      shift 2
+      ;;
     --oss)
       OSS_ARGS=(--oss)
       shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
-            | --isolated-worktrees | --base-ref | --verbose | -h | --help) break ;;
+            | --isolated-worktrees | --base-ref | --cargo-target-dir | --max-target-dir-gb \
+            | --verbose | -h | --help) break ;;
           *)
             OSS_ARGS+=("$1")
             shift
@@ -169,6 +198,8 @@ create_arm_workdir() {
       git -C "${REPO_ROOT}" worktree add --detach -q "${worktree_root}" "${BASE_REF_SHA}"
       workdir="${worktree_root}/codex-rs"
       base_ref="${BASE_REF_SHA}"
+      # Register so trap EXIT can sweep us if the run dies mid-arm.
+      ACTIVE_WORKTREES+=("${worktree_root}")
     else
       workdir="${CODEX_RS_ROOT}"
       isolated=false
@@ -196,7 +227,63 @@ cleanup_arm_workdir() {
     local worktree_root
     worktree_root="$(dirname "${workdir}")"
     git -C "${REPO_ROOT}" worktree remove --force "${worktree_root}" 2>/dev/null || true
+    rm -rf "${worktree_root}" 2>/dev/null || true
+    # Deregister from ACTIVE_WORKTREES (preserve original order for any peers).
+    local new=()
+    for wt in ${ACTIVE_WORKTREES[@]+"${ACTIVE_WORKTREES[@]}"}; do
+      [[ "${wt}" != "${worktree_root}" ]] && new+=("${wt}")
+    done
+    ACTIVE_WORKTREES=(${new[@]+"${new[@]}"})
   fi
+}
+
+# Trap-installed: sweep every worktree the run still has registered. Runs on
+# any exit path — clean termination, crash, Ctrl-C, set -e propagation.
+cleanup_all_active_worktrees() {
+  local count=${#ACTIVE_WORKTREES[@]}
+  if [[ "${count}" -eq 0 ]]; then
+    return
+  fi
+  echo "trap EXIT: force-removing ${count} orphan worktree(s)" >&2
+  for wt in ${ACTIVE_WORKTREES[@]+"${ACTIVE_WORKTREES[@]}"}; do
+    if [[ -n "${REPO_ROOT}" ]]; then
+      git -C "${REPO_ROOT}" worktree remove --force "${wt}" 2>/dev/null || true
+    fi
+    rm -rf "${wt}" 2>/dev/null || true
+  done
+  ACTIVE_WORKTREES=()
+}
+trap cleanup_all_active_worktrees EXIT
+
+# Ensure the safe codex binary still exists. If an agent in some arm wiped
+# the source tree's target/, the copy under SAFE_CODEX_BIN_DIR survives
+# unless the agent also reaches into /tmp. Either way we want to fail fast
+# with a clear message before invoking exit-127 ten more times.
+ensure_codex_bin_alive() {
+  if [[ -x "${CODEX_BIN}" ]]; then
+    return 0
+  fi
+  echo "ERROR: codex binary missing at ${CODEX_BIN}" >&2
+  echo "  An agent in a previous arm likely deleted it." >&2
+  echo "  Re-run with --codex-bin pointing to a freshly-built binary." >&2
+  return 1
+}
+
+# Check the shared cargo target dir size against --max-target-dir-gb.
+# Returns non-zero (and prints a message) if the threshold would be exceeded.
+check_target_dir_size() {
+  if [[ -z "${MAX_TARGET_DIR_GB:-}" || -z "${EVAL_CARGO_TARGET_DIR}" ]]; then
+    return 0
+  fi
+  [[ -d "${EVAL_CARGO_TARGET_DIR}" ]] || return 0
+  local kb gb
+  kb="$(du -sk "${EVAL_CARGO_TARGET_DIR}" 2>/dev/null | cut -f1)"
+  gb=$((kb / 1024 / 1024))
+  if [[ "${gb}" -ge "${MAX_TARGET_DIR_GB}" ]]; then
+    echo "ABORT: ${EVAL_CARGO_TARGET_DIR} is ${gb} GB >= --max-target-dir-gb ${MAX_TARGET_DIR_GB}" >&2
+    return 1
+  fi
+  return 0
 }
 
 log() {
@@ -581,7 +668,11 @@ ${task_text}"
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
   cd "${CODEX_RS_ROOT}"
   cleanup_arm_workdir "${workdir_kind}" "${workdir}" "${worktree_isolated}"
-  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit}"
+  local target_size="(n/a)"
+  if [[ -n "${EVAL_CARGO_TARGET_DIR}" && -d "${EVAL_CARGO_TARGET_DIR}" ]]; then
+    target_size="$(du -sh "${EVAL_CARGO_TARGET_DIR}" 2>/dev/null | cut -f1)"
+  fi
+  log "arm=${arm} task=${task_id} workdir=${workdir} isolated=${worktree_isolated} exit=${exec_exit} cargo_target=${target_size}"
 }
 
 resolve_codex_bin
@@ -598,14 +689,35 @@ ARTIFACTS_DIR="$(cd "${ARTIFACTS_DIR}" && pwd)"
 log "artifacts: ${ARTIFACTS_DIR}"
 if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
   log "isolated worktrees enabled; base_ref=${BASE_REF} (${BASE_REF_SHA}) repo=${REPO_ROOT}"
-fi
-# Reuse the source tree's cargo target/ across isolated worktrees so each
-# arm's `verify_command` (or any agent-initiated `cargo`) hits the existing
-# build cache instead of recompiling the whole workspace fresh. Without this
-# 30 arms × ~11 GB of fresh target/ would need ~330 GB of free disk.
-if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
-  export CARGO_TARGET_DIR="${CODEX_RS_ROOT}/target"
+
+  # Copy the codex binary to a stable safe location BEFORE any arm runs.
+  # Run 2 died because an agent in some arm wiped target/ — taking the codex
+  # binary with it. With a copy outside any path the agent normally
+  # touches, even a destructive `cargo clean` in a worktree leaves the
+  # runner intact.
+  SAFE_CODEX_BIN_DIR="$(mktemp -d -t codex-ri-eval-bin-XXXXXX)"
+  cp "${CODEX_BIN}" "${SAFE_CODEX_BIN_DIR}/codex"
+  chmod +x "${SAFE_CODEX_BIN_DIR}/codex"
+  # Read-only flags raise the bar against accidental deletion; an agent with
+  # --dangerously-bypass-approvals-and-sandbox can still force-remove this
+  # path, but everyday `rm` / `cargo clean` no longer suffices.
+  chmod 0555 "${SAFE_CODEX_BIN_DIR}/codex" 2>/dev/null || true
+  CODEX_BIN="${SAFE_CODEX_BIN_DIR}/codex"
+  log "safe codex binary: ${CODEX_BIN}"
+
+  # CARGO_TARGET_DIR must NOT point at the source tree's target/. If an
+  # agent in any arm runs `cargo clean`, that command rm -rf's the dir —
+  # taking the codex binary with it if we share the path. Default to a
+  # disposable /tmp dir; --cargo-target-dir overrides.
+  if [[ -z "${EVAL_CARGO_TARGET_DIR}" ]]; then
+    EVAL_CARGO_TARGET_DIR="/tmp/codex-ri-eval-cargo-target"
+  fi
+  mkdir -p "${EVAL_CARGO_TARGET_DIR}"
+  export CARGO_TARGET_DIR="${EVAL_CARGO_TARGET_DIR}"
   log "shared CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
+  if [[ -n "${MAX_TARGET_DIR_GB:-}" ]]; then
+    log "max-target-dir-gb guard: ${MAX_TARGET_DIR_GB} GB"
+  fi
 fi
 
 if [[ "${RUN_AGENT}" -eq 1 ]]; then
@@ -616,6 +728,14 @@ if [[ "${RUN_AGENT}" -eq 1 ]]; then
   while IFS=$'\x1f' read -r id task verify workdir_kind || [[ -n "${id:-}" ]]; do
     [[ -z "${id}" ]] && break
     workdir_kind="${workdir_kind:-calculator}"
+    # Pre-arm guards: bail loudly rather than emit 30 exit=127 records.
+    if ! ensure_codex_bin_alive; then
+      echo "stopping after $(( ${#ACTIVE_WORKTREES[@]} )) in-flight worktree(s)" >&2
+      exit 1
+    fi
+    if ! check_target_dir_size; then
+      exit 1
+    fi
     if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
       run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
       run_arm repo_intelligence "${id}" "${task}" "${verify}" "${workdir_kind}"
