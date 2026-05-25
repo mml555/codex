@@ -39,13 +39,58 @@ pub struct RepoIntelligenceExtensionConfig {
     pub task_override: Option<String>,
 }
 
+/// Env var the extension reads to load a pre-built `RepoMap` from
+/// disk instead of indexing the worktree at session start. Set by
+/// the eval runner (`scripts/harness-agent-eval.sh`) to a temp JSON
+/// path. The file is `serde_json::to_string(&RepoMap)`; failures to
+/// open or deserialize are logged and the extension falls back to
+/// building the index from `config.cwd` as if the env var were unset.
+///
+/// The original cost we're amortizing: in two consecutive isolated-
+/// worktree pairs of `convention_add_area_package_alias`, the RI arm
+/// spent 170+ seconds in `RepoMapBuilder::build(...)` walking the
+/// codex-rs tree before the model produced its first token. Vanilla
+/// skipped this entirely. Caching the map across arms in a batch
+/// erases that gap.
+pub const CACHED_MAP_ENV_VAR: &str = "CODEX_REPO_INTELLIGENCE_CACHED_MAP";
+
 impl RepoIntelligenceExtensionConfig {
     fn from_config(config: &Config) -> Self {
         Self {
             enabled: config.features.enabled(Feature::RepoIntelligence),
             cwd: config.cwd.clone(),
-            cached_map: None,
+            cached_map: load_cached_map_from_env(),
             task_override: None,
+        }
+    }
+}
+
+/// Read `CODEX_REPO_INTELLIGENCE_CACHED_MAP` and attempt to load the
+/// referenced JSON file as a `RepoMap`. Returns `None` on any error
+/// (missing var, missing file, invalid JSON) — the extension will
+/// fall back to building the index in-process. Logs at `warn!` so
+/// reviewers can see why the cache didn't help.
+fn load_cached_map_from_env() -> Option<RepoMap> {
+    let path = std::env::var(CACHED_MAP_ENV_VAR).ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(
+                "repo intelligence cached_map: failed to read {path}: {err}"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice::<RepoMap>(&bytes) {
+        Ok(map) => Some(map),
+        Err(err) => {
+            tracing::warn!(
+                "repo intelligence cached_map: failed to deserialize {path}: {err}"
+            );
+            None
         }
     }
 }

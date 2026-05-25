@@ -23,6 +23,7 @@ codex-repo-index = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-verification = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

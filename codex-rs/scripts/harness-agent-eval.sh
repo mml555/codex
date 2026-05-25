@@ -31,6 +31,10 @@ CLOUD_EXTRA_ARGS=()
 # Resilience guards (added after Run 1 / Run 2 post-mortems):
 EVAL_CARGO_TARGET_DIR=""       # --cargo-target-dir; default /tmp/codex-ri-eval-cargo-target
 SAFE_CODEX_BIN_DIR=""          # holds a write-protected copy of codex; survives target/ wipes
+SHARED_REPO_MAP_PATH=""        # prewarmed RepoMap JSON; threaded into each codex exec call
+                               # via CODEX_REPO_INTELLIGENCE_CACHED_MAP so the RI extension
+                               # skips the ~170s repo-index build inside each arm.
+HARNESS_PREWARM_MS=""          # wall-clock duration of the prewarm step (recorded per-record)
 MAX_TARGET_DIR_GB=""           # --max-target-dir-gb N; bail before disk-out
 # Worktrees the current run has created. Populated by create_arm_workdir,
 # deregistered by cleanup_arm_workdir, and force-cleaned on EXIT.
@@ -750,6 +754,7 @@ write_record() {
   RECORD_EDIT_COMMAND_COUNT="${RECORD_EDIT_COMMAND_COUNT:-}" \
   RECORD_VERIFY_COMMAND_COUNT="${RECORD_VERIFY_COMMAND_COUNT:-}" \
   RECORD_WARNINGS="${RECORD_WARNINGS:-}" \
+  RECORD_HARNESS_PREWARM_MS="${RECORD_HARNESS_PREWARM_MS:-}" \
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events}")" \
@@ -807,6 +812,13 @@ record = {
     # JSON string array. Reviewer-facing only — the validity classifier
     # has already cleared this run as behaviorally valid.
     "warnings": [w for w in os.environ.get("RECORD_WARNINGS", "").split(",") if w],
+    # Harness-side prewarm cost (RepoMap build) — wall-clock ms spent
+    # building the shared RepoMap once for the batch. Counted ONCE
+    # per batch but recorded on every arm's record for easy
+    # reviewer comparison. Reflects local-only cost; `duration_ms`
+    # remains the per-arm `codex exec` wall-clock and is what the
+    # model-loop comparison should use.
+    "harness_prewarm_ms": opt_env_int("RECORD_HARNESS_PREWARM_MS"),
     # RI-surfaced file lists. Each env var is a \n-joined block from
     # `extract_ri_surfaced_files`. Empty for vanilla arms and for
     # pre-split rollouts that used the legacy single-section header.
@@ -1167,6 +1179,14 @@ ${task_text}"
   local start_ms end_ms duration_ms
   start_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
   set +e
+  # Thread the prewarmed RepoMap into the RI extension via env var.
+  # Empty (or unset) for vanilla arms — vanilla doesn't load the
+  # extension, so the env var is harmless there. For RI arms this
+  # lets the extension's `from_config` deserialize the cached map
+  # instead of running `RepoMapBuilder::build` synchronously at
+  # session start (the source of the ~170s pre-model gap measured
+  # in the area-package-alias gated pairs).
+  CODEX_REPO_INTELLIGENCE_CACHED_MAP="${SHARED_REPO_MAP_PATH:-}" \
   "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${CLOUD_EXTRA_ARGS[@]+"${CLOUD_EXTRA_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
     --dangerously-bypass-approvals-and-sandbox \
     --json \
@@ -1227,6 +1247,7 @@ ${task_text}"
   RECORD_BASE_REF="${base_ref}" \
   RECORD_WORKTREE_PATH="${workdir}" \
   RECORD_DURATION_MS="${duration_ms}" \
+  RECORD_HARNESS_PREWARM_MS="${HARNESS_PREWARM_MS:-}" \
   RECORD_TOOL_CALL_COUNT="${tool_call_count}" \
   RECORD_SHELL_COMMAND_COUNT="${shell_command_count}" \
   RECORD_FILE_READ_COUNT="${file_read_count}" \
@@ -1417,6 +1438,34 @@ if [[ "${ISOLATED_WORKTREES}" -eq 1 ]]; then
   log "shared CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
   if [[ -n "${MAX_TARGET_DIR_GB:-}" ]]; then
     log "max-target-dir-gb guard: ${MAX_TARGET_DIR_GB} GB"
+  fi
+
+  # Prewarm the RepoMap ONCE for the whole batch and thread it into
+  # each arm via the CODEX_REPO_INTELLIGENCE_CACHED_MAP env var. The
+  # area-package-alias gated pairs (Runs 1 + 2) showed every RI arm
+  # spending ~170s synchronously building the index in a fresh
+  # worktree before the first model token. Caching the map across
+  # arms erases that gap — the build runs once here, then each arm's
+  # codex exec deserializes the JSON in milliseconds.
+  #
+  # The map is built from REPO_ROOT (the source tree the worktrees
+  # branch from), so all arms operating on the same base_ref see an
+  # identical map regardless of which tmp worktree they ended up in.
+  # `RepoMap.root` is metadata only — no consumer in the RI path
+  # reads it after build (verified by grep).
+  SHARED_REPO_MAP_PATH="$(mktemp -t codex-ri-eval-map-XXXXXX.json)"
+  log "prewarm: building shared RepoMap → ${SHARED_REPO_MAP_PATH}"
+  prewarm_start=$(python3 -c 'import time; print(int(time.time()*1000))')
+  if "${CODEX_BIN}" context dump-repo-index \
+      --cwd "${REPO_ROOT}/codex-rs" \
+      --json-out "${SHARED_REPO_MAP_PATH}" >/dev/null 2>&1; then
+    prewarm_end=$(python3 -c 'import time; print(int(time.time()*1000))')
+    HARNESS_PREWARM_MS=$((prewarm_end - prewarm_start))
+    map_size="$(wc -c < "${SHARED_REPO_MAP_PATH}" 2>/dev/null | tr -d ' ')"
+    log "prewarm: RepoMap ready (${HARNESS_PREWARM_MS}ms, ${map_size} bytes)"
+  else
+    log "prewarm: dump-repo-index failed; arms will fall back to in-arm indexing"
+    SHARED_REPO_MAP_PATH=""
   fi
 fi
 

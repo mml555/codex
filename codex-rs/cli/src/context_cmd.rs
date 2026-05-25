@@ -42,6 +42,27 @@ pub enum ContextSubcommand {
     Eval(ContextEvalCommand),
     /// Score vanilla vs harness-context agent runs from offline artifacts.
     AgentEval(crate::context_agent_eval_cmd::ContextAgentEvalCli),
+    /// Dump the raw repo index (RepoMap) for the current cwd to JSON.
+    /// Used by the eval runner to prewarm a shared cache so each arm's
+    /// `codex exec` session can load the map via the
+    /// `CODEX_REPO_INTELLIGENCE_CACHED_MAP` env var instead of rebuilding
+    /// it from scratch in a fresh worktree (which took ~170 seconds on
+    /// the codex-rs tree, per the area-package-alias gated runs).
+    DumpRepoIndex(ContextDumpRepoIndexCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct ContextDumpRepoIndexCommand {
+    /// Repository working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Path to write the JSON-serialized RepoMap. If omitted, writes
+    /// to stdout.
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
+    /// Rebuild the repo index instead of using the on-disk cache.
+    #[arg(long)]
+    pub refresh_index: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -119,7 +140,24 @@ pub async fn run_context_command(command: ContextCli) -> Result<()> {
         ContextSubcommand::AgentEval(cmd) => {
             crate::context_agent_eval_cmd::run_context_agent_eval(cmd).await
         }
+        ContextSubcommand::DumpRepoIndex(cmd) => run_context_dump_repo_index(cmd).await,
     }
+}
+
+pub async fn run_context_dump_repo_index(cmd: ContextDumpRepoIndexCommand) -> Result<()> {
+    let cwd = resolve_cwd(cmd.cwd)?;
+    let map = load_or_build_map(&cwd, cmd.refresh_index)?;
+    let json = serde_json::to_string_pretty(&map)?;
+    match cmd.json_out {
+        Some(path) => {
+            std::fs::write(&path, json.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        None => {
+            println!("{json}");
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_context_build(cmd: ContextBuildCommand) -> Result<()> {

@@ -108,6 +108,18 @@ pub struct AgentRunRecord {
     /// on the metric users actually feel.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    /// Local prewarm wall-clock time, in milliseconds, spent by the
+    /// eval runner building the shared `RepoMap` ONCE for the batch
+    /// before any arm started. Threaded into every arm's record (not
+    /// per-arm cost) so reviewers can separate three numbers:
+    ///   - prewarm_ms: local one-time index build (amortized)
+    ///   - duration_ms: per-arm `codex exec` wall-clock
+    ///   - model_loop = duration_ms minus the in-session init gap
+    /// The area-package-alias gated pairs showed the RI arm's
+    /// `duration_ms` included ~170s of in-session repo-index build
+    /// that this prewarm path is designed to eliminate.
+    #[serde(default)]
+    pub harness_prewarm_ms: Option<u64>,
     /// Count of `item.completed` events of any item type. A coarse proxy
     /// for "how many tool calls did the model make this turn".
     #[serde(default)]
@@ -1642,6 +1654,7 @@ mod tests {
             intent_changed_files: Vec::new(),
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
+            harness_prewarm_ms: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2624,6 +2637,7 @@ mod tests {
             intent_changed_files: Vec::new(),
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
+            harness_prewarm_ms: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2685,6 +2699,7 @@ mod tests {
             intent_changed_files: Vec::new(),
             diff_changed_files: Vec::new(),
             formatter_changed_files: Vec::new(),
+            harness_prewarm_ms: None,
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
