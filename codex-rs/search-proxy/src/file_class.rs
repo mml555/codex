@@ -74,10 +74,17 @@ pub fn classify_file(path: &str, hits: &ParsedFileHits) -> FileClass {
 /// a recognized Rust definition keyword (possibly preceded by `pub`,
 /// `unsafe`, `async`, `default`, or `pub(crate)`).
 fn line_looks_like_definition(line: &str) -> bool {
-    let trimmed = line.trim_start();
+    definition_symbol(line).is_some()
+}
 
-    // Strip up to two visibility / qualifier modifiers in order, e.g.
-    // "pub unsafe fn foo()" or "pub(crate) async fn bar()".
+/// If the line is a Rust definition, return the defined identifier
+/// (the token right after the keyword, e.g. `package_name_for_area`
+/// from `fn package_name_for_area(...)`). Returns `None` for
+/// non-definition lines. `macro_rules!` returns the macro name.
+pub(crate) fn definition_symbol(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // Strip up to three visibility / qualifier modifiers in order,
+    // e.g. "pub unsafe fn foo()" or "pub(crate) async fn bar()".
     let mut rest = trimmed;
     for _ in 0..3 {
         let next = strip_modifier(rest);
@@ -87,9 +94,20 @@ fn line_looks_like_definition(line: &str) -> bool {
         rest = next.trim_start();
     }
 
-    RUST_DEFINITION_KEYWORDS
+    let kw = RUST_DEFINITION_KEYWORDS
         .iter()
-        .any(|kw| rest.starts_with(kw))
+        .find(|kw| rest.starts_with(**kw))?;
+    let after_kw = rest[kw.len()..].trim_start();
+    // The identifier runs until the first non-identifier char
+    // (`(`, `<`, `{`, `:`, whitespace, `=`, `;`).
+    let ident: String = after_kw
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        return None;
+    }
+    Some(ident)
 }
 
 /// Strip a single qualifier token: `pub`, `pub(...)`, `unsafe`,
@@ -97,9 +115,10 @@ fn line_looks_like_definition(line: &str) -> bool {
 /// recognized qualifier is found at the start.
 fn strip_modifier(s: &str) -> &str {
     if let Some(rest) = s.strip_prefix("pub(")
-        && let Some(close) = rest.find(')') {
-            return &rest[close + 1..];
-        }
+        && let Some(close) = rest.find(')')
+    {
+        return &rest[close + 1..];
+    }
     for kw in ["pub ", "unsafe ", "async ", "default "] {
         if let Some(rest) = s.strip_prefix(kw) {
             return rest;

@@ -13,6 +13,8 @@ use crate::evidence::FileEvidence;
 use crate::evidence::HitLine;
 use crate::evidence_renderer::render_compact_evidence;
 use crate::file_class::classify_file;
+use crate::relevance::parse_query_terms;
+use crate::relevance::relevance_score;
 use crate::rg_json::ParsedFileHits;
 use crate::rg_json::parse_rg_json;
 use crate::rg_runner::RgExitStatus;
@@ -98,12 +100,28 @@ pub fn build_proxy_response(
     let total_hits: usize = parsed.iter().map(|p| p.hits.len()).sum();
     let total_files_matched = parsed.len();
 
-    let mut ranked: Vec<FileEvidence> = parsed
+    // Rank by (class, relevance desc, path). Class still dominates so
+    // definition sites (Owner) come before plain Source matches, but
+    // within a class the relevance score breaks ties on query
+    // alignment instead of alphabetical path order — the run3 fix.
+    let query_terms = parse_query_terms(&classified.query);
+    let mut scored: Vec<(FileEvidence, u32)> = parsed
         .iter()
-        .map(|p| build_file_evidence(p, options))
+        .map(|p| {
+            (
+                build_file_evidence(p, options),
+                relevance_score(p, &query_terms),
+            )
+        })
         .collect();
-
-    ranked.sort_by_key(|f| (f.class.rank(), f.path.clone()));
+    scored.sort_by(|(a, a_score), (b, b_score)| {
+        a.class
+            .rank()
+            .cmp(&b.class.rank())
+            .then(b_score.cmp(a_score))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let ranked: Vec<FileEvidence> = scored.into_iter().map(|(evidence, _)| evidence).collect();
 
     let mut files: Vec<FileEvidence> = Vec::new();
     let mut byte_budget = options.max_total_bytes;

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "concept_area_package_lookup",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "verification_required": false,
+    "task": "Somewhere in this workspace there is a helper function that takes an area id (the top-level path segment identifying which part of the repo a source file belongs to) and returns the matching Cargo package name used for targeted `cargo test -p` runs. Find that function and add a one-line `///` doc comment directly above its definition explaining what it maps and what it returns. Do not change any other file, do not add or remove entries, and do not edit the lookup table it reads from.",
+    "relevant_files": [
+      "verification/src/rules.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  }
+]

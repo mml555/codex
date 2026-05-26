@@ -20,6 +20,7 @@ mod evidence;
 mod evidence_builder;
 mod evidence_renderer;
 mod file_class;
+mod relevance;
 mod rg_json;
 mod rg_runner;
 

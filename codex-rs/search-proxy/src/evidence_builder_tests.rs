@@ -22,9 +22,7 @@ fn classified(query: &str) -> ClassifiedRg {
 }
 
 fn begin(path: &str) -> String {
-    format!(
-        r#"{{"type":"begin","data":{{"path":{{"text":{path:?}}}}}}}"#
-    )
+    format!(r#"{{"type":"begin","data":{{"path":{{"text":{path:?}}}}}}}"#)
 }
 
 fn match_event(path: &str, line: u32, text: &str, start: u64) -> String {
@@ -56,6 +54,100 @@ fn opts() -> EvidenceOptions {
         raw_pass_through_lines: 0,
         ..EvidenceOptions::default()
     }
+}
+
+#[test]
+fn run3_ranks_gold_owner_first_by_relevance() {
+    // End-to-end gate for the run3 ranking miss. The model's query was
+    // a broad alternation; three files all classify as Owner. Before
+    // the relevance fix, the alphabetical tiebreak put
+    // context-harness/src/task_terms.rs first and the gold
+    // verification/src/rules.rs third. After the fix, rules.rs must
+    // rank first because its DEFINITIONS (package_name_for_area,
+    // area_id_for_path) align with the query words.
+    //
+    // Each file carries its full matched set (not just the 3 lines the
+    // renderer would display) because the relevance scorer reads all
+    // matched lines.
+    let bytes = jsonl(&[
+        begin("context-harness/src/task_terms.rs"),
+        match_event(
+            "context-harness/src/task_terms.rs",
+            27,
+            "/// `area_id` appearing only inside a quoted example does NOT",
+            8,
+        ),
+        match_event(
+            "context-harness/src/task_terms.rs",
+            302,
+            "        .any(|term| area.area_id.contains(term) || term.contains(&area.area_id))",
+            30,
+        ),
+        match_event(
+            "context-harness/src/task_terms.rs",
+            418,
+            "pub fn build_task_terms(task: &str, map: &RepoMap) -> TaskTerms {",
+            7,
+        ),
+        end("context-harness/src/task_terms.rs"),
+        begin("repo-index/src/repo_map.rs"),
+        match_event(
+            "repo-index/src/repo_map.rs",
+            63,
+            "    pub fn area_map_for_id(&self, area_id: &str) -> Option<&AreaMap> {",
+            15,
+        ),
+        end("repo-index/src/repo_map.rs"),
+        begin("verification/src/rules.rs"),
+        match_event(
+            "verification/src/rules.rs",
+            16,
+            "/// Cargo package names for codex-rs area roots (path -> `cargo test -p` name).",
+            4,
+        ),
+        match_event(
+            "verification/src/rules.rs",
+            365,
+            "fn area_id_for_path(path: &str, map: &RepoMap) -> Option<String> {",
+            3,
+        ),
+        match_event(
+            "verification/src/rules.rs",
+            386,
+            "fn package_name_for_area(area_id: &str) -> Option<String> {",
+            3,
+        ),
+        end("verification/src/rules.rs"),
+    ]);
+    let runner = StaticRunner::matched(bytes);
+    let outcome = build_proxy_response(
+        &classified("area id|area_id|cargo test -p|targeted cargo|package name|lookup table"),
+        Path::new("."),
+        &runner,
+        &opts(),
+    );
+    let ProxyOutcome::Substitute { evidence, .. } = outcome else {
+        panic!("expected Substitute, got {outcome:?}");
+    };
+    assert_eq!(
+        evidence.files[0].path,
+        "verification/src/rules.rs",
+        "gold file must rank first; got order: {:?}",
+        evidence.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    // task_terms.rs must no longer outrank the gold file.
+    let rules_idx = evidence
+        .files
+        .iter()
+        .position(|f| f.path == "verification/src/rules.rs");
+    let task_terms_idx = evidence
+        .files
+        .iter()
+        .position(|f| f.path == "context-harness/src/task_terms.rs");
+    assert!(
+        rules_idx < task_terms_idx,
+        "rules.rs ({rules_idx:?}) must rank above task_terms.rs ({task_terms_idx:?})"
+    );
 }
 
 #[test]
