@@ -1,0 +1,17 @@
+Harness repo intelligence:
+Use this as task-routing guidance before editing.
+
+Task: Add a unit test inside the `#[cfg(test)] mod tests` block of the agent_eval module that asserts `classify_result` returns an `AgentEvalResult::Excluded` variant whenever `valid_for_comparison=false`, regardless of the score arguments. Na...
+
+Likely edit targets:
+1. core/README.md — Likely repo area match
+
+Orientation only:
+1. core/config.schema.json — Likely repo area match
+2. core/gpt-5.1-codex-max_prompt.md — Likely repo area match
+3. core/gpt-5.2-codex_prompt.md — Likely repo area match
+4. core/gpt_5_1_prompt.md — Likely repo area match
+
+Do not broaden the edit scope just because a file appears in orientation context. Prefer the smallest patch that satisfies the task.
+
+Likely area: core

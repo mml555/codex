@@ -1,0 +1,17 @@
+Harness repo intelligence:
+Use this as task-routing guidance before editing.
+
+Task: The constant whose literal text starts every model-visible repo-intelligence prompt fragment (so other code can detect that the harness reached the model) lives in exactly one file in the context-harness crate. Add a `// Sentinel line op...
+
+Likely edit targets:
+1. context-harness/BUILD.bazel — Path matches 3 task term(s)
+
+Orientation only:
+1. context-harness/Cargo.toml — Path matches 3 task term(s)
+2. context-harness/src/agent_eval.rs — Path matches 3 task term(s)
+3. context-harness/src/eval.rs — Path matches 3 task term(s)
+4. context-harness/src/metrics.rs — Path matches 3 task term(s)
+
+Do not broaden the edit scope just because a file appears in orientation context. Prefer the smallest patch that satisfies the task.
+
+Likely area: context-harness

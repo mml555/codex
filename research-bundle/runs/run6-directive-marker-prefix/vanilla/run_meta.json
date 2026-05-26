@@ -1,0 +1,10 @@
+{
+  "cli_version": "0.0.0",
+  "git_commit": "350d30b9c381af976c6bede6c34b2813e8080d39",
+  "model": "gpt-5.3-codex",
+  "model_provider": "azure",
+  "originator": "codex_exec",
+  "rollout_path": "/Users/mendell/.codex/sessions/2026/05/25/rollout-2026-05-25T21-01-10-019e61cc-c62e-7db3-8208-07c2a0e9bbd3.jsonl",
+  "thread_id": "019e61cc-c62e-7db3-8208-07c2a0e9bbd3",
+  "thread_source": "user"
+}
