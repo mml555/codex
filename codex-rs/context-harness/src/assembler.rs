@@ -381,7 +381,27 @@ fn score_file_for_task(
         relevance = 0.05;
         evidence.push("path:penalty_segment".to_string());
     }
-    if path_lower.ends_with(".json")
+    // Manifest de-prioritization: BUILD.bazel, Cargo.toml, package.json
+    // should almost never be edit targets unless the task explicitly
+    // names manifest vocabulary. The route-directive-marker packet
+    // check showed `context-harness/BUILD.bazel` winning the
+    // within-crate tiebreak over `renderer.rs` for a task that had
+    // nothing to do with the build system.
+    //
+    // The penalty is heavier than the generic `.toml/.json` penalty
+    // (×0.20 vs ×0.35) because manifests are stronger false
+    // positives — they pick up area/crate tokens from their paths
+    // (`context-harness/BUILD.bazel` matches "context", "harness")
+    // without being plausible edit targets. When the task DOES name
+    // manifest terms ("Cargo.toml", "BUILD.bazel", "manifest",
+    // "dependency", "bazel target"), the penalty stays out of the
+    // way and an explicit manifest task can still route correctly.
+    let manifest_unannounced =
+        is_manifest_path(&file.path) && !task_explicitly_names_manifest(terms);
+    if manifest_unannounced {
+        relevance *= 0.20;
+        evidence.push("path:manifest_unannounced".to_string());
+    } else if path_lower.ends_with(".json")
         || path_lower.ends_with(".toml")
         || path_lower.contains("schema/json")
     {
@@ -608,17 +628,15 @@ pub(crate) const WITHIN_CRATE_OWNER_BOOST: f64 = 0.30;
 /// file path suffix to the set of task-term triggers that indicate
 /// that file is the actual owner of the task's intent.
 ///
-/// Scoped narrowly on purpose: the user's directive was to add
-/// explicit ownership for the verification crate's known files only,
-/// NOT to build a generic semantic system. Each rule's triggers are
-/// the actual term forms the tokenizer emits after singularization
-/// (`commands` → `command`, etc.), so we don't need fuzzy matching.
+/// Scoped narrowly on purpose: each rule's triggers are the actual
+/// term forms the tokenizer emits after singularization (`commands`
+/// → `command`, etc.), so we don't need fuzzy matching.
 ///
 /// The matcher checks `terms.phrases` and `terms.expanded`. Phrases
 /// are the raw tokens from the task; `expanded` adds synonyms from
 /// the `task_terms::SYNONYMS` table.
 const WITHIN_CRATE_OWNERS: &[(&str, &[&str], &str)] = &[
-    // (file-path-suffix, trigger-terms, evidence-label)
+    // ---- verification crate (added in commit 227e682f5) ----
     //
     // `python_rules.rs` owns the python/pytest validation rules.
     // The pytest-target packet check failed when this file lost a
@@ -652,16 +670,75 @@ const WITHIN_CRATE_OWNERS: &[(&str, &[&str], &str)] = &[
         &["rule", "rules", "cargo", "package", "alias", "area"],
         "owner:rules",
     ),
+    //
+    // ---- context-harness crate (this commit) ----
+    //
+    // `renderer.rs` owns the directive prompt rendering pipeline,
+    // including the `HARNESS_MARKER` sentinel and the
+    // edit-targets/orientation section headers. The route-directive-
+    // marker packet check failed when this file lost the within-
+    // crate tiebreak to `BUILD.bazel`.
+    (
+        "context-harness/src/renderer.rs",
+        &[
+            "renderer", "render", "directive", "marker", "sentinel", "fragment", "prompt",
+        ],
+        "owner:harness_renderer",
+    ),
+    // `agent_eval.rs` owns the AgentRunRecord/AgentRunScore schemas,
+    // the validity classifier, the result classifier, and most
+    // diagnostic fields the cloud-eval reports surface. Trigger
+    // terms come from field names and field semantics, not
+    // generic verbs.
+    (
+        "context-harness/src/agent_eval.rs",
+        &[
+            "scorer", "record", "warning", "warnings", "invalid", "duration", "validity",
+            "classify",
+        ],
+        "owner:agent_eval",
+    ),
+    // `assembler.rs` owns context-packet assembly: file scoring,
+    // area affinity, within-crate ownership (this file itself),
+    // packet emission. "packet" is the most discriminative term.
+    (
+        "context-harness/src/assembler.rs",
+        &["assembler", "packet", "orientation"],
+        "owner:assembler",
+    ),
+    // `task_terms.rs` owns task tokenization and the quote-aware
+    // strong-phrase machinery added in commit f56a8c344.
+    (
+        "context-harness/src/task_terms.rs",
+        &[
+            "tokenize", "synonym", "synonyms", "backtick", "phrase", "phrases",
+        ],
+        "owner:task_terms",
+    ),
+    // `selection.rs` owns SelectionCaps (max_inspect_files,
+    // max_edit_targets, the include-relevance thresholds).
+    (
+        "context-harness/src/selection.rs",
+        &["caps", "cap", "budget", "inspect", "limit"],
+        "owner:selection",
+    ),
 ];
 
 /// If `path` is a known within-crate owner AND any of its trigger
-/// terms appears in the task, return the evidence label. The caller
-/// adds the +`WITHIN_CRATE_OWNER_BOOST` to the file's relevance.
-/// Returns None for unknown paths or non-matching tasks.
+/// terms appears LITERALLY in the task, return the evidence label.
+/// The caller adds the +`WITHIN_CRATE_OWNER_BOOST` to the file's
+/// relevance. Returns None for unknown paths or non-matching tasks.
+///
+/// Matches only against `terms.phrases` (the raw tokenized vocabulary
+/// of the task) — NOT `terms.expanded`. The synonym table
+/// (`task_terms::SYNONYMS`) expands "harness" to include "assembler"
+/// and "packet", which would otherwise fire the `owner:assembler`
+/// rule for any context-harness task, including
+/// `route_directive_marker` where the actual owner is `renderer.rs`.
+/// Synonym-based ownership matching is too loose for this routing
+/// signal — direct phrase mentions only.
 pub(crate) fn within_crate_owner_match(path: &str, terms: &TaskTerms) -> Option<&'static str> {
-    let has = |term: &str| {
-        terms.phrases.iter().any(|p| p == term) || terms.expanded.iter().any(|p| p == term)
-    };
+    let has = |term: &str| terms.phrases.iter().any(|p| p == term);
     for (suffix, triggers, evidence) in WITHIN_CRATE_OWNERS {
         if !path.ends_with(suffix) {
             continue;
@@ -675,6 +752,41 @@ pub(crate) fn within_crate_owner_match(path: &str, terms: &TaskTerms) -> Option<
 
 fn is_manifest_path(path: &str) -> bool {
     path.ends_with("BUILD.bazel") || path.ends_with("Cargo.toml") || path.ends_with("package.json")
+}
+
+/// True when the task's *outside-quotes* text explicitly names
+/// manifest-related vocabulary — "Cargo.toml", "BUILD.bazel",
+/// "manifest", "dependency"/"dependencies", "bazel", or "crate
+/// package". Stricter than the existing `task_mentions_manifest`
+/// helper (which fires on bare "cargo" or "bazel" tokens and over-
+/// matches tasks like `area-package-alias` that say "Cargo package
+/// names" purely in prose). Drives the manifest de-prioritization
+/// in `score_file_for_task`.
+///
+/// Substring matching (not tokenization) so that `Cargo.toml` survives
+/// the tokenizer's split on `.` — the tokenizer would otherwise
+/// produce `cargo` and `toml` separately, neither of which is
+/// discriminative on its own.
+///
+/// Reads `terms.task_outside_quotes_lower` so a quoted example like
+/// "`Cargo.toml`" does NOT count as a manifest mention — matches the
+/// area-inference contract added in commit f56a8c344.
+pub(crate) fn task_explicitly_names_manifest(terms: &TaskTerms) -> bool {
+    let text = &terms.task_outside_quotes_lower;
+    text.contains("cargo.toml")
+        || text.contains("build.bazel")
+        || text.contains("package.json")
+        || text.contains("manifest")
+        || text.contains("dependency")
+        || text.contains("dependencies")
+        || text.contains("crate package")
+        // `bazel` as a standalone token (not just inside a file path
+        // like "context-harness/BUILD.bazel" appearing in some other
+        // context). The quote-elided text never contains a "BUILD.bazel"
+        // literal — that would mean the task said it in prose.
+        || text.contains(" bazel ")
+        || text.starts_with("bazel ")
+        || text.ends_with(" bazel")
 }
 
 fn task_mentions_manifest(path: &str, terms: &TaskTerms) -> bool {
@@ -726,6 +838,7 @@ mod tests {
     use super::AREA_OUTSIDE_PENALTY;
     use super::ContextAssembler;
     use super::area_affinity_adjustment;
+    use super::task_explicitly_names_manifest;
     use super::within_crate_owner_match;
     use crate::RunMemory;
     use crate::TaskClassifier;
@@ -886,20 +999,157 @@ mod tests {
     #[test]
     fn within_crate_owner_returns_none_for_files_outside_known_owners() {
         // A verification file that isn't in the owners table (or any
-        // file in another crate) gets None — the ranker falls back
-        // to area boost + term matching only. Keeps the table's
-        // scope narrow and predictable.
+        // file in another crate without matching triggers) gets
+        // None — the ranker falls back to area boost + term matching
+        // only. Keeps the table's scope narrow and predictable.
         let terms = task_terms_for("any task about pytest verification");
         assert_eq!(
             within_crate_owner_match("verification/src/lib.rs", &terms),
             None,
             "lib.rs is not an owner — must not get the boost"
         );
+        // context-harness/agent_eval.rs IS now an owner, so it
+        // matches when terms (`scorer`, `record`, etc.) are present.
+        // For the pytest task above, no agent_eval triggers fire,
+        // so the match is still None.
         assert_eq!(
             within_crate_owner_match("context-harness/src/agent_eval.rs", &terms),
             None,
-            "the table is verification-only by design"
+            "no agent_eval triggers in this pytest task"
         );
+    }
+
+    #[test]
+    fn within_crate_owner_matches_renderer_for_directive_marker_task() {
+        // The route-directive-marker packet check failed when
+        // `context-harness/BUILD.bazel` won the within-crate tiebreak
+        // over `renderer.rs`. The renderer entry in the owners table
+        // must fire on this task's vocabulary ("directive",
+        // "fragment", "sentinel", "prompt").
+        let terms = task_terms_for(
+            "The constant whose literal text starts every model-visible \
+             repo-intelligence prompt fragment lives in exactly one file \
+             in the context-harness crate. Add a Sentinel doc comment \
+             above its definition.",
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/renderer.rs", &terms),
+            Some("owner:harness_renderer"),
+        );
+        // Manifests in the same crate must NOT fire the renderer
+        // ownership boost.
+        assert_eq!(
+            within_crate_owner_match("context-harness/BUILD.bazel", &terms),
+            None,
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/Cargo.toml", &terms),
+            None,
+        );
+        // Critical negative case: `assembler.rs` must NOT fire on
+        // this task. The first attempt at this fix matched
+        // `terms.expanded`, which includes "assembler" and "packet"
+        // as synonyms of "harness" — that produced a false positive
+        // on assembler.rs for any context-harness task. Phrase-only
+        // matching prevents that.
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/assembler.rs", &terms),
+            None,
+            "synonym-driven 'assembler' must NOT fire owner:assembler \
+             when the task is actually about the renderer/directive"
+        );
+    }
+
+    #[test]
+    fn within_crate_owner_matches_task_terms_for_tokenizer_task() {
+        // Tasks about the tokenizer / quote-aware machinery must
+        // route to task_terms.rs, not to assembler.rs or renderer.rs.
+        let terms = task_terms_for(
+            "Adjust the tokenizer's quote handling so backticked example \
+             phrases are downweighted during area inference",
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/task_terms.rs", &terms),
+            Some("owner:task_terms"),
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/assembler.rs", &terms),
+            None,
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/renderer.rs", &terms),
+            None,
+        );
+    }
+
+    #[test]
+    fn within_crate_owner_matches_assembler_for_packet_task() {
+        // The assembler entry should win for tasks describing context-
+        // packet assembly. Should NOT collide with renderer or
+        // agent_eval ownership for the same task.
+        let terms = task_terms_for(
+            "Update the assembler to emit a new evidence label when a \
+             file enters the orientation section of the packet",
+        );
+        assert_eq!(
+            within_crate_owner_match("context-harness/src/assembler.rs", &terms),
+            Some("owner:assembler"),
+        );
+    }
+
+    #[test]
+    fn manifest_paths_unannounced_get_de_prioritization_evidence() {
+        // Direct test of the manifest helper: a task that doesn't
+        // name manifest vocabulary leaves manifest paths unannounced.
+        let plain = task_terms_for(
+            "The constant whose literal text starts every model-visible \
+             prompt fragment lives in the context-harness crate.",
+        );
+        assert!(
+            !task_explicitly_names_manifest(&plain),
+            "directive-marker task must NOT mention manifests; got phrases={:?}",
+            plain.phrases
+        );
+
+        // Control: a task that explicitly names BUILD.bazel DOES
+        // count as a manifest task. The penalty must stay out of
+        // the way so an explicit manifest edit can route correctly.
+        let bazel_task = task_terms_for(
+            "Update the context-harness BUILD.bazel target to add a new \
+             rust_test rule for the regression suite.",
+        );
+        assert!(
+            task_explicitly_names_manifest(&bazel_task),
+            "explicit BUILD.bazel mention must count as manifest task; got: {:?}",
+            bazel_task.task_outside_quotes_lower
+        );
+
+        // Control 2: "Cargo package names" prose (the area-package-alias
+        // task) MUST NOT trigger the manifest path — bare "cargo" is too
+        // common to count.
+        let area_package = task_terms_for(
+            "Inside the verification crate there is a static array that \
+             maps area-id prefixes to Cargo package names. Add a new entry.",
+        );
+        assert!(
+            !task_explicitly_names_manifest(&area_package),
+            "bare 'Cargo package' prose must NOT count as manifest mention"
+        );
+
+        // Control 3: explicit "Cargo.toml" or "manifest" or
+        // "dependency" each count.
+        for variant in [
+            "Bump the codex-cli Cargo.toml version to 0.2",
+            "Add a new dev-dependency to the manifest",
+            "Replace a dependency entry with a newer revision",
+        ] {
+            let t = task_terms_for(variant);
+            assert!(
+                task_explicitly_names_manifest(&t),
+                "variant `{variant}` should trigger manifest task; outside_lower={:?}",
+                t.task_outside_quotes_lower
+            );
+        }
     }
 
     #[test]

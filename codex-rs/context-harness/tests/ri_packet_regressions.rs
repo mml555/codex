@@ -58,6 +58,47 @@ fn ri_packet_for_area_package_alias_picks_verification_rules() {
 }
 
 #[test]
+fn ri_packet_for_directive_marker_picks_renderer_not_bazel() {
+    // The route-directive-marker gated cloud pair (Run 6) surfaced
+    // `context-harness/BUILD.bazel` as the edit target instead of
+    // `context-harness/src/renderer.rs`. Two fixes were required:
+    //   - extend WITHIN_CRATE_OWNERS with renderer/directive/marker
+    //     triggers for renderer.rs
+    //   - de-prioritize manifest paths (BUILD.bazel, Cargo.toml,
+    //     package.json) when the task does NOT explicitly name
+    //     manifest vocabulary
+    // Both ship in this commit. This regression test runs against
+    // the live codex-rs RepoMap and confirms the fix end-to-end.
+    let map = live_codex_rs_map();
+    let task = "The constant whose literal text starts every \
+                model-visible repo-intelligence prompt fragment (so \
+                other code can detect that the harness reached the \
+                model) lives in exactly one file in the \
+                context-harness crate. Add a `// Sentinel line \
+                opening every directive repo-intelligence fragment.` \
+                doc comment immediately above its definition. Do \
+                not change any other file.";
+    let packet = build_context_packet(task, &map, &RunMemory::default(), BuildPacketOptions::default());
+    let fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
+    let (edit_targets, orientation) =
+        ContextPacketRenderer::parse_directive_file_lists(&fragment);
+
+    assert_eq!(
+        edit_targets.first().map(String::as_str),
+        Some("context-harness/src/renderer.rs"),
+        "edit target should be the renderer file, not BUILD.bazel.\n\
+         Got edit_targets: {edit_targets:?}\n\
+         Got orientation:  {orientation:?}\n\
+         Fragment:\n{fragment}"
+    );
+    assert!(
+        !edit_targets.iter().any(|p| p.contains("BUILD.bazel")),
+        "BUILD.bazel must NOT appear as an edit target for this task: \
+         {edit_targets:?}"
+    );
+}
+
+#[test]
 fn ri_packet_for_pytest_target_picks_python_rules() {
     let map = live_codex_rs_map();
     let task = "In the verification crate, find the helper that returns true \
