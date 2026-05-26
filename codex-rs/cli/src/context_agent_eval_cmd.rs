@@ -59,13 +59,71 @@ async fn run_agent_eval_score(cmd: ContextAgentEvalScoreCommand) -> Result<()> {
     let treatment_arm = resolve_treatment_arm(&cmd, &task_ids)?;
     validate_artifacts_layout(&cmd.artifacts_dir, &task_ids, treatment_arm)?;
     let mut comparisons = Vec::new();
+    let mut treatment_records = Vec::new();
     for task in &tasks {
         let vanilla = load_run_record(&cmd.artifacts_dir, &task.id, AgentArm::Vanilla)?;
         let treatment = load_run_record(&cmd.artifacts_dir, &task.id, treatment_arm)?;
         comparisons.push(compare_task(task, &vanilla, &treatment));
+        treatment_records.push(treatment);
     }
     let report = build_report(comparisons);
-    emit_report(&cmd, &report)
+    emit_report(&cmd, &report)?;
+
+    // Search-proxy runs carry per-arm interception metrics that the
+    // generic Main/Cost tables don't surface. Print a focused addendum
+    // (human mode only) so reviewers don't have to dig through
+    // record.json by hand. No-op for other treatment arms.
+    if cmd.human
+        && treatment_arm == AgentArm::SearchProxy
+        && let Some(addendum) = render_search_proxy_addendum(&treatment_records)
+    {
+        println!("{addendum}");
+    }
+    Ok(())
+}
+
+/// Format a compact Search Proxy metrics block from the treatment-arm
+/// records. Returns `None` if no record reported the proxy as enabled
+/// (e.g. the feature silently no-op'd), which is itself worth flagging.
+fn render_search_proxy_addendum(records: &[AgentRunRecord]) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    let mut lines = vec![String::new(), "==== Search proxy ====".to_string()];
+    let any_enabled = records.iter().any(|r| r.search_proxy_enabled);
+    if !any_enabled {
+        lines.push(
+            "WARNING: search_proxy feature not enabled on any treatment record \
+             (did `-c features.search_proxy=true` reach codex?)"
+                .to_string(),
+        );
+    }
+    for record in records {
+        let raw = record.search_proxy_raw_bytes_estimated;
+        let compact = record.search_proxy_compact_bytes;
+        let saved_pct = if raw > 0 {
+            format!("{:.0}%", 100.0 * (1.0 - (compact as f64 / raw as f64)))
+        } else {
+            "n/a".to_string()
+        };
+        lines.push(format!(
+            "{task}: enabled={enabled} subs={subs} escape_hatch_repeats={repeats} \
+             build_pass_throughs={passthrough} compact_bytes={compact} \
+             raw_bytes_est={raw} (compact saves {saved_pct} vs raw)",
+            task = record.task_id,
+            enabled = record.search_proxy_enabled,
+            subs = record.search_proxy_substitutions,
+            repeats = record.search_proxy_escape_hatch_repeats,
+            passthrough = record.search_proxy_build_pass_throughs,
+        ));
+        if !record.search_proxy_top_files.is_empty() {
+            lines.push(format!(
+                "  top_files: {}",
+                record.search_proxy_top_files.join(", ")
+            ));
+        }
+    }
+    Some(lines.join("\n"))
 }
 
 fn resolve_treatment_arm(
@@ -82,8 +140,11 @@ fn parse_treatment_arm(name: &str) -> Result<AgentArm> {
     match name {
         "harness" => Ok(AgentArm::Harness),
         "repo_intelligence" => Ok(AgentArm::RepoIntelligence),
+        "search_proxy" => Ok(AgentArm::SearchProxy),
         other => {
-            bail!("unknown treatment arm {other:?}; expected \"harness\" or \"repo_intelligence\"")
+            bail!(
+                "unknown treatment arm {other:?}; expected \"harness\", \"repo_intelligence\", or \"search_proxy\""
+            )
         }
     }
 }
@@ -92,24 +153,27 @@ fn detect_treatment_arm(artifacts_dir: &Path, task_ids: &[String]) -> Result<Age
     let Some(task_id) = task_ids.first() else {
         bail!("fixture has no tasks");
     };
-    let repo_intel = artifacts_dir
-        .join(task_id)
-        .join(AgentArm::RepoIntelligence.artifact_dir())
-        .join("record.json");
-    if repo_intel.is_file() {
-        return Ok(AgentArm::RepoIntelligence);
-    }
-    let harness = artifacts_dir
-        .join(task_id)
-        .join(AgentArm::Harness.artifact_dir())
-        .join("record.json");
-    if harness.is_file() {
-        return Ok(AgentArm::Harness);
+    // Detection order is the set of possible treatment arms; the first
+    // one with a record.json on disk wins. Vanilla is never a
+    // treatment arm so it's excluded here.
+    for arm in [
+        AgentArm::RepoIntelligence,
+        AgentArm::SearchProxy,
+        AgentArm::Harness,
+    ] {
+        let candidate = artifacts_dir
+            .join(task_id)
+            .join(arm.artifact_dir())
+            .join("record.json");
+        if candidate.is_file() {
+            return Ok(arm);
+        }
     }
     bail!(
-        "could not detect treatment arm under {}; expected {} or {}",
+        "could not detect treatment arm under {}; expected {}, {}, or {}",
         artifacts_dir.display(),
         AgentArm::RepoIntelligence.artifact_dir(),
+        AgentArm::SearchProxy.artifact_dir(),
         AgentArm::Harness.artifact_dir()
     );
 }
@@ -154,4 +218,69 @@ pub fn validate_artifacts_layout(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_treatment_arm_accepts_all_three_arms() {
+        assert_eq!(parse_treatment_arm("harness").unwrap(), AgentArm::Harness);
+        assert_eq!(
+            parse_treatment_arm("repo_intelligence").unwrap(),
+            AgentArm::RepoIntelligence
+        );
+        assert_eq!(
+            parse_treatment_arm("search_proxy").unwrap(),
+            AgentArm::SearchProxy
+        );
+    }
+
+    #[test]
+    fn parse_treatment_arm_rejects_unknown() {
+        let err = parse_treatment_arm("nonsense").unwrap_err().to_string();
+        assert!(err.contains("search_proxy"), "error should list the arms: {err}");
+    }
+
+    #[test]
+    fn search_proxy_addendum_reports_metrics_and_savings() {
+        let mut record = sample_search_proxy_record();
+        record.search_proxy_substitutions = 3;
+        record.search_proxy_escape_hatch_repeats = 3;
+        record.search_proxy_compact_bytes = 3_389;
+        record.search_proxy_raw_bytes_estimated = 41_218;
+        record.search_proxy_top_files = vec!["context-harness/src/agent_eval.rs".to_string()];
+        let out = render_search_proxy_addendum(&[record]).expect("addendum");
+        assert!(out.contains("==== Search proxy ===="), "{out}");
+        assert!(out.contains("subs=3"), "{out}");
+        assert!(out.contains("escape_hatch_repeats=3"), "{out}");
+        assert!(out.contains("saves 92% vs raw"), "{out}");
+        assert!(out.contains("context-harness/src/agent_eval.rs"), "{out}");
+    }
+
+    #[test]
+    fn search_proxy_addendum_warns_when_feature_never_enabled() {
+        let mut record = sample_search_proxy_record();
+        record.search_proxy_enabled = false;
+        let out = render_search_proxy_addendum(&[record]).expect("addendum");
+        assert!(
+            out.contains("WARNING: search_proxy feature not enabled"),
+            "{out}"
+        );
+    }
+
+    fn sample_search_proxy_record() -> AgentRunRecord {
+        serde_json::from_str(
+            r#"{
+                "arm": "search_proxy",
+                "task_id": "t",
+                "changed_files": [],
+                "tests_passed": false,
+                "turn_count": null,
+                "search_proxy_enabled": true
+            }"#,
+        )
+        .expect("sample record")
+    }
 }
