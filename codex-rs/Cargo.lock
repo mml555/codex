@@ -3666,6 +3666,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-search-proxy"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "shlex",
+]
+
+[[package]]
 name = "codex-secrets"
 version = "0.0.0"
 dependencies = [

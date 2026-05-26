@@ -1,0 +1,19 @@
+[package]
+name = "codex-search-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "codex_search_proxy"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+shlex = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
