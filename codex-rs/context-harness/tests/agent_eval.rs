@@ -44,6 +44,13 @@ fn synthetic_record(arm: AgentArm, task_id: &str) -> AgentRunRecord {
         formatter_changed_files: Vec::new(),
         harness_prewarm_ms: None,
         codex_build_profile: None,
+        search_proxy_enabled: matches!(arm, AgentArm::SearchProxy),
+        search_proxy_substitutions: 0,
+        search_proxy_escape_hatch_repeats: 0,
+        search_proxy_build_pass_throughs: 0,
+        search_proxy_compact_bytes: 0,
+        search_proxy_raw_bytes_estimated: 0,
+        search_proxy_top_files: Vec::new(),
         worktree_isolated: false,
         base_ref: None,
         worktree_path: None,
@@ -129,7 +136,10 @@ fn report_renders_human_summary_with_main_and_cost_tables() {
     }
     // The task row contains the canonical V vs RI values.
     assert!(text.contains("calculator_fix"), "{text}");
-    assert!(text.contains("0/1 vs 1/1"), "edit targets column missing:\n{text}");
+    assert!(
+        text.contains("0/1 vs 1/1"),
+        "edit targets column missing:\n{text}"
+    );
     assert!(text.contains("3/2"), "turns column missing:\n{text}");
     assert!(text.contains("1000/1050"), "tokens column missing:\n{text}");
     assert!(
@@ -166,8 +176,16 @@ fn ri_hard_v1_fixture_loads_with_no_prompt_naming_the_gold_file() {
             "task {} must declare workdir=codex_rs",
             t.id
         );
-        assert!(t.category.is_some(), "task {} must declare a category", t.id);
-        assert!(!t.relevant_files.is_empty(), "task {} must declare gold", t.id);
+        assert!(
+            t.category.is_some(),
+            "task {} must declare a category",
+            t.id
+        );
+        assert!(
+            !t.relevant_files.is_empty(),
+            "task {} must declare gold",
+            t.id
+        );
 
         // Anti-leak rule: the prompt MUST NOT contain any gold file path
         // as a substring. The whole point of the hard fixture is that
@@ -193,8 +211,7 @@ fn ri_hard_v1_fixture_loads_with_no_prompt_naming_the_gold_file() {
     }
     assert!(
         cats.len() >= 3,
-        "ri_hard_v1 should cover at least 3 distinct categories; got {:?}",
-        cats
+        "ri_hard_v1 should cover at least 3 distinct categories; got {cats:?}"
     );
 }
 
@@ -247,7 +264,8 @@ fn ri_v1_fixture_loads_15_tasks_across_five_categories() {
     for (cat, want) in expected {
         let got = counts.get(&cat).copied().unwrap_or(0);
         assert_eq!(
-            got, want,
+            got,
+            want,
             "category {} count: expected {}, got {}",
             cat.slug(),
             want,

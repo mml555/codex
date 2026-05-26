@@ -237,6 +237,46 @@ pub struct AgentRunRecord {
     /// from two runs that were genuinely isolated.
     #[serde(default)]
     pub worktree_path: Option<String>,
+    /// True when the codex binary was invoked with
+    /// `features.search_proxy=true` for this run. False for vanilla
+    /// arms and for any treatment whose runner forgot to flip the
+    /// flag. Recorded explicitly so reviewers can confirm the
+    /// treatment was actually applied (the rg-interception MVP
+    /// silently no-ops when the feature is off).
+    #[serde(default)]
+    pub search_proxy_enabled: bool,
+    /// Number of search-proxy `event=substitute` lines in the
+    /// codex_exec stderr. Each line corresponds to a model-issued
+    /// `rg` call where the proxy returned compact evidence instead
+    /// of raw output.
+    #[serde(default)]
+    pub search_proxy_substitutions: u32,
+    /// Number of `event=escape_hatch_repeat` lines — the model
+    /// resent a previously-substituted normalized command and got
+    /// raw `rg` output the second time.
+    #[serde(default)]
+    pub search_proxy_escape_hatch_repeats: u32,
+    /// Number of `event=build_pass_through` lines — the proxy ran
+    /// internal `rg` but declined to substitute (no matches, rg
+    /// error, runner spawn failure, or raw output already smaller
+    /// than the compact form would be).
+    #[serde(default)]
+    pub search_proxy_build_pass_throughs: u32,
+    /// Sum of `compact_bytes` across all substitutions. Total bytes
+    /// the proxy actually sent back to the model.
+    #[serde(default)]
+    pub search_proxy_compact_bytes: u64,
+    /// Sum of `raw_bytes` across all substitutions. Total bytes of
+    /// `rg --json` output the proxy consumed internally — a rough
+    /// upper bound on what the model would have seen without the
+    /// proxy.
+    #[serde(default)]
+    pub search_proxy_raw_bytes_estimated: u64,
+    /// Top-ranked file from each substitution, in invocation order.
+    /// For Run-8-style symbol searches the success signal is whether
+    /// the gold owner file appears here.
+    #[serde(default)]
+    pub search_proxy_top_files: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -257,6 +297,9 @@ pub enum AgentArm {
     Vanilla,
     Harness,
     RepoIntelligence,
+    /// Treatment arm for the search-proxy MVP. Runs codex with
+    /// `features.search_proxy=true`; vanilla arm runs without.
+    SearchProxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +320,7 @@ impl AgentArm {
             Self::Vanilla => "vanilla",
             Self::Harness => "harness",
             Self::RepoIntelligence => "repo_intelligence",
+            Self::SearchProxy => "search_proxy",
         }
     }
 
@@ -800,10 +844,10 @@ pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenU
         let Some(usage) = value.get("usage") else {
             continue;
         };
-        if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+        if let Some(n) = usage.get("input_tokens").and_then(serde_json::Value::as_i64) {
             input = input.saturating_add(n.max(0) as u64);
         }
-        if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+        if let Some(n) = usage.get("output_tokens").and_then(serde_json::Value::as_i64) {
             output = output.saturating_add(n.max(0) as u64);
         }
     }
@@ -914,7 +958,6 @@ pub struct AgentActivityCounts {
     pub verify_commands: u32,
 }
 
-
 /// Coarse classification of a single shell command into one of five phases.
 /// Returned as a static slug for both Rust scoring and the bash mirror.
 ///
@@ -956,10 +999,18 @@ pub fn classify_shell_phase(command: &str) -> &'static str {
             if has_context { "verify" } else { "discover" }
         }
         "sed" => {
-            if command.contains("-i") { "edit" } else { "other" }
+            if command.contains("-i") {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "perl" => {
-            if command.contains("-i") { "edit" } else { "other" }
+            if command.contains("-i") {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "awk" => {
             if command.contains("inplace") {
@@ -974,7 +1025,11 @@ pub fn classify_shell_phase(command: &str) -> &'static str {
         }
         "echo" | "printf" => {
             // `echo X > file` / `echo X >> file` is an edit.
-            if command.contains('>') { "edit" } else { "other" }
+            if command.contains('>') {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "mv" | "cp" | "rm" | "mkdir" | "touch" | "rmdir" | "ln" => "edit",
         "diff" => "verify",
@@ -1157,7 +1212,9 @@ fn strip_leading_cd_chains(command: &str) -> String {
     } else {
         trimmed
     };
-    let body = body.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"']);
+    let body = body
+        .trim_start_matches(['\'', '"'])
+        .trim_end_matches(['\'', '"']);
 
     let mut remaining = body.to_string();
     loop {
@@ -1367,14 +1424,12 @@ fn render_grouped_table(
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let header_cells: Vec<String> = headers.iter().map(std::string::ToString::to_string).collect();
     let separator_cells: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
 
     for category in category_order {
-        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> = rows
-            .iter()
-            .filter(|(c, _, _)| c == category)
-            .collect();
+        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> =
+            rows.iter().filter(|(c, _, _)| c == category).collect();
         if group.is_empty() {
             continue;
         }
@@ -1684,6 +1739,13 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: matches!(arm, AgentArm::SearchProxy),
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -2187,15 +2249,22 @@ mod tests {
         let text = render_agent_eval_human(&report);
 
         // Each category gets a header.
-        assert!(text.contains("== bridge_wiring =="), "missing bw header:\n{text}");
-        assert!(text.contains("== file_routing =="), "missing fr header:\n{text}");
-        assert!(text.contains("== uncategorized =="), "missing uncat header:\n{text}");
+        assert!(
+            text.contains("== bridge_wiring =="),
+            "missing bw header:\n{text}"
+        );
+        assert!(
+            text.contains("== file_routing =="),
+            "missing fr header:\n{text}"
+        );
+        assert!(
+            text.contains("== uncategorized =="),
+            "missing uncat header:\n{text}"
+        );
 
         // Each group has a per-group summary line.
-        let group_summaries: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("Group: "))
-            .collect();
+        let group_summaries: Vec<&str> =
+            text.lines().filter(|l| l.starts_with("Group: ")).collect();
         assert_eq!(
             group_summaries.len(),
             3,
@@ -2214,10 +2283,7 @@ mod tests {
         // Two tables × 3 categories = 6 "Task " header lines, with three
         // identical Main headers and three identical Cost headers (each
         // table has its own width set).
-        let header_lines: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("Task "))
-            .collect();
+        let header_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Task ")).collect();
         assert_eq!(
             header_lines.len(),
             6,
@@ -2225,8 +2291,14 @@ mod tests {
             header_lines.len()
         );
         // Both tables must be present.
-        assert!(text.contains("==== Main ===="), "Main section missing:\n{text}");
-        assert!(text.contains("==== Cost ===="), "Cost section missing:\n{text}");
+        assert!(
+            text.contains("==== Main ===="),
+            "Main section missing:\n{text}"
+        );
+        assert!(
+            text.contains("==== Cost ===="),
+            "Cost section missing:\n{text}"
+        );
     }
 
     #[test]
@@ -2368,22 +2440,37 @@ mod tests {
     #[test]
     fn classify_shell_phase_covers_common_cases() {
         // Wrapped form (`/bin/zsh -lc '<inner>'`) and bare form should agree.
-        assert_eq!(classify_shell_phase("/bin/zsh -lc 'find . -name *.rs'"), "discover");
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'find . -name *.rs'"),
+            "discover"
+        );
         assert_eq!(classify_shell_phase("find . -name '*.rs'"), "discover");
         assert_eq!(classify_shell_phase("ls -la"), "discover");
-        assert_eq!(classify_shell_phase("/bin/zsh -lc 'grep -n install foo.rs'"), "discover");
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'grep -n install foo.rs'"),
+            "discover"
+        );
         assert_eq!(classify_shell_phase("grep -A 3 pattern foo.rs"), "verify");
         assert_eq!(classify_shell_phase("grep -B 2 pattern foo.rs"), "verify");
         assert_eq!(classify_shell_phase("cat README.md"), "read");
         assert_eq!(classify_shell_phase("head -n 5 foo.rs"), "read");
         assert_eq!(classify_shell_phase("sed -i '' '1d' foo.rs"), "edit");
-        assert_eq!(classify_shell_phase("perl -i -pe 's/old/new/' foo.rs"), "edit");
-        assert_eq!(classify_shell_phase("awk 'NR==180{print}' foo.rs"), "verify");
+        assert_eq!(
+            classify_shell_phase("perl -i -pe 's/old/new/' foo.rs"),
+            "edit"
+        );
+        assert_eq!(
+            classify_shell_phase("awk 'NR==180{print}' foo.rs"),
+            "verify"
+        );
         assert_eq!(classify_shell_phase("echo content > newfile.rs"), "edit");
         assert_eq!(classify_shell_phase("mv old.rs new.rs"), "edit");
         assert_eq!(classify_shell_phase("git status"), "discover");
         assert_eq!(classify_shell_phase("git diff HEAD"), "verify");
-        assert_eq!(classify_shell_phase("python -m pytest tests/foo.py"), "other");
+        assert_eq!(
+            classify_shell_phase("python -m pytest tests/foo.py"),
+            "other"
+        );
     }
 
     #[test]
@@ -2436,7 +2523,10 @@ mod tests {
         let cells = format_cost_row(&row);
         assert_eq!(cells[0], "calculator_fix");
         assert_eq!(cells[1], "401000/405800");
-        assert_eq!(cells[2], "+4800", "Token Δ should be signed; RI +4800 tokens");
+        assert_eq!(
+            cells[2], "+4800",
+            "Token Δ should be signed; RI +4800 tokens"
+        );
         assert_eq!(cells[3], "15/7", "tool calls V/RI");
         assert_eq!(cells[4], "2/0", "discover V/RI");
         assert_eq!(cells[5], "5/1", "read V/RI");
@@ -2673,12 +2763,22 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: false,
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
         };
         let score = score_run(&record, &task);
-        assert_eq!(score.edit_target_files_hit, 1, "a.rs is in gold and touched");
+        assert_eq!(
+            score.edit_target_files_hit, 1,
+            "a.rs is in gold and touched"
+        );
         assert_eq!(score.edit_target_files_total, 1);
         // Orientation set: bridge {b} ∪ ri_orient {b,c,d} − gold {a}
         //                 = {b, c, d}
@@ -2737,13 +2837,23 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: false,
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.edit_target_files_hit, 1);
-        assert_eq!(score.orientation_files_touched, 1, "bridge wiring.rs edited");
+        assert_eq!(
+            score.orientation_files_touched, 1,
+            "bridge wiring.rs edited"
+        );
         assert_eq!(score.orientation_files_total, 1);
     }
 
@@ -2785,12 +2895,58 @@ mod tests {
         // Only RI arm carries a warning: prefix the arm.
         let t_only = AgentRunRecord {
             warnings: vec!["provider_network_error_recovered".to_string()],
-            ..treatment.clone()
+            ..treatment
         };
         let row = compare_task(&task, &vanilla, &t_only);
         assert_eq!(
             format_valid_cell(&row),
             "valid (RI: provider_network_error_recovered)"
         );
+    }
+
+    #[test]
+    fn search_proxy_record_round_trip_serde() {
+        // A record populated by the search-proxy treatment arm should
+        // serialize and deserialize without losing any of the seven
+        // new fields, and the round-trip should equal the source.
+        let original = AgentRunRecord {
+            search_proxy_enabled: true,
+            search_proxy_substitutions: 4,
+            search_proxy_escape_hatch_repeats: 1,
+            search_proxy_build_pass_throughs: 2,
+            search_proxy_compact_bytes: 3_840,
+            search_proxy_raw_bytes_estimated: 9_120,
+            search_proxy_top_files: vec![
+                "context-harness/src/agent_eval.rs".to_string(),
+                "context-harness/src/renderer.rs".to_string(),
+            ],
+            ..synthetic_record(AgentArm::SearchProxy, "round_trip_task")
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let round_tripped: AgentRunRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn search_proxy_record_loads_legacy_records_without_proxy_fields() {
+        // Pre-Commit-4 record.json files (the four cloud pairs from
+        // the RI experiment) have none of the search_proxy_* keys.
+        // `#[serde(default)]` should make them load with zeros / empty
+        // vec.
+        let legacy = r#"{
+            "arm": "vanilla",
+            "task_id": "legacy",
+            "changed_files": [],
+            "tests_passed": false,
+            "turn_count": null
+        }"#;
+        let rec: AgentRunRecord = serde_json::from_str(legacy).expect("legacy parse");
+        assert!(!rec.search_proxy_enabled);
+        assert_eq!(rec.search_proxy_substitutions, 0);
+        assert_eq!(rec.search_proxy_escape_hatch_repeats, 0);
+        assert_eq!(rec.search_proxy_build_pass_throughs, 0);
+        assert_eq!(rec.search_proxy_compact_bytes, 0);
+        assert_eq!(rec.search_proxy_raw_bytes_estimated, 0);
+        assert!(rec.search_proxy_top_files.is_empty());
     }
 }

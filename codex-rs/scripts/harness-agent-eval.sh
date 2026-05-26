@@ -17,6 +17,7 @@ ARTIFACTS_DIR=""
 RUN_AGENT=0
 RESCORE_ARTIFACTS_DIR=""
 SESSION_INJECTION=0
+SEARCH_PROXY_MODE=0
 VERBOSE=0
 ISOLATED_WORKTREES=0
 BASE_REF="HEAD"
@@ -138,6 +139,14 @@ while [[ $# -gt 0 ]]; do
       SESSION_INJECTION=1
       shift
       ;;
+    --with-search-proxy)
+      # Treatment arm enables `features.search_proxy=true` on codex
+      # and is scored under arm name `search_proxy`. Mutually
+      # exclusive with `--session-injection` — we deliberately do
+      # NOT combine search proxy with repo intelligence in MVP runs.
+      SEARCH_PROXY_MODE=1
+      shift
+      ;;
     --verbose)
       VERBOSE=1
       shift
@@ -164,6 +173,7 @@ while [[ $# -gt 0 ]]; do
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
+            | --with-search-proxy \
             | --isolated-worktrees | --base-ref | --cargo-target-dir | --max-target-dir-gb \
             | --cloud-args \
             | --verbose | -h | --help) break ;;
@@ -182,6 +192,7 @@ while [[ $# -gt 0 ]]; do
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --codex-bin | --artifacts-dir | --fixture | --run | --session-injection \
+            | --with-search-proxy \
             | --isolated-worktrees | --base-ref | --cargo-target-dir | --max-target-dir-gb \
             | --oss \
             | --verbose | -h | --help) break ;;
@@ -206,6 +217,12 @@ done
 
 if [[ "${SESSION_INJECTION}" -eq 1 && "${FIXTURE_EXPLICIT}" -eq 0 ]]; then
   TASK_FIXTURE="${CODEX_SESSION_TASK_FIXTURE}"
+fi
+
+if [[ "${SESSION_INJECTION}" -eq 1 && "${SEARCH_PROXY_MODE}" -eq 1 ]]; then
+  echo "--session-injection and --with-search-proxy are mutually exclusive" >&2
+  echo "(do not combine repo intelligence with search proxy in MVP runs)" >&2
+  exit 2
 fi
 
 resolve_isolation_base() {
@@ -608,6 +625,98 @@ print("\n".join(orientation), end="")
 PY
 }
 
+# Parse codex's stderr log for search-proxy tracing events. Emits SIX
+# fields delimited by ASCII Unit Separator (\x1f):
+#   <substitutions> \x1f <escape_hatch_repeats> \x1f <build_pass_throughs>
+#   \x1f <compact_bytes_sum> \x1f <raw_bytes_sum> \x1f <top_files_newline_joined>
+#
+# Each `event=substitute` line contributes one substitution, plus its
+# compact_bytes / raw_bytes / top_file fields. `event=escape_hatch_repeat`
+# and `event=build_pass_through` are counted only. Everything else is
+# ignored, including unrelated tracing output from other targets.
+#
+# Robust to:
+#   - missing stderr file (returns all zeros / empty top_files)
+#   - lines without the `search_proxy:` target tag
+#   - quoted field values that contain spaces
+#   - field ordering (extracts by name, not position)
+extract_search_proxy_metrics() {
+  local stderr_log="$1"
+  python3 - "${stderr_log}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+stderr_path = Path(sys.argv[1])
+
+# Tokenize key=value pairs from a tracing-fmt structured line. Values
+# may be bare (no spaces), `"quoted with spaces"`, or `?Debug`-style
+# (the `?` prefix appears for fields rendered via `field = ?value`).
+FIELD_RE = re.compile(r'(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
+
+
+def parse_fields(line: str) -> dict:
+    out: dict = {}
+    for m in FIELD_RE.finditer(line):
+        key, quoted, bare = m.group(1), m.group(2), m.group(3)
+        value = quoted if quoted is not None else bare
+        # Strip trailing punctuation that may glue onto a bare value
+        # (e.g. trailing commas / periods from the message body).
+        if value and value[-1] in ",.":
+            value = value[:-1]
+        out[key] = value
+    return out
+
+
+substitutions = 0
+escape_hatch_repeats = 0
+build_pass_throughs = 0
+compact_bytes_sum = 0
+raw_bytes_sum = 0
+top_files: list[str] = []
+
+if stderr_path.exists():
+    with stderr_path.open(encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if "search_proxy" not in line or "event=" not in line:
+                continue
+            fields = parse_fields(line)
+            event = fields.get("event")
+            if event == "substitute":
+                substitutions += 1
+                try:
+                    compact_bytes_sum += int(fields.get("compact_bytes", "0"))
+                except ValueError:
+                    pass
+                try:
+                    raw_bytes_sum += int(fields.get("raw_bytes", "0"))
+                except ValueError:
+                    pass
+                top = fields.get("top_file") or ""
+                if top:
+                    top_files.append(top)
+            elif event == "escape_hatch_repeat":
+                escape_hatch_repeats += 1
+            elif event == "build_pass_through":
+                build_pass_throughs += 1
+
+print(
+    "\x1f".join(
+        [
+            str(substitutions),
+            str(escape_hatch_repeats),
+            str(build_pass_throughs),
+            str(compact_bytes_sum),
+            str(raw_bytes_sum),
+            "\n".join(top_files),
+        ]
+    ),
+    end="",
+)
+PY
+}
+
 classify_run_validity() {
   local events="$1"
   local exec_exit="$2"
@@ -742,10 +851,13 @@ write_record() {
   # positional surface bounded. `serde(default)` on the Rust side accepts
   # records that lack any of these keys.
   local repo_intel_enabled=false
+  local search_proxy_enabled=false
   local harness_visible
   harness_visible="$(harness_context_visible_for_run "${events}")"
   if [[ "${arm}" == "repo_intelligence" ]]; then
     repo_intel_enabled=true
+  elif [[ "${arm}" == "search_proxy" ]]; then
+    search_proxy_enabled=true
   fi
   # RI-surfaced file lists (edit targets + orientation) parsed from the
   # rollout's directive prompt. Empty unless the rollout carries the
@@ -773,6 +885,7 @@ write_record() {
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events}")" \
+  RECORD_SEARCH_PROXY_ENABLED="${search_proxy_enabled}" \
   python3 - "${out}" "${arm}" "${task_id}" "${changed_json}" "${tests_passed}" "${turn_count}" "${exec_exit}" "${repo_intel_enabled}" "${harness_visible}" "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}" <<'PY'
 import json, os, sys
 (
@@ -848,6 +961,20 @@ record = {
     ],
     "ri_surfaced_orientation": [
         p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
+    ],
+    # Search-proxy MVP metrics (Commit 4). Sourced from
+    # `extract_search_proxy_metrics`, which scans the codex_exec
+    # stderr log for `tracing::info!(target="search_proxy", ...)` events.
+    # All counts are 0 / Vec::new() on arms where the feature is off
+    # or no `rg` invocations were intercepted.
+    "search_proxy_enabled": os.environ.get("RECORD_SEARCH_PROXY_ENABLED") == "true",
+    "search_proxy_substitutions": opt_env_int("RECORD_SEARCH_PROXY_SUBSTITUTIONS") or 0,
+    "search_proxy_escape_hatch_repeats": opt_env_int("RECORD_SEARCH_PROXY_ESCAPE_HATCH_REPEATS") or 0,
+    "search_proxy_build_pass_throughs": opt_env_int("RECORD_SEARCH_PROXY_BUILD_PASS_THROUGHS") or 0,
+    "search_proxy_compact_bytes": opt_env_int("RECORD_SEARCH_PROXY_COMPACT_BYTES") or 0,
+    "search_proxy_raw_bytes_estimated": opt_env_int("RECORD_SEARCH_PROXY_RAW_BYTES_ESTIMATED") or 0,
+    "search_proxy_top_files": [
+        p for p in os.environ.get("RECORD_SEARCH_PROXY_TOP_FILES", "").split("\n") if p
     ],
     "worktree_isolated": os.environ.get("RECORD_WORKTREE_ISOLATED") == "true",
     # See bottom of this dict literal — `intent_changed_files`,
@@ -1191,9 +1318,13 @@ ${task_text}"
   # The repo_intelligence arm needs features.repo_intelligence=true regardless
   # of provider mode. Without it the extension early-returns on the gate
   # check and the RI arm reduces to vanilla — invalidating the entire A/B.
+  # search_proxy is the parallel toggle for the rg-interception MVP and
+  # is mutually exclusive with RI in this script.
   local feature_args=()
   if [[ "${arm}" == "repo_intelligence" ]]; then
     feature_args=(-c features.repo_intelligence=true)
+  elif [[ "${arm}" == "search_proxy" ]]; then
+    feature_args=(-c features.search_proxy=true)
   fi
   # `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under `set -u`
   # (bash 3.x on macOS treats an empty `${arr[@]}` as unbound).
@@ -1207,8 +1338,13 @@ ${task_text}"
   # instead of running `RepoMapBuilder::build` synchronously at
   # session start (the source of the ~170s pre-model gap measured
   # in the area-package-alias gated pairs).
+  # RUST_LOG: include the search-proxy target so the stderr scraper
+  # downstream can count `event=substitute` / `escape_hatch_repeat` /
+  # `build_pass_through` lines per arm. The RI extension target stays
+  # in the directive too so RI-arm rollouts continue to log
+  # contribute() timings.
   CODEX_REPO_INTELLIGENCE_CACHED_MAP="${SHARED_REPO_MAP_PATH:-}" \
-  RUST_LOG="${RUST_LOG:-codex_repo_intelligence_extension=info}" \
+  RUST_LOG="${RUST_LOG:-codex_repo_intelligence_extension=info,search_proxy=info}" \
   "${CODEX_BIN}" exec ${OSS_ARGS[@]+"${OSS_ARGS[@]}"} ${CLOUD_EXTRA_ARGS[@]+"${CLOUD_EXTRA_ARGS[@]}"} ${feature_args[@]+"${feature_args[@]}"} -s workspace-write \
     --dangerously-bypass-approvals-and-sandbox \
     --json \
@@ -1265,6 +1401,13 @@ ${task_text}"
   if [[ "${run_valid}" == "true" ]]; then
     invalid_reason=""
   fi
+  # Parse search-proxy tracing events from the stderr log. Empty / all
+  # zeros for arms where the feature is off (vanilla, harness, RI).
+  local sp_metrics
+  sp_metrics="$(extract_search_proxy_metrics "${ARTIFACTS_DIR}/${task_id}/${arm}/codex_exec.stderr.log")"
+  local sp_subs sp_repeats sp_passthrough sp_compact sp_raw sp_top
+  IFS=$'\x1f' read -r sp_subs sp_repeats sp_passthrough sp_compact sp_raw sp_top <<<"${sp_metrics}"
+
   RECORD_WORKTREE_ISOLATED="${worktree_isolated}" \
   RECORD_BASE_REF="${base_ref}" \
   RECORD_WORKTREE_PATH="${workdir}" \
@@ -1278,6 +1421,12 @@ ${task_text}"
   RECORD_EDIT_COMMAND_COUNT="${edit_command_count}" \
   RECORD_VERIFY_COMMAND_COUNT="${verify_command_count}" \
   RECORD_WARNINGS="${warnings_csv}" \
+  RECORD_SEARCH_PROXY_SUBSTITUTIONS="${sp_subs:-0}" \
+  RECORD_SEARCH_PROXY_ESCAPE_HATCH_REPEATS="${sp_repeats:-0}" \
+  RECORD_SEARCH_PROXY_BUILD_PASS_THROUGHS="${sp_passthrough:-0}" \
+  RECORD_SEARCH_PROXY_COMPACT_BYTES="${sp_compact:-0}" \
+  RECORD_SEARCH_PROXY_RAW_BYTES_ESTIMATED="${sp_raw:-0}" \
+  RECORD_SEARCH_PROXY_TOP_FILES="${sp_top:-}" \
   write_record "${ARTIFACTS_DIR}/${task_id}/${arm}/record.json" "${arm}" "${task_id}" \
     "${changed_json}" "${tests_passed}" "${turns}" "${exec_exit}" "${events}" \
     "${run_valid}" "${invalid_reason}" "${tokens_input}" "${tokens_output}" "${tokens_total}"
@@ -1341,9 +1490,22 @@ rescore_record() {
   ri_surfaced="$(extract_ri_surfaced_files "${events_path}")"
   local ri_edit_targets ri_orientation
   IFS=$'\x1f' read -r ri_edit_targets ri_orientation <<<"${ri_surfaced}"
+  # Re-scrape search-proxy metrics from the stderr log. Empty / zeros
+  # for arms that ran before Commit 4 or with the feature off.
+  local sp_metrics
+  sp_metrics="$(extract_search_proxy_metrics "${record_dir}/codex_exec.stderr.log")"
+  local sp_subs sp_repeats sp_passthrough sp_compact sp_raw sp_top
+  IFS=$'\x1f' read -r sp_subs sp_repeats sp_passthrough sp_compact sp_raw sp_top <<<"${sp_metrics}"
+
   RECORD_RI_SURFACED_EDIT_TARGETS="${ri_edit_targets}" \
   RECORD_RI_SURFACED_ORIENTATION="${ri_orientation}" \
   RECORD_INTENT_CHANGED_FILES="$(extract_intent_changed_files "${events_path}")" \
+  RECORD_SEARCH_PROXY_SUBSTITUTIONS="${sp_subs:-0}" \
+  RECORD_SEARCH_PROXY_ESCAPE_HATCH_REPEATS="${sp_repeats:-0}" \
+  RECORD_SEARCH_PROXY_BUILD_PASS_THROUGHS="${sp_passthrough:-0}" \
+  RECORD_SEARCH_PROXY_COMPACT_BYTES="${sp_compact:-0}" \
+  RECORD_SEARCH_PROXY_RAW_BYTES_ESTIMATED="${sp_raw:-0}" \
+  RECORD_SEARCH_PROXY_TOP_FILES="${sp_top:-}" \
   python3 - "${record_path}" "${run_valid}" "${invalid_reason}" "${warnings_csv}" "${harness_visible}" \
     "${tool_call_count}" "${shell_command_count}" "${file_read_count}" \
     "${discover_command_count}" "${edit_command_count}" "${verify_command_count}" <<'PY'
@@ -1371,6 +1533,17 @@ rec["ri_surfaced_edit_targets"] = [
 ]
 rec["ri_surfaced_orientation"] = [
     p for p in os.environ.get("RECORD_RI_SURFACED_ORIENTATION", "").split("\n") if p
+]
+def _env_int(name):
+    raw = os.environ.get(name, "")
+    return int(raw) if raw not in ("", "null") else 0
+rec["search_proxy_substitutions"] = _env_int("RECORD_SEARCH_PROXY_SUBSTITUTIONS")
+rec["search_proxy_escape_hatch_repeats"] = _env_int("RECORD_SEARCH_PROXY_ESCAPE_HATCH_REPEATS")
+rec["search_proxy_build_pass_throughs"] = _env_int("RECORD_SEARCH_PROXY_BUILD_PASS_THROUGHS")
+rec["search_proxy_compact_bytes"] = _env_int("RECORD_SEARCH_PROXY_COMPACT_BYTES")
+rec["search_proxy_raw_bytes_estimated"] = _env_int("RECORD_SEARCH_PROXY_RAW_BYTES_ESTIMATED")
+rec["search_proxy_top_files"] = [
+    p for p in os.environ.get("RECORD_SEARCH_PROXY_TOP_FILES", "").split("\n") if p
 ]
 # Intent / diff / formatter triplet. Mirrors write_record's assembly.
 intent_paths = [
@@ -1511,6 +1684,9 @@ if [[ "${RUN_AGENT}" -eq 1 ]]; then
     if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
       run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
       run_arm repo_intelligence "${id}" "${task}" "${verify}" "${workdir_kind}"
+    elif [[ "${SEARCH_PROXY_MODE}" -eq 1 ]]; then
+      run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
+      run_arm search_proxy "${id}" "${task}" "${verify}" "${workdir_kind}"
     else
       run_arm vanilla "${id}" "${task}" "${verify}" "${workdir_kind}"
       run_arm harness "${id}" "${task}" "${verify}" "${workdir_kind}"
@@ -1533,6 +1709,8 @@ fi
 SCORE_ARGS=(--fixture "${TASK_FIXTURE}" --artifacts-dir "${ARTIFACTS_DIR}" --human)
 if [[ "${SESSION_INJECTION}" -eq 1 ]]; then
   SCORE_ARGS+=(--treatment-arm repo_intelligence)
+elif [[ "${SEARCH_PROXY_MODE}" -eq 1 ]]; then
+  SCORE_ARGS+=(--treatment-arm search_proxy)
 fi
 
 "${CODEX_BIN}" context agent-eval score "${SCORE_ARGS[@]}"
