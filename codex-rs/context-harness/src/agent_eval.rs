@@ -38,6 +38,23 @@ pub struct AgentEvalTask {
     /// a final "uncategorized" group.
     #[serde(default)]
     pub category: Option<TaskCategory>,
+    /// Whether this task naturally REQUIRES the model to verify its
+    /// change (e.g. compile + run targeted tests). The first set of
+    /// release-mode pairs revealed that "should the model run
+    /// `just test`?" was a much bigger driver of wall-clock and token
+    /// cost than the RI directive itself — vanilla skipping
+    /// verification on a simple doc-comment task produced an
+    /// 11x wall-clock difference vs RI. Tagging fixtures lets the
+    /// report split metrics by task class so verification-optional
+    /// and verification-required pairs are compared separately.
+    ///
+    /// `None` for pre-instrumentation fixtures (default). Use
+    /// `Some(true)` when the task adds assertions, behavior changes,
+    /// or new tests where both arms naturally need to confirm the
+    /// result. Use `Some(false)` for pure routing / doc-only tasks
+    /// where verification is optional.
+    #[serde(default)]
+    pub verification_required: Option<bool>,
 }
 
 /// What aspect of repo intelligence a task is meant to exercise. Used purely
@@ -1202,6 +1219,7 @@ impl AgentEvalTask {
             bridge_files: fixture.bridge_files.clone(),
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         }
     }
 }
@@ -1632,6 +1650,7 @@ mod tests {
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         }
     }
 
@@ -1848,6 +1867,7 @@ mod tests {
             bridge_files: Vec::new(),
             workdir: AgentEvalWorkdir::CodexRs,
             category: None,
+            verification_required: None,
         };
         let record = AgentRunRecord {
             changed_files: vec!["codex-rs/cli/src/context_cmd.rs".to_string()],
@@ -1873,6 +1893,7 @@ mod tests {
             bridge_files: vec!["cli/src/main.rs".to_string()],
             workdir: AgentEvalWorkdir::CodexRs,
             category: None,
+            verification_required: None,
         };
         let record = AgentRunRecord {
             changed_files: vec!["codex-rs/cli/src/main.rs".to_string()],
@@ -2532,6 +2553,7 @@ mod tests {
             verify_command: None,
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         };
         let mut record = synthetic_record(AgentArm::RepoIntelligence, &task.id);
         // Diff sees: gold + bridge + 7 fmt-drift files.
@@ -2586,6 +2608,7 @@ mod tests {
             verify_command: None,
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         };
         let mut record = synthetic_record(AgentArm::Vanilla, &task.id);
         record.changed_files = vec!["gold.rs".to_string(), "other.rs".to_string()];
@@ -2611,6 +2634,7 @@ mod tests {
             verify_command: None,
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         };
         let record = AgentRunRecord {
             arm: AgentArm::RepoIntelligence,
@@ -2682,6 +2706,7 @@ mod tests {
             verify_command: None,
             workdir: AgentEvalWorkdir::Calculator,
             category: None,
+            verification_required: None,
         };
         let record = AgentRunRecord {
             arm: AgentArm::Vanilla,
