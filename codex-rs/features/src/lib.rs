@@ -200,6 +200,11 @@ pub enum Feature {
     WorkspaceDependencies,
     /// Inject harness-native repo context packets into session prompts.
     RepoIntelligence,
+    /// Intercept simple model-initiated `rg` invocations and return
+    /// compact evidence instead of raw `rg` output. Separate from
+    /// [`Feature::RepoIntelligence`]; experimental MVP gated for the
+    /// `search-proxy-mvp` branch.
+    SearchProxy,
 
     // Removed
     /// Removed compatibility flag retained as a no-op so old configs can
@@ -1196,6 +1201,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RepoIntelligence,
         key: "repo_intelligence",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::SearchProxy,
+        key: "search_proxy",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

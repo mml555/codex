@@ -17,6 +17,7 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::search_proxy::intercept_search_proxy;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
@@ -143,6 +144,17 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         tool_name.name.as_str(),
     )
     .await?
+    {
+        return Ok(output);
+    }
+
+    // Intercept simple `rg` invocations via the search proxy. Gated
+    // on `Feature::SearchProxy`; declines (returns `Ok(None)`) for any
+    // command that doesn't classify as eligible, has already been
+    // substituted once in this session, or where the proxy decided
+    // raw output was already smaller than the compact form.
+    if let Some(output) =
+        intercept_search_proxy(&hook_command, exec_params.cwd.as_path(), session.as_ref()).await?
     {
         return Ok(output);
     }
