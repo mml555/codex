@@ -1,0 +1,183 @@
+[
+  {
+    "id": "route_install_to_extension",
+    "category": "file_routing",
+    "workdir": "codex_rs",
+    "task": "Add a one-line `// Registers this extension as ContextContributor / ThreadLifecycleContributor / TurnInputContributor.` doc comment immediately above the function in the repo-intelligence crate that calls `registry.thread_lifecycle_contributor(extension.clone())`. Do not change any other file.",
+    "relevant_files": [
+      "ext/repo-intelligence/src/extension.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "route_pytest_target_check",
+    "category": "file_routing",
+    "workdir": "codex_rs",
+    "task": "In the verification crate, find the helper that returns true when a path matches the narrow single-file pytest target shape (`tests/test_X.py` only, no globs, no `::`, no extra args). Add a `// Narrow single-file pytest target gate.` doc comment immediately above its definition. Do not change any other file.",
+    "relevant_files": [
+      "verification/src/python_rules.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "route_directive_marker",
+    "category": "file_routing",
+    "workdir": "codex_rs",
+    "task": "The constant whose literal text starts every model-visible repo-intelligence prompt fragment (so other code can detect that the harness reached the model) lives in exactly one file in the context-harness crate. Add a `// Sentinel line opening every directive repo-intelligence fragment.` doc comment immediately above its definition. Do not change any other file.",
+    "relevant_files": [
+      "context-harness/src/renderer.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "bridge_extension_to_app_server_registry",
+    "category": "bridge_wiring",
+    "workdir": "codex_rs",
+    "task": "The repo-intelligence extension is registered into the codex app-server's extension registry. Add a `// Registered in app-server/src/extensions.rs.` comment above the `install` function in the extension's own crate. Also add a `// Registers codex-repo-intelligence-extension.` comment above the call site in the app-server crate that registers it.",
+    "relevant_files": [
+      "ext/repo-intelligence/src/extension.rs"
+    ],
+    "bridge_files": [
+      "app-server/src/extensions.rs"
+    ],
+    "danger_zones": []
+  },
+  {
+    "id": "bridge_cli_to_context_harness_renderer",
+    "category": "bridge_wiring",
+    "workdir": "codex_rs",
+    "task": "The `codex context build` CLI subcommand renders prompt fragments by calling into the context-harness crate's ContextPacketRenderer. Add a `// Renders via context-harness::ContextPacketRenderer.` comment above the function in the CLI crate that handles the `context build` subcommand. Also add a `// Called from cli/src/context_cmd.rs.` comment above `render_prompt_fragment` in the context-harness renderer.",
+    "relevant_files": [
+      "cli/src/context_cmd.rs"
+    ],
+    "bridge_files": [
+      "context-harness/src/renderer.rs"
+    ],
+    "danger_zones": []
+  },
+  {
+    "id": "bridge_verification_to_repo_index",
+    "category": "bridge_wiring",
+    "workdir": "codex_rs",
+    "task": "The verification planner consumes a RepoMap defined in the repo-index crate. Add a `// RepoMap comes from repo-index/src/repo_map.rs.` comment above the function in the verification crate that builds the verification plan. Also add a `// Consumed by verification/src/rules.rs::build_verification_plan.` comment above the RepoMap struct definition.",
+    "relevant_files": [
+      "verification/src/rules.rs"
+    ],
+    "bridge_files": [
+      "repo-index/src/repo_map.rs"
+    ],
+    "danger_zones": []
+  },
+  {
+    "id": "targeted_test_python_rules",
+    "category": "test_targeting",
+    "workdir": "codex_rs",
+    "task": "Add a single new `#[test]` function `narrow_pytest_target_rejects_pytest_glob` to the integration test file in the verification crate that already covers python-rules planning. The new test must assert that `codex_verification::python_rules::narrow_pytest_file_target(\"python -m pytest tests/*.py\")` returns `None`. Do not modify any source file.",
+    "relevant_files": [
+      "verification/tests/plan_python.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": [
+      "verification/src/python_rules.rs"
+    ]
+  },
+  {
+    "id": "targeted_test_directive_header",
+    "category": "test_targeting",
+    "workdir": "codex_rs",
+    "task": "Add a regression test to the existing packet_golden integration test file in the context-harness crate. The test must build a context packet for any non-empty task on the restaurant fixture map and assert that the first non-empty line of `ContextPacketRenderer::render_prompt_fragment(&packet)` is exactly the string `Harness repo intelligence:`. Name it `directive_fragment_first_line_is_harness_marker`. Do not modify the renderer.",
+    "relevant_files": [
+      "context-harness/tests/packet_golden.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": [
+      "context-harness/src/renderer.rs"
+    ]
+  },
+  {
+    "id": "targeted_test_agent_eval_excluded",
+    "category": "test_targeting",
+    "workdir": "codex_rs",
+    "task": "Add a unit test inside the `#[cfg(test)] mod tests` block of the agent_eval module that asserts `classify_result` returns an `AgentEvalResult::Excluded` variant whenever `valid_for_comparison=false`, regardless of the score arguments. Name the test `classify_result_excluded_when_pair_invalid`.",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "convention_add_area_package_alias",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "task": "Inside the verification crate there is a static array that maps area-id prefixes (like `\"cli\"`) to Cargo package names (like `\"codex-cli\"`). Add a new entry mapping `\"protocol\"` \u2192 `\"codex-protocol\"`, keeping the existing tuple shape and alphabetic ordering.",
+    "relevant_files": [
+      "verification/src/rules.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "convention_add_feature_flag_spec",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "task": "Add a new feature flag to the central feature registry: enum variant `RepoIntelligenceTelemetry`, key `\"repo_intelligence_telemetry\"`, stage `UnderDevelopment`, default disabled. Follow the existing pattern used by every other Feature variant + FeatureSpec entry in the same file. Do not touch any consumer crate.",
+    "relevant_files": [
+      "features/src/lib.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "convention_add_invalid_reason_variant",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "task": "Add a new variant `ProviderRateLimit` to the `AgentRunInvalidReason` enum in the context-harness crate, and wire its slug `\"provider_rate_limit\"` into the `invalid_reason_slug` helper. Match the existing snake_case convention used by every sibling variant.",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  },
+  {
+    "id": "cross_feature_gated_extension_log",
+    "category": "cross_module_ownership",
+    "workdir": "codex_rs",
+    "task": "Add a new feature flag `RepoIntelligenceLogging` (key `\"repo_intelligence_logging\"`, stage `UnderDevelopment`, default disabled) in the central feature registry. Then, in the repo-intelligence extension's `contribute` method, emit a single `tracing::debug!` line gated on the new flag being enabled in the active config. Do not change any other crate.",
+    "relevant_files": [
+      "features/src/lib.rs"
+    ],
+    "bridge_files": [
+      "ext/repo-intelligence/src/extension.rs"
+    ],
+    "danger_zones": []
+  },
+  {
+    "id": "cross_invalid_reason_with_classifier",
+    "category": "cross_module_ownership",
+    "workdir": "codex_rs",
+    "task": "Add a new `ProviderRateLimit` variant to the `AgentRunInvalidReason` enum in the context-harness crate (wired into `invalid_reason_slug` as `\"provider_rate_limit\"`). Then update the bash agent-eval runner's `classify_run_validity` python block so any error message matching `rate limit` or `too many requests` (case-insensitive) classifies as `provider_rate_limit` rather than `provider_usage_limit`. Both edits are required.",
+    "relevant_files": [
+      "context-harness/src/agent_eval.rs"
+    ],
+    "bridge_files": [
+      "scripts/harness-agent-eval.sh"
+    ],
+    "danger_zones": []
+  },
+  {
+    "id": "cross_expose_planner_command",
+    "category": "cross_module_ownership",
+    "workdir": "codex_rs",
+    "task": "In the repo-intelligence extension crate, add a new `pub fn narrow_verification_command(task: &str, map: &RepoMap, packet: &ContextPacket) -> Option<PlannedCommand>` that returns the same planned command `narrow_verification_hint` formats. Re-export it from the crate's `lib.rs`. The existing `narrow_verification_hint` should continue to call this new helper internally (so its output is unchanged).",
+    "relevant_files": [
+      "ext/repo-intelligence/src/extension.rs"
+    ],
+    "bridge_files": [
+      "ext/repo-intelligence/src/lib.rs"
+    ],
+    "danger_zones": []
+  }
+]

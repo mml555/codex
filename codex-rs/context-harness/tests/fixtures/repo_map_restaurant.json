@@ -1,0 +1,81 @@
+{
+  "version": 2,
+  "repo_id": "fixture-restaurant-search",
+  "root": "/fixture",
+  "files": [
+    {
+      "path": "backend/routes/restaurants.py",
+      "signals": {
+        "confidence": 0.78,
+        "tags": ["route"],
+        "summary": "Restaurant search API route",
+        "evidence": ["path:routes", "path:restaurants"]
+      }
+    },
+    {
+      "path": "backend/services/restaurant_search.py",
+      "signals": {
+        "confidence": 0.72,
+        "tags": ["services"],
+        "summary": "Restaurant search service logic",
+        "evidence": ["path:services", "path:restaurant", "path:search"]
+      }
+    }
+  ],
+  "tests": [
+    {
+      "path": "tests/api/test_restaurants.py",
+      "confidence": 0.85,
+      "related_paths": ["backend/routes/restaurants.py"],
+      "reason": "covers restaurant search endpoint"
+    },
+    {
+      "path": "tests/services/test_restaurant_search.py",
+      "confidence": 0.82,
+      "related_paths": ["backend/services/restaurant_search.py"],
+      "reason": "covers restaurant search service"
+    }
+  ],
+  "areas": [
+    {
+      "name": "routes",
+      "paths": ["backend/routes/restaurants.py"],
+      "confidence": 0.7
+    }
+  ],
+  "packages": [],
+  "area_maps": [
+    {
+      "area_id": "backend",
+      "root_paths": ["backend/"],
+      "owned_files": [
+        "backend/routes/restaurants.py",
+        "backend/services/restaurant_search.py"
+      ],
+      "test_paths": [
+        "tests/api/test_restaurants.py",
+        "tests/services/test_restaurant_search.py"
+      ],
+      "related_cli_paths": [],
+      "negative_paths": [],
+      "confidence": 0.85
+    }
+  ],
+  "commands": [],
+  "test_map": [
+    {
+      "source_path": "backend/routes/restaurants.py",
+      "test_paths": ["tests/api/test_restaurants.py"],
+      "confidence": 0.85,
+      "evidence": ["covers restaurant search endpoint"]
+    },
+    {
+      "source_path": "backend/services/restaurant_search.py",
+      "test_paths": ["tests/services/test_restaurant_search.py"],
+      "confidence": 0.82,
+      "evidence": ["covers restaurant search service"]
+    }
+  ],
+  "agents_md": "Do not touch ranking logic unless required.",
+  "warnings": []
+}

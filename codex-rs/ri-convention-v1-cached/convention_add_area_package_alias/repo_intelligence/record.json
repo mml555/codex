@@ -1,0 +1,76 @@
+{
+  "arm": "repo_intelligence",
+  "task_id": "convention_add_area_package_alias",
+  "changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/assembler.rs",
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/context-harness/tests/ri_packet_regressions.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/src/extension.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/verification/src/planner.rs",
+    "codex-rs/verification/src/rules.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": true,
+  "harness_context_visible": true,
+  "run_valid": true,
+  "invalid_reason": null,
+  "tokens_input": 387513,
+  "tokens_output": 2180,
+  "tokens_total": 389693,
+  "duration_ms": 189786,
+  "tool_call_count": 13,
+  "shell_command_count": 6,
+  "file_read_count": 0,
+  "discover_command_count": 1,
+  "edit_command_count": 1,
+  "verify_command_count": 1,
+  "warnings": [],
+  "harness_prewarm_ms": 87270,
+  "ri_surfaced_edit_targets": [
+    "verification/src/rules.rs"
+  ],
+  "ri_surfaced_orientation": [
+    "ri-convention-v1-repeat/convention_add_area_package_alias/repo_intelligence/events.jsonl"
+  ],
+  "worktree_isolated": true,
+  "base_ref": "db10939505e49d5cfd11a4a2bf891870f5d70928",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.FlZ3LqWd8m/codex-rs",
+  "intent_changed_files": [
+    "verification/src/rules.rs"
+  ],
+  "diff_changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/assembler.rs",
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/context-harness/tests/ri_packet_regressions.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/src/extension.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/verification/src/planner.rs",
+    "codex-rs/verification/src/rules.rs"
+  ],
+  "formatter_changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/assembler.rs",
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/context-harness/tests/ri_packet_regressions.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/src/extension.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/verification/src/planner.rs"
+  ]
+}

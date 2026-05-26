@@ -12,13 +12,25 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 
-pub(crate) fn thread_extensions<S>(guardian_agent_spawner: S) -> Arc<ExtensionRegistry<Config>>
+pub(crate) fn thread_extensions<S>(
+    guardian_agent_spawner: S,
+    _config: &Config,
+) -> Arc<ExtensionRegistry<Config>>
 where
     S: AgentSpawner<StartThreadOptions, Spawned = NewThread, Error = CodexErr> + 'static,
 {
     let mut builder = ExtensionRegistryBuilder::<Config>::new();
     codex_guardian::install(&mut builder, guardian_agent_spawner);
     codex_memories_extension::install(&mut builder);
+    // Always register; feature gating happens in extension config/contribute paths.
+    codex_repo_intelligence_extension::install(&mut builder);
+    Arc::new(builder.build())
+}
+
+/// Builds the prompt-only extension registry used by debug prompt assembly.
+pub fn repo_intelligence_prompt_extensions() -> Arc<ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    codex_repo_intelligence_extension::install(&mut builder);
     Arc::new(builder.build())
 }
 

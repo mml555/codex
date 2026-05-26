@@ -1,0 +1,53 @@
+[
+  {
+    "task": "make context diff-prompt self-contained without env vars",
+    "gold_files": [
+      "cli/src/context_cmd.rs",
+      "core/src/prompt_debug.rs",
+      "context-harness/src/prompt_paths.rs"
+    ],
+    "bridge_files": [
+      "cli/src/context_cmd.rs",
+      "core/src/prompt_debug.rs"
+    ],
+    "gold_tests": [],
+    "danger_zones": ["cli main.rs dispatch", "unrelated MCP wiring"]
+  },
+  {
+    "task": "add codex context-harness eval command with fixture metrics",
+    "gold_files": [
+      "cli/src/context_cmd.rs",
+      "context-harness/src/eval.rs",
+      "context-harness/src/metrics.rs"
+    ],
+    "bridge_files": ["cli/src/context_cmd.rs"],
+    "gold_tests": ["context-harness/tests/eval_codex_fixtures.rs"],
+    "danger_zones": ["repo-index builder", "golden packet snapshots"]
+  },
+  {
+    "task": "wire repo intelligence extension into session prompt assembly",
+    "gold_files": [
+      "ext/repo-intelligence/src/extension.rs",
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "bridge_files": [
+      "app-server/src/extensions.rs",
+      "core/src/session/mod.rs"
+    ],
+    "gold_tests": [
+      "ext/repo-intelligence/tests/contributor_injection.rs"
+    ],
+    "danger_zones": ["turn.rs", "full wiremock responses suite"]
+  },
+  {
+    "task": "improve context packet prompt fragment rendering for models",
+    "gold_files": [
+      "context-harness/src/renderer.rs",
+      "context-harness/tests/packet_golden.rs"
+    ],
+    "bridge_files": [],
+    "gold_tests": ["context-harness/tests/packet_golden.rs"],
+    "danger_zones": ["TUI context_harness_panel", "JSON packet schema"]
+  }
+]

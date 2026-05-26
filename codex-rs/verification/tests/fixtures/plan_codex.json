@@ -1,0 +1,31 @@
+[
+  {
+    "changed_files": ["context-harness/src/metrics.rs"],
+    "expected_commands": ["cargo test -p codex-context-harness"],
+    "forbidden_substrings": ["cargo test --workspace"]
+  },
+  {
+    "changed_files": ["cli/src/context_cmd.rs"],
+    "expected_commands": [
+      "cargo test -p codex-cli",
+      "cargo test -p codex-context-harness"
+    ],
+    "forbidden_substrings": ["cargo test --workspace"]
+  },
+  {
+    "changed_files": ["core/src/prompt_debug.rs"],
+    "expected_commands": ["cargo test -p codex-core"],
+    "forbidden_substrings": ["cargo test --workspace", "cargo test -p codex-tui"]
+  },
+  {
+    "changed_files": ["ext/repo-intelligence/src/extension.rs"],
+    "expected_commands": ["cargo test -p codex-repo-intelligence-extension"],
+    "forbidden_substrings": ["cargo test --workspace"]
+  },
+  {
+    "changed_files": ["context-harness/tests/eval_codex_fixtures.rs"],
+    "expected_commands": ["cargo test -p codex-context-harness"],
+    "task": "add codex context-harness eval command with fixture metrics",
+    "forbidden_substrings": ["cargo test --workspace"]
+  }
+]

@@ -156,6 +156,22 @@ pub(crate) async fn run_turn(
         return None;
     }
 
+    // Extensions only act on user input; `ResponseInputItem` variants
+    // (mailbox messages, sub-agent replies) bypass the contributor chain.
+    // This mirrors the same projection used later in `build_skills_and_plugins`.
+    let extension_input: Vec<UserInput> = input
+        .iter()
+        .filter_map(|item| match item {
+            TurnInput::UserInput(content) => Some(content.as_slice()),
+            TurnInput::ResponseInputItem(_) => None,
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    sess.services
+        .extensions
+        .prepare_turn_input(&sess.services.thread_extension_data, &extension_input);
+
     sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 

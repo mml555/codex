@@ -1,0 +1,33 @@
+[
+  {
+    "id": "renderer_prompt_fragment",
+    "workdir": "codex_rs",
+    "task": "improve context packet prompt fragment rendering for models",
+    "relevant_files": [
+      "context-harness/src/renderer.rs",
+      "context-harness/tests/packet_golden.rs"
+    ],
+    "bridge_files": [],
+    "relevant_tests": ["context-harness/tests/packet_golden.rs"],
+    "verify_command": "cargo test -p codex-context-harness packet_golden -q"
+  },
+  {
+    "id": "verification_pytest_safety",
+    "workdir": "codex_rs",
+    "task": "tighten verification pytest command safety for narrow test targets",
+    "relevant_files": [
+      "verification/src/python_rules.rs",
+      "verification/src/command_exec.rs"
+    ],
+    "bridge_files": ["verification/src/command_exec.rs"],
+    "verify_command": "cargo test -p codex-verification --test plan_python -q"
+  },
+  {
+    "id": "harness_eval_runner_flag",
+    "workdir": "codex_rs",
+    "task": "document harness-agent-eval session-injection mode and codex_rs workdir in the runner script",
+    "relevant_files": ["scripts/harness-agent-eval.sh"],
+    "bridge_files": ["scripts/harness-agent-eval.sh", "context-harness/src/agent_eval.rs"],
+    "verify_command": "cargo test -p codex-context-harness agent_eval -q"
+  }
+]

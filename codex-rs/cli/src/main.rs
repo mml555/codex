@@ -43,6 +43,8 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod context_agent_eval_cmd;
+mod context_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -51,6 +53,7 @@ mod mcp_cmd;
 mod plugin_cmd;
 mod remote_control_cmd;
 mod state_db_recovery;
+mod verification_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -193,6 +196,13 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// Harness-native repo context tools.
+    #[clap(visible_alias = "context-harness")]
+    Context(context_cmd::ContextCli),
+
+    /// Deterministic post-edit verification planning (no test execution).
+    Verification(verification_cmd::VerificationCli),
 }
 
 #[derive(Debug, Parser)]
@@ -1380,6 +1390,22 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             run_exec_server_command(cmd, &arg0_paths, &root_config_overrides, strict_config)
                 .await?;
         }
+        Some(Subcommand::Context(cmd)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "context",
+            )?;
+            context_cmd::run_context_command(cmd).await?;
+        }
+        Some(Subcommand::Verification(cmd)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "verification",
+            )?;
+            verification_cmd::run_verification_command(cmd).await?;
+        }
         Some(Subcommand::Features(FeaturesCli { sub })) => match sub {
             FeaturesSubcommand::List => {
                 reject_remote_mode_for_subcommand(
@@ -1707,7 +1733,13 @@ async fn run_debug_prompt_input_command(
         });
     }
 
-    let prompt_input = codex_core::build_prompt_input(config, input, /*state_db*/ None).await?;
+    let prompt_input = codex_core::build_prompt_input_with_extensions(
+        config,
+        input,
+        /*state_db*/ None,
+        codex_app_server::repo_intelligence_prompt_extensions(),
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&prompt_input)?);
 
     Ok(())
@@ -1866,6 +1898,8 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
+        Some(Subcommand::Context(_)) => Some("context"),
+        Some(Subcommand::Verification(_)) => Some("verification"),
     }
 }
 

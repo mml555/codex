@@ -1,0 +1,17 @@
+[
+  {
+    "task": "fix restaurant search pagination",
+    "gold_files": [
+      "backend/routes/restaurants.py",
+      "backend/services/restaurant_search.py"
+    ],
+    "gold_tests": ["tests/api/test_restaurants.py"],
+    "danger_zones": ["legacy v4 routes", "ranking logic"]
+  },
+  {
+    "task": "add loading state to marketplace cards",
+    "gold_files": ["frontend/components/marketplace_card.tsx"],
+    "gold_tests": ["frontend/components/marketplace_card.test.tsx"],
+    "danger_zones": ["unrelated checkout flow"]
+  }
+]

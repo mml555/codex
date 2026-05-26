@@ -103,6 +103,7 @@ mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
+pub use crate::extensions::repo_intelligence_prompt_extensions;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::auth::AppServerWebsocketAuthArgs;

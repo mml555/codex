@@ -6905,6 +6905,8 @@ async fn make_multi_agent_v2_usage_hint_test_session(
 
 struct PromptExtensionTestContributor;
 struct PromptExtensionTestState;
+struct PromptExtensionTurnInputTestContributor;
+struct PromptExtensionTurnInputTestState(String);
 
 impl codex_extension_api::ContextContributor for PromptExtensionTestContributor {
     fn contribute<'a>(
@@ -6933,6 +6935,58 @@ fn prompt_extension_test_registry()
 -> Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>> {
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
     builder.prompt_contributor(Arc::new(PromptExtensionTestContributor));
+    Arc::new(builder.build())
+}
+
+impl codex_extension_api::TurnInputContributor for PromptExtensionTurnInputTestContributor {
+    fn prepare_turn_input(
+        &self,
+        thread_store: &codex_extension_api::ExtensionData,
+        input: &[UserInput],
+    ) {
+        let text = input
+            .iter()
+            .filter_map(|item| match item {
+                UserInput::Text { text, .. } => Some(text.trim()),
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            thread_store.insert(PromptExtensionTurnInputTestState(text));
+        }
+    }
+}
+
+impl codex_extension_api::ContextContributor for PromptExtensionTurnInputTestContributor {
+    fn contribute<'a>(
+        &'a self,
+        _session_store: &'a codex_extension_api::ExtensionData,
+        thread_store: &'a codex_extension_api::ExtensionData,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<codex_extension_api::PromptFragment>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            thread_store
+                .get::<PromptExtensionTurnInputTestState>()
+                .map(|state| {
+                    vec![codex_extension_api::PromptFragment::new(
+                        codex_extension_api::PromptSlot::ContextualUser,
+                        format!("turn input contribution: {}", state.0),
+                    )]
+                })
+                .unwrap_or_default()
+        })
+    }
+}
+
+fn prompt_extension_turn_input_test_registry()
+-> Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>> {
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    let contributor = Arc::new(PromptExtensionTurnInputTestContributor);
+    builder.turn_input_contributor(contributor.clone());
+    builder.prompt_contributor(contributor);
     Arc::new(builder.build())
 }
 
@@ -6971,6 +7025,30 @@ async fn build_initial_context_omits_prompt_fragments_without_extension_state() 
             .flatten()
             .any(|text| *text == "prompt extension enabled"),
         "did not expect prompt extension developer text, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_prompt_input_primes_turn_input_extensions_before_context_assembly() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    session.services.extensions = prompt_extension_turn_input_test_registry();
+
+    let prompt_input = crate::prompt_debug::build_prompt_input_from_session(
+        &session,
+        vec![UserInput::Text {
+            text: "review repo map".to_string(),
+            text_elements: Vec::new(),
+        }],
+    )
+    .await
+    .expect("prompt input should build");
+
+    let user_messages = user_input_texts(&prompt_input);
+    assert!(
+        user_messages
+            .iter()
+            .any(|text| text.contains("turn input contribution: review repo map")),
+        "expected turn input contribution in contextual user prompt, got {user_messages:?}"
     );
 }
 

@@ -12,6 +12,7 @@ use crate::ExtensionData;
 mod prompt;
 mod thread_lifecycle;
 mod tool_lifecycle;
+mod turn_input;
 mod turn_lifecycle;
 
 pub use prompt::PromptFragment;
@@ -24,6 +25,7 @@ pub use tool_lifecycle::ToolCallSource;
 pub use tool_lifecycle::ToolFinishInput;
 pub use tool_lifecycle::ToolLifecycleFuture;
 pub use tool_lifecycle::ToolStartInput;
+pub use turn_input::TurnInputContributor;
 pub use turn_lifecycle::TurnAbortInput;
 pub use turn_lifecycle::TurnStartInput;
 pub use turn_lifecycle::TurnStopInput;

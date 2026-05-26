@@ -1,0 +1,27 @@
+{
+  "arm": "repo_intelligence",
+  "task_id": "route_install_to_extension",
+  "changed_files": [
+    "codex-rs/ext/repo-intelligence/src/extension.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": true,
+  "harness_context_visible": true,
+  "run_valid": true,
+  "invalid_reason": null,
+  "tokens_input": 316996,
+  "tokens_output": 1431,
+  "tokens_total": 318427,
+  "duration_ms": 789232,
+  "tool_call_count": 11,
+  "shell_command_count": 9,
+  "file_read_count": 2,
+  "worktree_isolated": true,
+  "base_ref": "266c2c870ce42d4aef9ba6ac1dfbb80f200388e7",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.GrkHiG4dt9/codex-rs",
+  "discover_command_count": 2,
+  "edit_command_count": 4,
+  "verify_command_count": 1
+}

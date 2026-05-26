@@ -1,0 +1,40 @@
+//! Deterministic verification planning and guarded narrow test execution.
+
+mod command_exec;
+mod eval;
+mod output;
+mod planner;
+pub mod python_rules;
+mod rules;
+mod runner;
+mod selector;
+
+pub use eval::PlanEvalFixture;
+pub use eval::PlanEvalReport;
+pub use eval::PlanEvalResult;
+pub use eval::load_plan_fixtures;
+pub use eval::render_plan_eval_summary;
+pub use eval::run_plan_eval;
+pub use eval::score_plan_fixture;
+pub use output::DEFAULT_MAX_RELEVANT_OUTPUT_CHARS;
+pub use output::DEFAULT_MAX_STREAM_CHARS;
+pub use planner::PlanRequest;
+pub use planner::PlanScope;
+pub use planner::PlannedCommand;
+pub use planner::SkippedCommand;
+pub use planner::VerificationPlan;
+pub use planner::VerificationPlanner;
+pub use planner::VerificationRisk;
+pub use runner::CommandRunResult;
+pub use runner::FailurePacket;
+pub use runner::RunOptions;
+pub use runner::VerificationRunReport;
+pub use runner::VerificationRunStatus;
+pub use runner::cancelled_run_report;
+pub use runner::is_safe_to_run;
+pub use runner::render_run_human;
+pub use runner::run_verification_plan;
+pub use runner::runnable_narrow_commands;
+pub use runner::verification_exit_code;
+pub use selector::TestSelector;
+pub use selector::VerificationCommand;

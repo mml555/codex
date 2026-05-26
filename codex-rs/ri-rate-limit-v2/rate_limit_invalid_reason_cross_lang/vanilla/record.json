@@ -1,0 +1,62 @@
+{
+  "arm": "vanilla",
+  "task_id": "rate_limit_invalid_reason_cross_lang",
+  "changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/scripts/harness-agent-eval.sh",
+    "codex-rs/verification/src/planner.rs"
+  ],
+  "tests_passed": false,
+  "turn_count": 1,
+  "exec_exit_code": 0,
+  "repo_intelligence_enabled": false,
+  "harness_context_visible": false,
+  "run_valid": true,
+  "invalid_reason": null,
+  "tokens_input": 1090165,
+  "tokens_output": 8895,
+  "tokens_total": 1099060,
+  "duration_ms": 311052,
+  "tool_call_count": 35,
+  "shell_command_count": 26,
+  "file_read_count": 1,
+  "discover_command_count": 7,
+  "edit_command_count": 2,
+  "verify_command_count": 9,
+  "warnings": [],
+  "ri_surfaced_edit_targets": [],
+  "ri_surfaced_orientation": [],
+  "worktree_isolated": true,
+  "base_ref": "24d3931866033af8a863d1fcc134da03776e6f1f",
+  "worktree_path": "/var/folders/bn/jq675y6x5m1d1x83vyh99f5c0000gn/T/codex-arm-XXXXXX.6xI3umXbcA/codex-rs",
+  "intent_changed_files": [
+    "context-harness/src/agent_eval.rs",
+    "scripts/harness-agent-eval.sh"
+  ],
+  "diff_changed_files": [
+    "codex-rs/context-harness/src/agent_eval.rs",
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/scripts/harness-agent-eval.sh",
+    "codex-rs/verification/src/planner.rs"
+  ],
+  "formatter_changed_files": [
+    "codex-rs/context-harness/src/lib.rs",
+    "codex-rs/context-harness/src/renderer.rs",
+    "codex-rs/context-harness/src/task_terms.rs",
+    "codex-rs/context-harness/tests/agent_eval.rs",
+    "codex-rs/core/src/lib.rs",
+    "codex-rs/ext/repo-intelligence/tests/contributor_injection.rs",
+    "codex-rs/verification/src/planner.rs"
+  ]
+}

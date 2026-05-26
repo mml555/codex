@@ -1,0 +1,381 @@
+use std::path::Path;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use anyhow::Result;
+use clap::Parser;
+use codex_context_harness::BuildPacketOptions;
+use codex_context_harness::ContextPacketRenderer;
+use codex_context_harness::RunMemory;
+use codex_context_harness::TokenBudget;
+use codex_context_harness::build_context_packet;
+use codex_context_harness::estimate_tokens_from_prompt_json;
+use codex_context_harness::extract_paths_from_prompt_json;
+use codex_context_harness::load_eval_fixtures;
+use codex_context_harness::render_eval_human;
+use codex_context_harness::render_eval_summary;
+use codex_context_harness::run_eval;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigOverrides;
+use codex_core::config::LoaderOverrides;
+use codex_protocol::user_input::UserInput;
+use codex_repo_index::RepoIndexCache;
+use codex_repo_index::RepoMapBuilder;
+use codex_repo_index::RepoMapBuilderOptions;
+use codex_utils_home_dir::find_codex_home;
+use codex_verification::PlanRequest;
+use codex_verification::VerificationPlanner;
+
+#[derive(Debug, Parser)]
+pub struct ContextCli {
+    #[command(subcommand)]
+    pub subcommand: ContextSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum ContextSubcommand {
+    /// Build a harness context packet for a task (JSON).
+    Build(ContextBuildCommand),
+    /// Compare harness packet paths against vanilla prompt-input.
+    DiffPrompt(ContextDiffPromptCommand),
+    /// Run fixture-based harness metrics (recall, waste, test accuracy).
+    Eval(ContextEvalCommand),
+    /// Score vanilla vs harness-context agent runs from offline artifacts.
+    AgentEval(crate::context_agent_eval_cmd::ContextAgentEvalCli),
+    /// Dump the raw repo index (RepoMap) for the current cwd to JSON.
+    /// Used by the eval runner to prewarm a shared cache so each arm's
+    /// `codex exec` session can load the map via the
+    /// `CODEX_REPO_INTELLIGENCE_CACHED_MAP` env var instead of rebuilding
+    /// it from scratch in a fresh worktree (which took ~170 seconds on
+    /// the codex-rs tree, per the area-package-alias gated runs).
+    DumpRepoIndex(ContextDumpRepoIndexCommand),
+}
+
+#[derive(Debug, Parser)]
+pub struct ContextDumpRepoIndexCommand {
+    /// Repository working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Path to write the JSON-serialized RepoMap. If omitted, writes
+    /// to stdout.
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
+    /// Rebuild the repo index instead of using the on-disk cache.
+    #[arg(long)]
+    pub refresh_index: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ContextBuildCommand {
+    /// Task description.
+    pub task: String,
+    /// Repository working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Write JSON output to a file instead of stdout.
+    #[arg(long)]
+    pub json_out: Option<PathBuf>,
+    /// Rebuild the repo index instead of using cache.
+    #[arg(long)]
+    pub refresh_index: bool,
+    /// Print human-readable debug output.
+    #[arg(long)]
+    pub human: bool,
+    /// Print only the model-visible prompt fragment.
+    #[arg(long)]
+    pub prompt_fragment: bool,
+    /// Token budget limit for context packing.
+    #[arg(long, default_value_t = 12_000)]
+    pub token_budget: u32,
+    /// Changed file paths used when attaching a verification plan.
+    #[arg(long = "changed")]
+    pub changed: Vec<String>,
+    /// Include a deterministic verification plan in JSON output.
+    #[arg(long)]
+    pub with_verification_plan: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ContextDiffPromptCommand {
+    /// Task description.
+    pub task: String,
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    #[arg(long)]
+    pub refresh_index: bool,
+    #[arg(long)]
+    pub token_budget: Option<u32>,
+    /// Print a short human-readable summary instead of JSON only.
+    #[arg(long)]
+    pub human: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct ContextEvalCommand {
+    /// JSON fixture with labeled tasks (see context-harness/tests/fixtures/tasks.json).
+    #[arg(long)]
+    pub fixture: PathBuf,
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    #[arg(long)]
+    pub refresh_index: bool,
+    /// Use a static RepoMap JSON for all tasks (skips repo indexing).
+    #[arg(long)]
+    pub map_fixture: Option<PathBuf>,
+    /// Emit per-task JSON instead of summary lines.
+    #[arg(long)]
+    pub json: bool,
+    /// Per-task metrics with missed gold paths and extras.
+    #[arg(long)]
+    pub human: bool,
+    #[arg(long, default_value_t = 12_000)]
+    pub token_budget: u32,
+}
+
+pub async fn run_context_command(command: ContextCli) -> Result<()> {
+    match command.subcommand {
+        ContextSubcommand::Build(cmd) => run_context_build(cmd).await,
+        ContextSubcommand::DiffPrompt(cmd) => run_context_diff_prompt(cmd).await,
+        ContextSubcommand::Eval(cmd) => run_context_eval(cmd).await,
+        ContextSubcommand::AgentEval(cmd) => {
+            crate::context_agent_eval_cmd::run_context_agent_eval(cmd).await
+        }
+        ContextSubcommand::DumpRepoIndex(cmd) => run_context_dump_repo_index(cmd).await,
+    }
+}
+
+pub async fn run_context_dump_repo_index(cmd: ContextDumpRepoIndexCommand) -> Result<()> {
+    let cwd = resolve_cwd(cmd.cwd)?;
+    let map = load_or_build_map(&cwd, cmd.refresh_index)?;
+    let json = serde_json::to_string_pretty(&map)?;
+    match cmd.json_out {
+        Some(path) => {
+            std::fs::write(&path, json.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        None => {
+            println!("{json}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_context_build(cmd: ContextBuildCommand) -> Result<()> {
+    let cwd = resolve_cwd(cmd.cwd)?;
+    let map = load_or_build_map(&cwd, cmd.refresh_index)?;
+    let build_options = BuildPacketOptions {
+        token_budget: TokenBudget {
+            limit: cmd.token_budget,
+        },
+        ..BuildPacketOptions::default()
+    };
+
+    let packet = build_context_packet(&cmd.task, &map, &RunMemory::default(), build_options);
+
+    let output = if cmd.prompt_fragment {
+        ContextPacketRenderer::render_prompt_fragment(&packet)
+    } else if cmd.human {
+        ContextPacketRenderer::render_human_debug(&packet)
+    } else if cmd.with_verification_plan {
+        let plan = if cmd.changed.is_empty() {
+            VerificationPlanner::plan_with_request(
+                &map,
+                &PlanRequest {
+                    task: Some(cmd.task.clone()),
+                    changed_paths: Vec::new(),
+                },
+            )
+        } else {
+            VerificationPlanner::plan_with_context(
+                &map,
+                &PlanRequest {
+                    task: Some(cmd.task.clone()),
+                    changed_paths: cmd.changed.clone(),
+                },
+                &packet,
+            )
+        };
+        serde_json::to_string_pretty(&serde_json::json!({
+            "packet": packet,
+            "verification_plan": plan,
+        }))?
+    } else {
+        ContextPacketRenderer::render_json(&packet)?
+    };
+
+    if let Some(path) = cmd.json_out {
+        std::fs::write(&path, &output).with_context(|| format!("write {}", path.display()))?;
+    } else {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+pub async fn run_context_diff_prompt(cmd: ContextDiffPromptCommand) -> Result<()> {
+    let cwd = resolve_cwd(cmd.cwd)?;
+    let map = load_self_contained_map(&cwd, cmd.refresh_index)?;
+    let options = BuildPacketOptions {
+        token_budget: TokenBudget {
+            limit: cmd.token_budget.unwrap_or(12_000),
+        },
+        ..BuildPacketOptions::default()
+    };
+    let packet = build_context_packet(&cmd.task, &map, &RunMemory::default(), options);
+    let harness_paths: std::collections::BTreeSet<String> = packet
+        .included_paths()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let vanilla_json = build_vanilla_prompt_json(&cmd.task, &cwd).await?;
+    let vanilla_paths = extract_paths_from_prompt_json(&vanilla_json);
+    let vanilla_token_estimate = estimate_tokens_from_prompt_json(&vanilla_json);
+
+    let harness_fragment = ContextPacketRenderer::render_prompt_fragment(&packet);
+    let overlap = harness_paths.intersection(&vanilla_paths).count();
+    let report = serde_json::json!({
+        "task": cmd.task,
+        "harness_included_paths": harness_paths.iter().collect::<Vec<_>>(),
+        "vanilla_paths": vanilla_paths.iter().collect::<Vec<_>>(),
+        "overlap": harness_paths.intersection(&vanilla_paths).collect::<Vec<_>>(),
+        "harness_only": harness_paths.difference(&vanilla_paths).collect::<Vec<_>>(),
+        "vanilla_only": vanilla_paths.difference(&harness_paths).collect::<Vec<_>>(),
+        "harness_token_estimate": packet.token_budget.used_estimate,
+        "vanilla_token_estimate": vanilla_token_estimate,
+        "dropped_count": packet.decision_log.dropped.len(),
+        "budget_exhausted_count": packet.decision_log.budget_exhausted.len(),
+        "harness_prompt_fragment": harness_fragment,
+    });
+
+    if cmd.human {
+        println!(
+            "task: {}\nharness paths: {} | vanilla paths: {} | overlap: {}\nharness tokens: {} | vanilla tokens: {}\nharness-only: {}\nvanilla-only: {}",
+            cmd.task,
+            harness_paths.len(),
+            vanilla_paths.len(),
+            overlap,
+            packet.token_budget.used_estimate,
+            vanilla_token_estimate,
+            harness_paths.difference(&vanilla_paths).count(),
+            vanilla_paths.difference(&harness_paths).count(),
+        );
+        println!("\n--- harness prompt fragment ---\n{harness_fragment}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    }
+    Ok(())
+}
+
+pub async fn run_context_eval(cmd: ContextEvalCommand) -> Result<()> {
+    let map = if let Some(path) = cmd.map_fixture {
+        load_map_fixture(&path)?
+    } else {
+        let cwd = resolve_cwd(cmd.cwd)?;
+        load_or_build_map(&cwd, cmd.refresh_index)?
+    };
+    let fixtures = load_eval_fixtures(&cmd.fixture)?;
+    let report = run_eval(
+        &fixtures,
+        &map,
+        BuildPacketOptions {
+            token_budget: TokenBudget {
+                limit: cmd.token_budget,
+            },
+            ..BuildPacketOptions::default()
+        },
+    );
+
+    if cmd.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if cmd.human {
+        println!("{}", render_eval_human(&report));
+    } else {
+        println!("{}", render_eval_summary(&report));
+    }
+    Ok(())
+}
+
+async fn build_vanilla_prompt_json(task: &str, cwd: &Path) -> Result<String> {
+    let codex_home = tempfile::TempDir::new().context("create isolated Codex home")?;
+    write_self_contained_config(codex_home.path())?;
+
+    let overrides = ConfigOverrides {
+        cwd: Some(cwd.to_path_buf()),
+        ephemeral: Some(true),
+        ..Default::default()
+    };
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(self_contained_loader_overrides(codex_home.path()))
+        .harness_overrides(overrides)
+        .build()
+        .await?;
+    let input = vec![UserInput::Text {
+        text: task.replace("\r\n", "\n").replace('\r', "\n"),
+        text_elements: Vec::new(),
+    }];
+    let prompt_input = codex_core::build_prompt_input_self_contained(config, input, None).await?;
+    Ok(serde_json::to_string(&prompt_input)?)
+}
+
+fn write_self_contained_config(codex_home: &Path) -> Result<()> {
+    let mut config = toml::map::Map::new();
+    config.insert(
+        "sqlite_home".to_string(),
+        toml::Value::String(codex_home.join("sqlite").to_string_lossy().into_owned()),
+    );
+    config.insert(
+        "log_dir".to_string(),
+        toml::Value::String(codex_home.join("log").to_string_lossy().into_owned()),
+    );
+    std::fs::write(
+        codex_home.join("config.toml"),
+        toml::to_string(&toml::Value::Table(config))?,
+    )
+    .with_context(|| format!("write isolated config in {}", codex_home.display()))?;
+    Ok(())
+}
+
+fn self_contained_loader_overrides(codex_home: &Path) -> LoaderOverrides {
+    let isolated_config_dir = codex_home.join("host-config");
+    LoaderOverrides {
+        managed_config_path: Some(isolated_config_dir.join("managed_config.toml")),
+        system_config_path: Some(isolated_config_dir.join("config.toml")),
+        system_requirements_path: Some(isolated_config_dir.join("requirements.toml")),
+        ignore_managed_requirements: true,
+        #[cfg(target_os = "macos")]
+        managed_preferences_base64: Some(String::new()),
+        macos_managed_config_requirements_base64: Some(String::new()),
+        ..Default::default()
+    }
+}
+
+fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
+    Ok(cwd.unwrap_or_else(|| std::env::current_dir().expect("cwd")))
+}
+
+fn load_map_fixture(path: &Path) -> Result<codex_repo_index::RepoMap> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_self_contained_map(cwd: &Path, refresh: bool) -> Result<codex_repo_index::RepoMap> {
+    RepoMapBuilder::build_with_options(
+        cwd,
+        RepoMapBuilderOptions {
+            refresh,
+            cache: None,
+        },
+    )
+}
+
+fn load_or_build_map(cwd: &Path, refresh: bool) -> Result<codex_repo_index::RepoMap> {
+    let cache = RepoIndexCache::new(find_codex_home()?.as_path());
+    RepoMapBuilder::build_with_options(
+        cwd,
+        RepoMapBuilderOptions {
+            refresh,
+            cache: Some(cache),
+        },
+    )
+}

@@ -1,0 +1,17 @@
+[
+  {
+    "changed_files": ["src/calculator.py"],
+    "expected_commands": ["python -m pytest tests/test_calculator.py"],
+    "forbidden_substrings": ["cargo test"]
+  },
+  {
+    "changed_files": ["tests/test_calculator.py"],
+    "expected_commands": ["python -m pytest tests/test_calculator.py"],
+    "forbidden_substrings": ["cargo test"]
+  },
+  {
+    "changed_files": ["src/unknown.py"],
+    "expected_commands": [],
+    "forbidden_substrings": ["cargo test", "python -m pytest"]
+  }
+]

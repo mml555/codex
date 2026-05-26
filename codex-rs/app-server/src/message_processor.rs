@@ -310,7 +310,10 @@ impl MessageProcessor {
                 auth_manager.clone(),
                 session_source,
                 environment_manager,
-                thread_extensions(guardian_agent_spawner(thread_manager.clone())),
+                thread_extensions(
+                    guardian_agent_spawner(thread_manager.clone()),
+                    config.as_ref(),
+                ),
                 Some(analytics_events_client.clone()),
                 Arc::clone(&thread_store),
                 state_db.clone(),
