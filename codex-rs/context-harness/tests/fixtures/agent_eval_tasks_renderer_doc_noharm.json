@@ -1,0 +1,14 @@
+[
+  {
+    "id": "noharm_named_file_doc_comment",
+    "category": "local_convention",
+    "workdir": "codex_rs",
+    "verification_required": false,
+    "task": "In context-harness/src/renderer.rs, add a one-line `///` doc comment directly above the `shorten_for_prompt` function describing what it does. Do not change any other file and do not change the function body.",
+    "relevant_files": [
+      "context-harness/src/renderer.rs"
+    ],
+    "bridge_files": [],
+    "danger_zones": []
+  }
+]

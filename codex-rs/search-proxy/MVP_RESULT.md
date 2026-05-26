@@ -3,7 +3,9 @@
 **Branch:** `search-proxy-mvp`
 **Date:** 2026-05-26
 **Status:** Real positive signal on symbol-heavy discovery tasks (2 clean
-wins across 2 crates). No-harm/easy-case behavior not yet tested.
+wins across 2 crates) + a mechanism-level no-harm pass (proxy stays
+inert when no eligible search occurs). MVP earned a write-up; cloud
+runs paused.
 
 ---
 
@@ -133,63 +135,115 @@ substitutions and went straight to `rules.rs`. The 3/3 → 0/2 drop
 suggests the Run2 escape-hatch wrinkle was partly a symptom of wrong
 ranking, not just format.
 
+### Run5 — no-harm / named-file task
+
+Safety check: does the proxy interfere when it isn't needed? Prompt
+names the file directly (`context-harness/src/renderer.rs`, add a doc
+comment above `shorten_for_prompt`), so no discovery is required.
+
+```
+                       vanilla     search_proxy    delta
+tokens_total           257,858        520,634    +102% (2x)
+duration_ms             40,825        243,590    +497% (6x)
+tool_call_count              8             17
+edit / verify              1/1            2/2
+intent_changed_files renderer.rs ✓ renderer.rs ✓  both correct
+substitutions / escape_hatch / build_pass_through   0 / 0 / 0  (proxy never fired)
+```
+
+> On the no-harm named-file task, Search Proxy did not activate at all,
+> so it introduced no direct proxy behavior. The treatment arm still
+> cost more because the model independently entered a verification loop.
+> This makes the cost comparison confounded, but the mechanism-level
+> no-harm check passed.
+
+The model's only rg was `rg "shorten_for_prompt" renderer.rs && sed …`
+— `&&`-chained, which the classifier correctly rejects as ineligible.
+There were no standalone eligible rg commands, so the proxy stayed
+inert (0 of every metric, 0 tracing). The 2x/6x arm cost is the
+search_proxy arm running `just fmt` + `just test` (a ~3-min compile)
+and two edit/verify cycles while vanilla skipped verification — the
+same "model strategy variance dominates the cost ledger" confound the
+RI eval flagged.
+
 ---
 
-## Conclusion
+## Result summary
 
 ```
-Run2  agent_eval.rs   -54%   top_file ✓   escape-hatch 3/3
-Run4  rules.rs        -22%   top_file ✓   escape-hatch 0/2
+Run2  agent_eval.rs   -54% tokens   top_file ✓   same intent file   escape-hatch 3/3
+Run3  rules.rs         -4% (noise)  top_file ✗ (pre-fix)            escape-hatch 1/1
+Run4  rules.rs        -22% tokens   top_file ✓   same intent file   escape-hatch 0/2
+Run5  renderer.rs     proxy inert   no-harm mechanism pass; cost confounded by verify variance
 ```
 
-Two clean wins, two different crates, two different symbol vocabularies,
-correct top file and correct intent edit both times. **Search Proxy is
-promising on symbol-heavy discovery tasks** — the kind where the model
-must locate an owner file from concept/symbol language. It both reduces
-paid context and avoids the wrong-upfront-hint failure that sank RI.
+Two clean wins across two crates and two symbol vocabularies (correct
+top file + correct intent edit both times), plus a mechanism-level
+no-harm pass. **Search Proxy is promising on symbol-heavy discovery
+tasks and stays inert when no eligible search occurs** — but the claim
+is still narrow (see below).
 
 ---
 
-## Caveats / not yet proven
+## Key findings
 
-- **No-harm on easy cases (the open question).** Both wins were tasks
-  where discovery mattered. We have NOT tested a task where the prompt
-  already names the file — the proxy must not tax runs that don't need
-  it. This is the next eval.
-- **Wall-clock.** +7% (Run2) / flat (Run4). The proxy runs a bounded
-  internal `rg` before answering. Acceptable so far; watch it.
-- **The result classifier verdict.** The eval still prints
-  `ri_worse:faster_wall_clock` because the comparison logic penalizes
-  tiny wall-clock deltas and ignores token deltas. Misleading for a
-  token-dominant treatment. Fix later with a treatment-aware classifier
-  and thresholds (ignore <5% / <5s deltas); raw metrics are clear
-  enough for now.
-- **Single-run samples.** One A/B per task; no repeat-variance bounds.
+- **Reactive mediation beats upfront RI.** Answering at the moment of
+  the tool call grounds on real matches and structurally avoids RI's
+  wrong-upfront-hint failure (and when the hint is wrong, the escape
+  hatch makes it cheap — Run3 was -4%, not RI Run 8's +404%).
+- **Correct compact evidence can be trusted by the model.** Run4's
+  0/2 escape-hatch rate (vs Run2's 3/3 with the same format but
+  wrong-then-right ranking) shows the model accepts evidence it
+  believes is correct.
+- **Ranking quality matters.** The binary Owner classifier with an
+  alphabetical tiebreak mis-ranked the gold file to #3 (Run3); a
+  within-tier relevance score fixed it (Run4).
+- **Repo pollution skews raw-search estimates.** Committed `ri-*`
+  artifact dirs inflated Run3's raw match pool to 4.2 MB; untracking
+  them dropped Run4 to 62 KB.
+- **Verification variance is the biggest unrelated confound.** Whether
+  the model runs `just test` swings wall-clock and tokens far more than
+  the proxy does on easy tasks (Run5). Single-sample A/Bs can't
+  separate it from proxy effect.
+- **Still narrow: `rg` only.** No `sed` / file-read / test
+  interception. No RI combination.
 
 ---
 
-## Next eval (decided)
+## What is proven vs not
 
-**No-harm / easy case.** A task whose prompt names the file directly
-(e.g. "in `context-harness/src/renderer.rs`, add a doc comment above
-`HARNESS_MARKER` …"). Pass = the proxy stays out of the way:
+Proven (narrow):
 
-```
-search_proxy_substitutions = 0 or harmless
-intent_changed_files same
-tokens / duration / tool calls not materially worse
-```
+> Reactive tool mediation can help on symbol-heavy search tasks and can
+> stay inert when no eligible search occurs.
 
-If the proxy activates unnecessarily and worsens an easy run, that's a
-real problem to fix before going further.
+NOT proven:
 
-## Out of scope (deliberately, until no-harm is shown)
+> Search Proxy always reduces cost.
+> Search Proxy controls verification variance.
+> Search Proxy improves easy-task wall-clock.
+
+These are separate questions for later.
+
+---
+
+## Next engineering options (not yet decided)
+
+1. Add a verification policy separately (control the dominant confound).
+2. Expand the proxy to `sed` / large file reads.
+3. Improve the compact evidence format.
+4. Add a treatment-aware result classifier (the current
+   `ri_worse:faster_wall_clock` verdict penalizes tiny wall-clock
+   deltas and ignores token deltas; use thresholds, e.g. ignore <5% /
+   <5s).
+5. Run a broader eval later (more tasks, repeats for variance bounds).
+
+## Out of scope for the MVP (deliberately)
 
 - Combining Search Proxy with RI.
-- Extending interception to `sed` / `cat` / `find` / tests.
-- Iterating the compact format (escape-hatch is already trending to 0
-  with correct ranking).
-- A third symbol-heavy task (enough generalization evidence for now).
+- Extending interception beyond `rg` before the above are scoped.
+- Iterating the compact format (escape-hatch already trends to 0 with
+  correct ranking).
 
 ---
 
