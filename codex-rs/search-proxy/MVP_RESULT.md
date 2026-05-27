@@ -63,9 +63,19 @@ substitutions / escape_hatch_repeats        3 / 3
 top_files                    context-harness/src/agent_eval.rs (all 3)
 ```
 
-Clear token win. **But** the model re-issued every substituted command
-(escape-hatch 3/3) — it treated compact evidence as a pointer, not a
-satisfying answer. Flagged as the main thing to improve.
+The proxy produced correct compact evidence — gold `agent_eval.rs` was the
+top file on all 3 substitutions — and tokens were far lower. **But** the
+model re-issued every substituted command (escape-hatch 3/3): it ran the
+original `rg` anyway on every call.
+
+**Updated read (treatment-aware classifier, `search-proxy-hardening`):**
+this rescore now reads `search_proxy_inconclusive:model_strategy_variance`
+(proxy state `bypassed_all`), **not** a token win. Because the model
+bypassed every substitution and ran the original command, the -54% delta
+cannot be attributed to the proxy — it is most likely run variance. The
+original Run2 was still useful evidence that the proxy *surfaces the right
+file*, but attribution is weaker than Run4, where the model accepted the
+compact evidence (escape-hatch 0/2) and the token win is creditable.
 
 ### Run3 — `verification/src/rules.rs`, concept-only prompt
 
