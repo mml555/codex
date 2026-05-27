@@ -6,3 +6,11 @@
 
 # Value of CARGO_TARGET_DIR when using .devcontainer/devcontainer.json.
 /target-arm64/
+
+# Agent-eval artifact directories (record.json / events.jsonl / rollouts).
+# These are run outputs, not source — keeping them tracked pollutes
+# rg-based discovery inside isolated eval worktrees. Reports and
+# fixtures live under context-harness/ and are tracked normally.
+/ri-*/
+/ri-*.log
+/sp-mvp-run*/

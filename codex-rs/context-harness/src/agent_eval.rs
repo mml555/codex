@@ -237,6 +237,46 @@ pub struct AgentRunRecord {
     /// from two runs that were genuinely isolated.
     #[serde(default)]
     pub worktree_path: Option<String>,
+    /// True when the codex binary was invoked with
+    /// `features.search_proxy=true` for this run. False for vanilla
+    /// arms and for any treatment whose runner forgot to flip the
+    /// flag. Recorded explicitly so reviewers can confirm the
+    /// treatment was actually applied (the rg-interception MVP
+    /// silently no-ops when the feature is off).
+    #[serde(default)]
+    pub search_proxy_enabled: bool,
+    /// Number of search-proxy `event=substitute` lines in the
+    /// codex_exec stderr. Each line corresponds to a model-issued
+    /// `rg` call where the proxy returned compact evidence instead
+    /// of raw output.
+    #[serde(default)]
+    pub search_proxy_substitutions: u32,
+    /// Number of `event=escape_hatch_repeat` lines — the model
+    /// resent a previously-substituted normalized command and got
+    /// raw `rg` output the second time.
+    #[serde(default)]
+    pub search_proxy_escape_hatch_repeats: u32,
+    /// Number of `event=build_pass_through` lines — the proxy ran
+    /// internal `rg` but declined to substitute (no matches, rg
+    /// error, runner spawn failure, or raw output already smaller
+    /// than the compact form would be).
+    #[serde(default)]
+    pub search_proxy_build_pass_throughs: u32,
+    /// Sum of `compact_bytes` across all substitutions. Total bytes
+    /// the proxy actually sent back to the model.
+    #[serde(default)]
+    pub search_proxy_compact_bytes: u64,
+    /// Sum of `raw_bytes` across all substitutions. Total bytes of
+    /// `rg --json` output the proxy consumed internally — a rough
+    /// upper bound on what the model would have seen without the
+    /// proxy.
+    #[serde(default)]
+    pub search_proxy_raw_bytes_estimated: u64,
+    /// Top-ranked file from each substitution, in invocation order.
+    /// For Run-8-style symbol searches the success signal is whether
+    /// the gold owner file appears here.
+    #[serde(default)]
+    pub search_proxy_top_files: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -257,6 +297,9 @@ pub enum AgentArm {
     Vanilla,
     Harness,
     RepoIntelligence,
+    /// Treatment arm for the search-proxy MVP. Runs codex with
+    /// `features.search_proxy=true`; vanilla arm runs without.
+    SearchProxy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +320,7 @@ impl AgentArm {
             Self::Vanilla => "vanilla",
             Self::Harness => "harness",
             Self::RepoIntelligence => "repo_intelligence",
+            Self::SearchProxy => "search_proxy",
         }
     }
 
@@ -361,6 +405,12 @@ pub enum AgentEvalResult {
     RiWorse { reason: ResultReason },
     /// All comparison dimensions tied.
     Tie,
+    /// Treatment mechanism never engaged (e.g. no eligible search), so the
+    /// pair measures only baseline variance. Reason is a short slug.
+    Inert { reason: String },
+    /// Mechanism engaged but the cost signal can't be attributed to it
+    /// (e.g. the model bypassed every interception). Reason is a short slug.
+    Inconclusive { reason: String },
     /// Comparison was not made because the pair was invalid.
     Excluded { reason: String },
 }
@@ -382,6 +432,15 @@ pub enum ResultReason {
     FewerTurns,
     FasterWallClock,
     FewerTokens,
+    /// Treatment used materially fewer tokens (≥5%). Search-proxy verdict.
+    TokenEfficiency,
+    /// Treatment issued materially fewer discovery commands. Search-proxy verdict.
+    FewerDiscoveryCommands,
+    /// Treatment cost materially more (≥5% tokens) — interception overhead
+    /// outweighed the saving. Search-proxy verdict.
+    Overhead,
+    /// No dimension crossed its materiality threshold. Search-proxy verdict.
+    NoMaterialDelta,
 }
 
 impl ResultReason {
@@ -392,17 +451,55 @@ impl ResultReason {
             Self::FewerTurns => "fewer_turns",
             Self::FasterWallClock => "faster_wall_clock",
             Self::FewerTokens => "fewer_tokens",
+            Self::TokenEfficiency => "token_efficiency",
+            Self::FewerDiscoveryCommands => "fewer_discovery_commands",
+            Self::Overhead => "overhead",
+            Self::NoMaterialDelta => "no_material_delta",
         }
     }
 }
 
+/// Verdict-label prefix per treatment arm. RI/harness keep their legacy
+/// prefixes so existing reports and tests are unaffected.
+fn verdict_prefix(arm: AgentArm) -> &'static str {
+    match arm {
+        AgentArm::SearchProxy => "search_proxy",
+        // Legacy: RI, harness, and (never-a-treatment) vanilla all rendered
+        // as `ri_*` before treatment-aware labels existed. Preserve that so
+        // existing RI/harness reports and tests are unchanged.
+        AgentArm::RepoIntelligence | AgentArm::Harness | AgentArm::Vanilla => "ri",
+    }
+}
+
 impl AgentEvalResult {
-    /// Render as the machine+human label, e.g. `ri_better:file_targeting`.
+    /// Render as the legacy machine+human label, e.g. `ri_better:file_targeting`.
+    /// Arm-neutral; prefer [`Self::slug_for_arm`] for treatment-aware output.
     pub fn slug(&self) -> String {
         match self {
             Self::RiBetter { reason } => format!("ri_better:{}", reason.slug()),
             Self::RiWorse { reason } => format!("ri_worse:{}", reason.slug()),
             Self::Tie => "tie".to_string(),
+            Self::Inert { reason } => format!("inert:{reason}"),
+            Self::Inconclusive { reason } => format!("inconclusive:{reason}"),
+            Self::Excluded { reason } => format!("excluded:{reason}"),
+        }
+    }
+
+    /// Render with a treatment-aware prefix, e.g.
+    /// `search_proxy_better:token_efficiency` or `ri_better:file_targeting`.
+    /// RI/harness keep their legacy prefixes so existing reports/tests are
+    /// unaffected.
+    pub fn slug_for_arm(&self, arm: AgentArm) -> String {
+        let prefix = verdict_prefix(arm);
+        match self {
+            Self::RiBetter { reason } => format!("{prefix}_better:{}", reason.slug()),
+            Self::RiWorse { reason } => format!("{prefix}_worse:{}", reason.slug()),
+            Self::Tie if matches!(arm, AgentArm::SearchProxy) => {
+                format!("{prefix}_tie:no_material_delta")
+            }
+            Self::Tie => "tie".to_string(),
+            Self::Inert { reason } => format!("{prefix}_inert:{reason}"),
+            Self::Inconclusive { reason } => format!("{prefix}_inconclusive:{reason}"),
             Self::Excluded { reason } => format!("excluded:{reason}"),
         }
     }
@@ -670,6 +767,90 @@ pub fn classify_result(
     AgentEvalResult::Tie
 }
 
+/// Treatment-aware verdict for the search-proxy arm. Unlike
+/// [`classify_result`] (a strict priority ladder where any delta flips the
+/// verdict), this applies materiality thresholds and never lets wall-clock
+/// override a token result — wall-clock is reported but not scored.
+///
+/// Priority: correctness (file targeting) → inert (no eligible search) →
+/// inconclusive (model bypassed every interception, so cost can't be
+/// attributed) → token efficiency (±5%) → discovery-command win (±1 jitter
+/// ignored) → no material delta.
+pub fn classify_search_proxy_result(
+    vanilla: &AgentRunScore,
+    treatment: &AgentRunScore,
+    treatment_record: &AgentRunRecord,
+    valid_for_comparison: bool,
+    excluded_reason: Option<&str>,
+) -> AgentEvalResult {
+    if !valid_for_comparison {
+        let reason = excluded_reason.unwrap_or("invalid").to_string();
+        return AgentEvalResult::Excluded { reason };
+    }
+
+    // Correctness dominates: a wrong/missed edit is never excused by cost.
+    if treatment.target_files_hit > vanilla.target_files_hit {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+    if treatment.target_files_hit < vanilla.target_files_hit {
+        return AgentEvalResult::RiWorse {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+
+    // The proxy never fired — no eligible search occurred. The pair only
+    // measures baseline model variance, so it's neither a win nor a loss.
+    let subs = treatment_record.search_proxy_substitutions;
+    if subs == 0 {
+        return AgentEvalResult::Inert {
+            reason: "no_eligible_search".to_string(),
+        };
+    }
+
+    // The model bypassed every interception (repeated each substituted
+    // command), so any cost delta is its own strategy variance, not the
+    // proxy's doing. Refuse to attribute.
+    if treatment_record.search_proxy_escape_hatch_repeats >= subs {
+        return AgentEvalResult::Inconclusive {
+            reason: "model_strategy_variance".to_string(),
+        };
+    }
+
+    // Token efficiency, 5% materiality threshold. This is the primary
+    // outcome signal for discovery mediation.
+    if let (Some(v), Some(t)) = (vanilla.tokens_total, treatment.tokens_total)
+        && v > 0
+    {
+        let ratio = t as f64 / v as f64;
+        if ratio <= 0.95 {
+            return AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency,
+            };
+        }
+        if ratio >= 1.05 {
+            return AgentEvalResult::RiWorse {
+                reason: ResultReason::Overhead,
+            };
+        }
+    }
+
+    // Discovery-command win when tokens are within the dead band. Ignore a
+    // ±1 jitter; require at least 2 fewer discovery commands.
+    if let (Some(v), Some(t)) = (
+        vanilla.discover_command_count,
+        treatment.discover_command_count,
+    ) && v >= t + 2
+    {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FewerDiscoveryCommands,
+        };
+    }
+
+    AgentEvalResult::Tie
+}
+
 pub fn compare_task(
     task: &AgentEvalTask,
     vanilla: &AgentRunRecord,
@@ -679,12 +860,22 @@ pub fn compare_task(
     let valid_for_comparison = excluded_reason.is_none();
     let vanilla_score = score_run(vanilla, task);
     let treatment_score = score_run(treatment, task);
-    let result = classify_result(
-        &vanilla_score,
-        &treatment_score,
-        valid_for_comparison,
-        excluded_reason.as_deref(),
-    );
+    let result = if matches!(treatment.arm, AgentArm::SearchProxy) {
+        classify_search_proxy_result(
+            &vanilla_score,
+            &treatment_score,
+            treatment,
+            valid_for_comparison,
+            excluded_reason.as_deref(),
+        )
+    } else {
+        classify_result(
+            &vanilla_score,
+            &treatment_score,
+            valid_for_comparison,
+            excluded_reason.as_deref(),
+        )
+    };
     AgentEvalComparison {
         task_id: task.id.clone(),
         task: task.task.clone(),
@@ -800,10 +991,10 @@ pub fn token_usage_from_exec_jsonl(bytes: &[u8]) -> anyhow::Result<Option<TokenU
         let Some(usage) = value.get("usage") else {
             continue;
         };
-        if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+        if let Some(n) = usage.get("input_tokens").and_then(serde_json::Value::as_i64) {
             input = input.saturating_add(n.max(0) as u64);
         }
-        if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+        if let Some(n) = usage.get("output_tokens").and_then(serde_json::Value::as_i64) {
             output = output.saturating_add(n.max(0) as u64);
         }
     }
@@ -914,7 +1105,6 @@ pub struct AgentActivityCounts {
     pub verify_commands: u32,
 }
 
-
 /// Coarse classification of a single shell command into one of five phases.
 /// Returned as a static slug for both Rust scoring and the bash mirror.
 ///
@@ -956,10 +1146,18 @@ pub fn classify_shell_phase(command: &str) -> &'static str {
             if has_context { "verify" } else { "discover" }
         }
         "sed" => {
-            if command.contains("-i") { "edit" } else { "other" }
+            if command.contains("-i") {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "perl" => {
-            if command.contains("-i") { "edit" } else { "other" }
+            if command.contains("-i") {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "awk" => {
             if command.contains("inplace") {
@@ -974,7 +1172,11 @@ pub fn classify_shell_phase(command: &str) -> &'static str {
         }
         "echo" | "printf" => {
             // `echo X > file` / `echo X >> file` is an edit.
-            if command.contains('>') { "edit" } else { "other" }
+            if command.contains('>') {
+                "edit"
+            } else {
+                "other"
+            }
         }
         "mv" | "cp" | "rm" | "mkdir" | "touch" | "rmdir" | "ln" => "edit",
         "diff" => "verify",
@@ -1157,7 +1359,9 @@ fn strip_leading_cd_chains(command: &str) -> String {
     } else {
         trimmed
     };
-    let body = body.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"']);
+    let body = body
+        .trim_start_matches(['\'', '"'])
+        .trim_end_matches(['\'', '"']);
 
     let mut remaining = body.to_string();
     loop {
@@ -1367,14 +1571,12 @@ fn render_grouped_table(
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let header_cells: Vec<String> = headers.iter().map(std::string::ToString::to_string).collect();
     let separator_cells: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
 
     for category in category_order {
-        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> = rows
-            .iter()
-            .filter(|(c, _, _)| c == category)
-            .collect();
+        let group: Vec<&(Option<TaskCategory>, &AgentEvalComparison, Vec<String>)> =
+            rows.iter().filter(|(c, _, _)| c == category).collect();
         if group.is_empty() {
             continue;
         }
@@ -1398,25 +1600,230 @@ fn render_grouped_table(
 /// Count `result` outcomes across a slice of comparisons and emit a one-line
 /// summary like `2 ri_better / 0 ri_worse / 1 tie / 0 excluded`.
 fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) -> String {
+    let rows: Vec<&AgentEvalComparison> = rows.into_iter().collect();
+    let prefix = rows
+        .first()
+        .map(|r| verdict_prefix(r.treatment_arm))
+        .unwrap_or("ri");
     let mut better = 0u32;
     let mut worse = 0u32;
     let mut tie = 0u32;
+    let mut inert = 0u32;
+    let mut inconclusive = 0u32;
     let mut excluded = 0u32;
-    for row in rows {
+    for row in &rows {
         match row.result {
             AgentEvalResult::RiBetter { .. } => better += 1,
             AgentEvalResult::RiWorse { .. } => worse += 1,
             AgentEvalResult::Tie => tie += 1,
+            AgentEvalResult::Inert { .. } => inert += 1,
+            AgentEvalResult::Inconclusive { .. } => inconclusive += 1,
             AgentEvalResult::Excluded { .. } => excluded += 1,
         }
     }
-    format!("{better} ri_better / {worse} ri_worse / {tie} tie / {excluded} excluded")
+    // Legacy format is preserved when there are no inert/inconclusive rows
+    // (the only states RI/harness arms can produce), so existing reports
+    // and tests are unchanged; search-proxy runs surface the extra buckets.
+    let mut summary = format!("{better} {prefix}_better / {worse} {prefix}_worse / {tie} tie");
+    if inert > 0 {
+        summary += &format!(" / {inert} inert");
+    }
+    if inconclusive > 0 {
+        summary += &format!(" / {inconclusive} inconclusive");
+    }
+    summary += &format!(" / {excluded} excluded");
+    summary
 }
 
 const DASH: &str = "—";
 
+/// At-a-glance state of the search proxy on one task, derived from the
+/// treatment record's interception counters. Surfaced as its own report
+/// column so Run2 (`bypassed_all`), Run4 (`active`), and Run5 (`inert`) are
+/// distinguishable without reading logs.
+pub fn search_proxy_proxy_state(record: &AgentRunRecord) -> &'static str {
+    let subs = record.search_proxy_substitutions;
+    let repeats = record.search_proxy_escape_hatch_repeats;
+    let pass_throughs = record.search_proxy_build_pass_throughs;
+    if subs == 0 {
+        // No substitution happened. Either an eligible search ran but the
+        // builder declined (pass_through_only), or nothing eligible fired.
+        if pass_throughs > 0 {
+            "pass_through_only"
+        } else {
+            "inert"
+        }
+    } else if repeats >= subs {
+        "bypassed_all"
+    } else if repeats > 0 {
+        "partial_bypass"
+    } else {
+        "active"
+    }
+}
+
+/// One row of the Search Proxy report table. Built by
+/// [`search_proxy_report_row`] from a (task, vanilla, treatment) triple +
+/// its comparison verdict; rendered by [`render_search_proxy_table`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchProxyReportRow {
+    pub task_id: String,
+    pub proxy_state: &'static str,
+    /// `Some(true)` if any proxy top-file matched a gold relevant file,
+    /// `Some(false)` if not, `None` when the proxy never substituted.
+    pub top_file_correct: Option<bool>,
+    pub substitutions: u32,
+    pub escape_hatch_repeats: u32,
+    pub compact_bytes: u64,
+    pub raw_bytes_estimated: u64,
+    pub tokens_vanilla: Option<u64>,
+    pub tokens_treatment: Option<u64>,
+    pub discover_vanilla: Option<u32>,
+    pub discover_treatment: Option<u32>,
+    pub intent_files_vanilla: usize,
+    pub intent_files_treatment: usize,
+    /// Treatment-aware verdict slug, e.g. `search_proxy_better:token_efficiency`.
+    pub result: String,
+}
+
+pub fn search_proxy_report_row(
+    task: &AgentEvalTask,
+    vanilla: &AgentRunRecord,
+    treatment: &AgentRunRecord,
+    comparison: &AgentEvalComparison,
+) -> SearchProxyReportRow {
+    let top_file_correct = if treatment.search_proxy_substitutions == 0 {
+        None
+    } else {
+        let golds: Vec<String> = task
+            .relevant_files
+            .iter()
+            .map(|f| normalize_agent_eval_path(f))
+            .collect();
+        Some(treatment.search_proxy_top_files.iter().any(|f| {
+            let nf = normalize_agent_eval_path(f);
+            golds.iter().any(|g| *g == nf)
+        }))
+    };
+    SearchProxyReportRow {
+        task_id: task.id.clone(),
+        proxy_state: search_proxy_proxy_state(treatment),
+        top_file_correct,
+        substitutions: treatment.search_proxy_substitutions,
+        escape_hatch_repeats: treatment.search_proxy_escape_hatch_repeats,
+        compact_bytes: treatment.search_proxy_compact_bytes,
+        raw_bytes_estimated: treatment.search_proxy_raw_bytes_estimated,
+        tokens_vanilla: vanilla.tokens_total,
+        tokens_treatment: treatment.tokens_total,
+        discover_vanilla: vanilla.discover_command_count,
+        discover_treatment: treatment.discover_command_count,
+        intent_files_vanilla: vanilla.intent_changed_files.len(),
+        intent_files_treatment: treatment.intent_changed_files.len(),
+        result: comparison.result.slug_for_arm(comparison.treatment_arm),
+    }
+}
+
+/// Column-aligned flat table: header, separator, then one line per row.
+fn render_flat_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+    let n = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for cells in rows {
+        for (i, cell) in cells.iter().enumerate() {
+            if i < n {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+    }
+    let render = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pad = widths.get(i).copied().unwrap_or(0);
+                let extra = pad.saturating_sub(cell.chars().count());
+                format!("{cell}{}", " ".repeat(extra))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+    let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    let mut out = vec![render(&header_cells), render(&separator)];
+    for cells in rows {
+        out.push(render(cells));
+    }
+    out
+}
+
+/// Render the Search Proxy report table + per-task notes for confounded
+/// states. Reviewable without log archaeology.
+pub fn render_search_proxy_table(rows: &[SearchProxyReportRow]) -> String {
+    const HEADERS: [&str; 10] = [
+        "Task",
+        "Proxy state",
+        "Top file ok?",
+        "Subs",
+        "Repeats",
+        "Compact/raw B",
+        "Tokens V/P",
+        "Discover V/P",
+        "Intent V/P",
+        "Result",
+    ];
+    let opt_u64 = |x: Option<u64>| x.map_or_else(|| "?".to_string(), |v| v.to_string());
+    let opt_u32 = |x: Option<u32>| x.map_or_else(|| "?".to_string(), |v| v.to_string());
+    let cell_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let raw = if r.raw_bytes_estimated > 0 {
+                r.raw_bytes_estimated.to_string()
+            } else {
+                "n/a".to_string()
+            };
+            vec![
+                r.task_id.clone(),
+                r.proxy_state.to_string(),
+                match r.top_file_correct {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "n/a",
+                }
+                .to_string(),
+                r.substitutions.to_string(),
+                r.escape_hatch_repeats.to_string(),
+                format!("{}/{raw}", r.compact_bytes),
+                format!("{}/{}", opt_u64(r.tokens_vanilla), opt_u64(r.tokens_treatment)),
+                format!(
+                    "{}/{}",
+                    opt_u32(r.discover_vanilla),
+                    opt_u32(r.discover_treatment)
+                ),
+                format!("{}/{}", r.intent_files_vanilla, r.intent_files_treatment),
+                r.result.clone(),
+            ]
+        })
+        .collect();
+
+    let mut out = vec![String::new(), "==== Search proxy ====".to_string()];
+    out.extend(render_flat_table(&HEADERS, &cell_rows));
+    for r in rows {
+        match r.proxy_state {
+            "inert" | "pass_through_only" => out.push(format!(
+                "  note [{}]: proxy did not substitute (no eligible search); any cost delta is confounded by unrelated verification/model behavior.",
+                r.task_id
+            )),
+            "bypassed_all" => out.push(format!(
+                "  note [{}]: model bypassed every substitution — cost is not attributable to the proxy.",
+                r.task_id
+            )),
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
 fn format_main_row(row: &AgentEvalComparison) -> [String; 9] {
-    let result = row.result.slug();
+    let result = row.result.slug_for_arm(row.treatment_arm);
     if !row.valid_for_comparison {
         let valid_cell = format_invalid_cell(row);
         let ri_visible = if row.treatment.harness_context_visible {
@@ -1684,6 +2091,13 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: matches!(arm, AgentArm::SearchProxy),
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
@@ -1985,6 +2399,203 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn sp_classify(
+        v_tokens: Option<u64>,
+        t_tokens: Option<u64>,
+        v_hit: usize,
+        t_hit: usize,
+        v_discover: Option<u32>,
+        t_discover: Option<u32>,
+        subs: u32,
+        escape_hatch_repeats: u32,
+    ) -> AgentEvalResult {
+        let vanilla = AgentRunScore {
+            target_files_hit: v_hit,
+            tokens_total: v_tokens,
+            discover_command_count: v_discover,
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: t_hit,
+            tokens_total: t_tokens,
+            discover_command_count: t_discover,
+            ..zero_score()
+        };
+        let rec = AgentRunRecord {
+            search_proxy_substitutions: subs,
+            search_proxy_escape_hatch_repeats: escape_hatch_repeats,
+            ..synthetic_record(AgentArm::SearchProxy, "t")
+        };
+        classify_search_proxy_result(&vanilla, &treatment, &rec, true, None)
+    }
+
+    #[test]
+    fn sp_token_win_below_threshold() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(800), 1, 1, None, None, 1, 0),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency
+            }
+        );
+    }
+
+    #[test]
+    fn sp_token_regression_is_overhead() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(1100), 1, 1, None, None, 1, 0),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::Overhead
+            }
+        );
+    }
+
+    #[test]
+    fn sp_small_token_delta_is_no_material_delta() {
+        // -2% tokens is within the 5% dead band; tiny jitter must not
+        // manufacture a verdict (the old classifier's failure mode).
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(3), Some(3), 1, 0),
+            AgentEvalResult::Tie
+        );
+    }
+
+    #[test]
+    fn sp_discovery_win_when_tokens_in_dead_band() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(5), Some(2), 1, 0),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerDiscoveryCommands
+            }
+        );
+    }
+
+    #[test]
+    fn sp_one_fewer_discovery_is_jitter_not_a_win() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(3), Some(2), 1, 0),
+            AgentEvalResult::Tie
+        );
+    }
+
+    #[test]
+    fn sp_inert_when_no_substitutions() {
+        // No eligible search → inert even though tokens are far lower
+        // (that delta is baseline variance, not the proxy).
+        assert_eq!(
+            sp_classify(Some(1000), Some(500), 1, 1, None, None, 0, 0),
+            AgentEvalResult::Inert {
+                reason: "no_eligible_search".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sp_inconclusive_when_model_bypassed_every_interception() {
+        // subs=1, escape_hatch_repeats=1 → the model repeated the broad
+        // command, so a -20% token delta can't be credited to the proxy.
+        // This is the real cloud A/B shape.
+        assert_eq!(
+            sp_classify(Some(1000), Some(800), 1, 1, None, None, 1, 1),
+            AgentEvalResult::Inconclusive {
+                reason: "model_strategy_variance".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sp_correctness_dominates_cost() {
+        // Far cheaper but missed the gold edit → worse, never a token win.
+        assert_eq!(
+            sp_classify(Some(1000), Some(100), 1, 0, None, None, 1, 0),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::FileTargeting
+            }
+        );
+    }
+
+    #[test]
+    fn sp_verdict_labels_are_treatment_aware() {
+        let sp = AgentArm::SearchProxy;
+        assert_eq!(
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency
+            }
+            .slug_for_arm(sp),
+            "search_proxy_better:token_efficiency"
+        );
+        assert_eq!(
+            AgentEvalResult::Inert {
+                reason: "no_eligible_search".to_string()
+            }
+            .slug_for_arm(sp),
+            "search_proxy_inert:no_eligible_search"
+        );
+        assert_eq!(
+            AgentEvalResult::Inconclusive {
+                reason: "model_strategy_variance".to_string()
+            }
+            .slug_for_arm(sp),
+            "search_proxy_inconclusive:model_strategy_variance"
+        );
+        assert_eq!(
+            AgentEvalResult::Tie.slug_for_arm(sp),
+            "search_proxy_tie:no_material_delta"
+        );
+        // Legacy RI label unchanged.
+        assert_eq!(
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FileTargeting
+            }
+            .slug_for_arm(AgentArm::RepoIntelligence),
+            "ri_better:file_targeting"
+        );
+    }
+
+    #[test]
+    fn proxy_state_derivation_covers_all_states() {
+        let with = |subs, repeats, pass| AgentRunRecord {
+            search_proxy_substitutions: subs,
+            search_proxy_escape_hatch_repeats: repeats,
+            search_proxy_build_pass_throughs: pass,
+            ..synthetic_record(AgentArm::SearchProxy, "t")
+        };
+        assert_eq!(search_proxy_proxy_state(&with(0, 0, 0)), "inert");
+        assert_eq!(search_proxy_proxy_state(&with(0, 0, 2)), "pass_through_only");
+        assert_eq!(search_proxy_proxy_state(&with(2, 0, 0)), "active");
+        assert_eq!(search_proxy_proxy_state(&with(3, 3, 0)), "bypassed_all");
+        assert_eq!(search_proxy_proxy_state(&with(3, 1, 0)), "partial_bypass");
+    }
+
+    #[test]
+    fn search_proxy_table_renders_header_states_and_confounded_note() {
+        let row = SearchProxyReportRow {
+            task_id: "noharm_named_file_doc_comment".to_string(),
+            proxy_state: "inert",
+            top_file_correct: None,
+            substitutions: 0,
+            escape_hatch_repeats: 0,
+            compact_bytes: 0,
+            raw_bytes_estimated: 0,
+            tokens_vanilla: Some(1000),
+            tokens_treatment: Some(2000),
+            discover_vanilla: Some(1),
+            discover_treatment: Some(1),
+            intent_files_vanilla: 1,
+            intent_files_treatment: 1,
+            result: "search_proxy_inert:no_eligible_search".to_string(),
+        };
+        let out = render_search_proxy_table(&[row]);
+        assert!(out.contains("==== Search proxy ===="), "{out}");
+        assert!(out.contains("Proxy state"), "{out}");
+        assert!(out.contains("inert"), "{out}");
+        assert!(out.contains("1000/2000"), "tokens V/P column missing:\n{out}");
+        assert!(
+            out.contains("confounded"),
+            "inert row must carry a confounded note:\n{out}"
+        );
+    }
+
     #[test]
     fn classify_ri_better_by_file_targeting() {
         let vanilla = zero_score();
@@ -2187,15 +2798,22 @@ mod tests {
         let text = render_agent_eval_human(&report);
 
         // Each category gets a header.
-        assert!(text.contains("== bridge_wiring =="), "missing bw header:\n{text}");
-        assert!(text.contains("== file_routing =="), "missing fr header:\n{text}");
-        assert!(text.contains("== uncategorized =="), "missing uncat header:\n{text}");
+        assert!(
+            text.contains("== bridge_wiring =="),
+            "missing bw header:\n{text}"
+        );
+        assert!(
+            text.contains("== file_routing =="),
+            "missing fr header:\n{text}"
+        );
+        assert!(
+            text.contains("== uncategorized =="),
+            "missing uncat header:\n{text}"
+        );
 
         // Each group has a per-group summary line.
-        let group_summaries: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("Group: "))
-            .collect();
+        let group_summaries: Vec<&str> =
+            text.lines().filter(|l| l.starts_with("Group: ")).collect();
         assert_eq!(
             group_summaries.len(),
             3,
@@ -2214,10 +2832,7 @@ mod tests {
         // Two tables × 3 categories = 6 "Task " header lines, with three
         // identical Main headers and three identical Cost headers (each
         // table has its own width set).
-        let header_lines: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("Task "))
-            .collect();
+        let header_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("Task ")).collect();
         assert_eq!(
             header_lines.len(),
             6,
@@ -2225,8 +2840,14 @@ mod tests {
             header_lines.len()
         );
         // Both tables must be present.
-        assert!(text.contains("==== Main ===="), "Main section missing:\n{text}");
-        assert!(text.contains("==== Cost ===="), "Cost section missing:\n{text}");
+        assert!(
+            text.contains("==== Main ===="),
+            "Main section missing:\n{text}"
+        );
+        assert!(
+            text.contains("==== Cost ===="),
+            "Cost section missing:\n{text}"
+        );
     }
 
     #[test]
@@ -2368,22 +2989,37 @@ mod tests {
     #[test]
     fn classify_shell_phase_covers_common_cases() {
         // Wrapped form (`/bin/zsh -lc '<inner>'`) and bare form should agree.
-        assert_eq!(classify_shell_phase("/bin/zsh -lc 'find . -name *.rs'"), "discover");
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'find . -name *.rs'"),
+            "discover"
+        );
         assert_eq!(classify_shell_phase("find . -name '*.rs'"), "discover");
         assert_eq!(classify_shell_phase("ls -la"), "discover");
-        assert_eq!(classify_shell_phase("/bin/zsh -lc 'grep -n install foo.rs'"), "discover");
+        assert_eq!(
+            classify_shell_phase("/bin/zsh -lc 'grep -n install foo.rs'"),
+            "discover"
+        );
         assert_eq!(classify_shell_phase("grep -A 3 pattern foo.rs"), "verify");
         assert_eq!(classify_shell_phase("grep -B 2 pattern foo.rs"), "verify");
         assert_eq!(classify_shell_phase("cat README.md"), "read");
         assert_eq!(classify_shell_phase("head -n 5 foo.rs"), "read");
         assert_eq!(classify_shell_phase("sed -i '' '1d' foo.rs"), "edit");
-        assert_eq!(classify_shell_phase("perl -i -pe 's/old/new/' foo.rs"), "edit");
-        assert_eq!(classify_shell_phase("awk 'NR==180{print}' foo.rs"), "verify");
+        assert_eq!(
+            classify_shell_phase("perl -i -pe 's/old/new/' foo.rs"),
+            "edit"
+        );
+        assert_eq!(
+            classify_shell_phase("awk 'NR==180{print}' foo.rs"),
+            "verify"
+        );
         assert_eq!(classify_shell_phase("echo content > newfile.rs"), "edit");
         assert_eq!(classify_shell_phase("mv old.rs new.rs"), "edit");
         assert_eq!(classify_shell_phase("git status"), "discover");
         assert_eq!(classify_shell_phase("git diff HEAD"), "verify");
-        assert_eq!(classify_shell_phase("python -m pytest tests/foo.py"), "other");
+        assert_eq!(
+            classify_shell_phase("python -m pytest tests/foo.py"),
+            "other"
+        );
     }
 
     #[test]
@@ -2436,7 +3072,10 @@ mod tests {
         let cells = format_cost_row(&row);
         assert_eq!(cells[0], "calculator_fix");
         assert_eq!(cells[1], "401000/405800");
-        assert_eq!(cells[2], "+4800", "Token Δ should be signed; RI +4800 tokens");
+        assert_eq!(
+            cells[2], "+4800",
+            "Token Δ should be signed; RI +4800 tokens"
+        );
         assert_eq!(cells[3], "15/7", "tool calls V/RI");
         assert_eq!(cells[4], "2/0", "discover V/RI");
         assert_eq!(cells[5], "5/1", "read V/RI");
@@ -2673,12 +3312,22 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: false,
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
         };
         let score = score_run(&record, &task);
-        assert_eq!(score.edit_target_files_hit, 1, "a.rs is in gold and touched");
+        assert_eq!(
+            score.edit_target_files_hit, 1,
+            "a.rs is in gold and touched"
+        );
         assert_eq!(score.edit_target_files_total, 1);
         // Orientation set: bridge {b} ∪ ri_orient {b,c,d} − gold {a}
         //                 = {b, c, d}
@@ -2737,13 +3386,23 @@ mod tests {
             formatter_changed_files: Vec::new(),
             harness_prewarm_ms: None,
             codex_build_profile: None,
+            search_proxy_enabled: false,
+            search_proxy_substitutions: 0,
+            search_proxy_escape_hatch_repeats: 0,
+            search_proxy_build_pass_throughs: 0,
+            search_proxy_compact_bytes: 0,
+            search_proxy_raw_bytes_estimated: 0,
+            search_proxy_top_files: Vec::new(),
             worktree_isolated: false,
             base_ref: None,
             worktree_path: None,
         };
         let score = score_run(&record, &task);
         assert_eq!(score.edit_target_files_hit, 1);
-        assert_eq!(score.orientation_files_touched, 1, "bridge wiring.rs edited");
+        assert_eq!(
+            score.orientation_files_touched, 1,
+            "bridge wiring.rs edited"
+        );
         assert_eq!(score.orientation_files_total, 1);
     }
 
@@ -2785,12 +3444,58 @@ mod tests {
         // Only RI arm carries a warning: prefix the arm.
         let t_only = AgentRunRecord {
             warnings: vec!["provider_network_error_recovered".to_string()],
-            ..treatment.clone()
+            ..treatment
         };
         let row = compare_task(&task, &vanilla, &t_only);
         assert_eq!(
             format_valid_cell(&row),
             "valid (RI: provider_network_error_recovered)"
         );
+    }
+
+    #[test]
+    fn search_proxy_record_round_trip_serde() {
+        // A record populated by the search-proxy treatment arm should
+        // serialize and deserialize without losing any of the seven
+        // new fields, and the round-trip should equal the source.
+        let original = AgentRunRecord {
+            search_proxy_enabled: true,
+            search_proxy_substitutions: 4,
+            search_proxy_escape_hatch_repeats: 1,
+            search_proxy_build_pass_throughs: 2,
+            search_proxy_compact_bytes: 3_840,
+            search_proxy_raw_bytes_estimated: 9_120,
+            search_proxy_top_files: vec![
+                "context-harness/src/agent_eval.rs".to_string(),
+                "context-harness/src/renderer.rs".to_string(),
+            ],
+            ..synthetic_record(AgentArm::SearchProxy, "round_trip_task")
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let round_tripped: AgentRunRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn search_proxy_record_loads_legacy_records_without_proxy_fields() {
+        // Pre-Commit-4 record.json files (the four cloud pairs from
+        // the RI experiment) have none of the search_proxy_* keys.
+        // `#[serde(default)]` should make them load with zeros / empty
+        // vec.
+        let legacy = r#"{
+            "arm": "vanilla",
+            "task_id": "legacy",
+            "changed_files": [],
+            "tests_passed": false,
+            "turn_count": null
+        }"#;
+        let rec: AgentRunRecord = serde_json::from_str(legacy).expect("legacy parse");
+        assert!(!rec.search_proxy_enabled);
+        assert_eq!(rec.search_proxy_substitutions, 0);
+        assert_eq!(rec.search_proxy_escape_hatch_repeats, 0);
+        assert_eq!(rec.search_proxy_build_pass_throughs, 0);
+        assert_eq!(rec.search_proxy_compact_bytes, 0);
+        assert_eq!(rec.search_proxy_raw_bytes_estimated, 0);
+        assert!(rec.search_proxy_top_files.is_empty());
     }
 }

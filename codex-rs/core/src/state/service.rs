@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::SkillsManager;
@@ -81,4 +82,11 @@ pub(crate) struct SessionServices {
     /// Shared process-level environment registry. Sessions carry an `Arc` handle so they can pass
     /// the same manager through child-thread spawn paths without reconstructing it.
     pub(crate) environment_manager: Arc<EnvironmentManager>,
+
+    /// Set of `ClassifiedRg::normalized` strings the search-proxy
+    /// hook has already substituted in this session. Used as the
+    /// repeat-command escape hatch: if the model re-sends the same
+    /// rg invocation, the second call is passed through to raw rg.
+    /// Only populated when `Feature::SearchProxy` is enabled.
+    pub(crate) search_proxy_intercepts: Mutex<HashSet<String>>,
 }
