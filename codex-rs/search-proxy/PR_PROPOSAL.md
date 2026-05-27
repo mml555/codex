@@ -76,10 +76,17 @@ carries none of it, and squash-merge collapses the add-then-remove churn so
 the landed commit is clean. Suggested squashed message:
 
 ```
-feat(codex-rs): add feature-gated Search Proxy (rg mediation, default off)
+feat(codex-rs): add experimental search proxy for rg discovery
 
-Classify rg → compact ranked evidence → core hook (shell + unified_exec)
-→ eval path + metrics + treatment-aware reporting. Read-only, escape-hatch
-protected, default off. Early evidence: one attributable token win on
-symbol-heavy discovery (rules.rs, -22%) + a no-harm inert case.
+- feature-gated SearchProxy, default off
+- intercepts eligible rg calls with compact evidence
+- exact-repeat bypass preserves raw rg access
+- read-only; unsafe/chained commands pass through
+- wired through shell and unified_exec
+- agent-eval metrics and treatment-aware reporting
+- early controlled evidence: one clean token win, one weaker/inconclusive
+  win, one no-harm/inert case
+
+Land via squash-merge (an early commit vendored a research-bundle that a
+later commit removed; squash keeps it off main).
 ```
