@@ -405,6 +405,12 @@ pub enum AgentEvalResult {
     RiWorse { reason: ResultReason },
     /// All comparison dimensions tied.
     Tie,
+    /// Treatment mechanism never engaged (e.g. no eligible search), so the
+    /// pair measures only baseline variance. Reason is a short slug.
+    Inert { reason: String },
+    /// Mechanism engaged but the cost signal can't be attributed to it
+    /// (e.g. the model bypassed every interception). Reason is a short slug.
+    Inconclusive { reason: String },
     /// Comparison was not made because the pair was invalid.
     Excluded { reason: String },
 }
@@ -426,6 +432,15 @@ pub enum ResultReason {
     FewerTurns,
     FasterWallClock,
     FewerTokens,
+    /// Treatment used materially fewer tokens (≥5%). Search-proxy verdict.
+    TokenEfficiency,
+    /// Treatment issued materially fewer discovery commands. Search-proxy verdict.
+    FewerDiscoveryCommands,
+    /// Treatment cost materially more (≥5% tokens) — interception overhead
+    /// outweighed the saving. Search-proxy verdict.
+    Overhead,
+    /// No dimension crossed its materiality threshold. Search-proxy verdict.
+    NoMaterialDelta,
 }
 
 impl ResultReason {
@@ -436,17 +451,55 @@ impl ResultReason {
             Self::FewerTurns => "fewer_turns",
             Self::FasterWallClock => "faster_wall_clock",
             Self::FewerTokens => "fewer_tokens",
+            Self::TokenEfficiency => "token_efficiency",
+            Self::FewerDiscoveryCommands => "fewer_discovery_commands",
+            Self::Overhead => "overhead",
+            Self::NoMaterialDelta => "no_material_delta",
         }
     }
 }
 
+/// Verdict-label prefix per treatment arm. RI/harness keep their legacy
+/// prefixes so existing reports and tests are unaffected.
+fn verdict_prefix(arm: AgentArm) -> &'static str {
+    match arm {
+        AgentArm::SearchProxy => "search_proxy",
+        // Legacy: RI, harness, and (never-a-treatment) vanilla all rendered
+        // as `ri_*` before treatment-aware labels existed. Preserve that so
+        // existing RI/harness reports and tests are unchanged.
+        AgentArm::RepoIntelligence | AgentArm::Harness | AgentArm::Vanilla => "ri",
+    }
+}
+
 impl AgentEvalResult {
-    /// Render as the machine+human label, e.g. `ri_better:file_targeting`.
+    /// Render as the legacy machine+human label, e.g. `ri_better:file_targeting`.
+    /// Arm-neutral; prefer [`Self::slug_for_arm`] for treatment-aware output.
     pub fn slug(&self) -> String {
         match self {
             Self::RiBetter { reason } => format!("ri_better:{}", reason.slug()),
             Self::RiWorse { reason } => format!("ri_worse:{}", reason.slug()),
             Self::Tie => "tie".to_string(),
+            Self::Inert { reason } => format!("inert:{reason}"),
+            Self::Inconclusive { reason } => format!("inconclusive:{reason}"),
+            Self::Excluded { reason } => format!("excluded:{reason}"),
+        }
+    }
+
+    /// Render with a treatment-aware prefix, e.g.
+    /// `search_proxy_better:token_efficiency` or `ri_better:file_targeting`.
+    /// RI/harness keep their legacy prefixes so existing reports/tests are
+    /// unaffected.
+    pub fn slug_for_arm(&self, arm: AgentArm) -> String {
+        let prefix = verdict_prefix(arm);
+        match self {
+            Self::RiBetter { reason } => format!("{prefix}_better:{}", reason.slug()),
+            Self::RiWorse { reason } => format!("{prefix}_worse:{}", reason.slug()),
+            Self::Tie if matches!(arm, AgentArm::SearchProxy) => {
+                format!("{prefix}_tie:no_material_delta")
+            }
+            Self::Tie => "tie".to_string(),
+            Self::Inert { reason } => format!("{prefix}_inert:{reason}"),
+            Self::Inconclusive { reason } => format!("{prefix}_inconclusive:{reason}"),
             Self::Excluded { reason } => format!("excluded:{reason}"),
         }
     }
@@ -714,6 +767,90 @@ pub fn classify_result(
     AgentEvalResult::Tie
 }
 
+/// Treatment-aware verdict for the search-proxy arm. Unlike
+/// [`classify_result`] (a strict priority ladder where any delta flips the
+/// verdict), this applies materiality thresholds and never lets wall-clock
+/// override a token result — wall-clock is reported but not scored.
+///
+/// Priority: correctness (file targeting) → inert (no eligible search) →
+/// inconclusive (model bypassed every interception, so cost can't be
+/// attributed) → token efficiency (±5%) → discovery-command win (±1 jitter
+/// ignored) → no material delta.
+pub fn classify_search_proxy_result(
+    vanilla: &AgentRunScore,
+    treatment: &AgentRunScore,
+    treatment_record: &AgentRunRecord,
+    valid_for_comparison: bool,
+    excluded_reason: Option<&str>,
+) -> AgentEvalResult {
+    if !valid_for_comparison {
+        let reason = excluded_reason.unwrap_or("invalid").to_string();
+        return AgentEvalResult::Excluded { reason };
+    }
+
+    // Correctness dominates: a wrong/missed edit is never excused by cost.
+    if treatment.target_files_hit > vanilla.target_files_hit {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+    if treatment.target_files_hit < vanilla.target_files_hit {
+        return AgentEvalResult::RiWorse {
+            reason: ResultReason::FileTargeting,
+        };
+    }
+
+    // The proxy never fired — no eligible search occurred. The pair only
+    // measures baseline model variance, so it's neither a win nor a loss.
+    let subs = treatment_record.search_proxy_substitutions;
+    if subs == 0 {
+        return AgentEvalResult::Inert {
+            reason: "no_eligible_search".to_string(),
+        };
+    }
+
+    // The model bypassed every interception (repeated each substituted
+    // command), so any cost delta is its own strategy variance, not the
+    // proxy's doing. Refuse to attribute.
+    if treatment_record.search_proxy_escape_hatch_repeats >= subs {
+        return AgentEvalResult::Inconclusive {
+            reason: "model_strategy_variance".to_string(),
+        };
+    }
+
+    // Token efficiency, 5% materiality threshold. This is the primary
+    // outcome signal for discovery mediation.
+    if let (Some(v), Some(t)) = (vanilla.tokens_total, treatment.tokens_total)
+        && v > 0
+    {
+        let ratio = t as f64 / v as f64;
+        if ratio <= 0.95 {
+            return AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency,
+            };
+        }
+        if ratio >= 1.05 {
+            return AgentEvalResult::RiWorse {
+                reason: ResultReason::Overhead,
+            };
+        }
+    }
+
+    // Discovery-command win when tokens are within the dead band. Ignore a
+    // ±1 jitter; require at least 2 fewer discovery commands.
+    if let (Some(v), Some(t)) = (
+        vanilla.discover_command_count,
+        treatment.discover_command_count,
+    ) && v >= t + 2
+    {
+        return AgentEvalResult::RiBetter {
+            reason: ResultReason::FewerDiscoveryCommands,
+        };
+    }
+
+    AgentEvalResult::Tie
+}
+
 pub fn compare_task(
     task: &AgentEvalTask,
     vanilla: &AgentRunRecord,
@@ -723,12 +860,22 @@ pub fn compare_task(
     let valid_for_comparison = excluded_reason.is_none();
     let vanilla_score = score_run(vanilla, task);
     let treatment_score = score_run(treatment, task);
-    let result = classify_result(
-        &vanilla_score,
-        &treatment_score,
-        valid_for_comparison,
-        excluded_reason.as_deref(),
-    );
+    let result = if matches!(treatment.arm, AgentArm::SearchProxy) {
+        classify_search_proxy_result(
+            &vanilla_score,
+            &treatment_score,
+            treatment,
+            valid_for_comparison,
+            excluded_reason.as_deref(),
+        )
+    } else {
+        classify_result(
+            &vanilla_score,
+            &treatment_score,
+            valid_for_comparison,
+            excluded_reason.as_deref(),
+        )
+    };
     AgentEvalComparison {
         task_id: task.id.clone(),
         task: task.task.clone(),
@@ -1453,25 +1600,45 @@ fn render_grouped_table(
 /// Count `result` outcomes across a slice of comparisons and emit a one-line
 /// summary like `2 ri_better / 0 ri_worse / 1 tie / 0 excluded`.
 fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) -> String {
+    let rows: Vec<&AgentEvalComparison> = rows.into_iter().collect();
+    let prefix = rows
+        .first()
+        .map(|r| verdict_prefix(r.treatment_arm))
+        .unwrap_or("ri");
     let mut better = 0u32;
     let mut worse = 0u32;
     let mut tie = 0u32;
+    let mut inert = 0u32;
+    let mut inconclusive = 0u32;
     let mut excluded = 0u32;
-    for row in rows {
+    for row in &rows {
         match row.result {
             AgentEvalResult::RiBetter { .. } => better += 1,
             AgentEvalResult::RiWorse { .. } => worse += 1,
             AgentEvalResult::Tie => tie += 1,
+            AgentEvalResult::Inert { .. } => inert += 1,
+            AgentEvalResult::Inconclusive { .. } => inconclusive += 1,
             AgentEvalResult::Excluded { .. } => excluded += 1,
         }
     }
-    format!("{better} ri_better / {worse} ri_worse / {tie} tie / {excluded} excluded")
+    // Legacy format is preserved when there are no inert/inconclusive rows
+    // (the only states RI/harness arms can produce), so existing reports
+    // and tests are unchanged; search-proxy runs surface the extra buckets.
+    let mut summary = format!("{better} {prefix}_better / {worse} {prefix}_worse / {tie} tie");
+    if inert > 0 {
+        summary += &format!(" / {inert} inert");
+    }
+    if inconclusive > 0 {
+        summary += &format!(" / {inconclusive} inconclusive");
+    }
+    summary += &format!(" / {excluded} excluded");
+    summary
 }
 
 const DASH: &str = "—";
 
 fn format_main_row(row: &AgentEvalComparison) -> [String; 9] {
-    let result = row.result.slug();
+    let result = row.result.slug_for_arm(row.treatment_arm);
     if !row.valid_for_comparison {
         let valid_cell = format_invalid_cell(row);
         let ri_visible = if row.treatment.harness_context_visible {
@@ -2045,6 +2212,159 @@ mod tests {
             orientation_files_touched: 0,
             orientation_files_total: 0,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sp_classify(
+        v_tokens: Option<u64>,
+        t_tokens: Option<u64>,
+        v_hit: usize,
+        t_hit: usize,
+        v_discover: Option<u32>,
+        t_discover: Option<u32>,
+        subs: u32,
+        escape_hatch_repeats: u32,
+    ) -> AgentEvalResult {
+        let vanilla = AgentRunScore {
+            target_files_hit: v_hit,
+            tokens_total: v_tokens,
+            discover_command_count: v_discover,
+            ..zero_score()
+        };
+        let treatment = AgentRunScore {
+            target_files_hit: t_hit,
+            tokens_total: t_tokens,
+            discover_command_count: t_discover,
+            ..zero_score()
+        };
+        let rec = AgentRunRecord {
+            search_proxy_substitutions: subs,
+            search_proxy_escape_hatch_repeats: escape_hatch_repeats,
+            ..synthetic_record(AgentArm::SearchProxy, "t")
+        };
+        classify_search_proxy_result(&vanilla, &treatment, &rec, true, None)
+    }
+
+    #[test]
+    fn sp_token_win_below_threshold() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(800), 1, 1, None, None, 1, 0),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency
+            }
+        );
+    }
+
+    #[test]
+    fn sp_token_regression_is_overhead() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(1100), 1, 1, None, None, 1, 0),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::Overhead
+            }
+        );
+    }
+
+    #[test]
+    fn sp_small_token_delta_is_no_material_delta() {
+        // -2% tokens is within the 5% dead band; tiny jitter must not
+        // manufacture a verdict (the old classifier's failure mode).
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(3), Some(3), 1, 0),
+            AgentEvalResult::Tie
+        );
+    }
+
+    #[test]
+    fn sp_discovery_win_when_tokens_in_dead_band() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(5), Some(2), 1, 0),
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FewerDiscoveryCommands
+            }
+        );
+    }
+
+    #[test]
+    fn sp_one_fewer_discovery_is_jitter_not_a_win() {
+        assert_eq!(
+            sp_classify(Some(1000), Some(980), 1, 1, Some(3), Some(2), 1, 0),
+            AgentEvalResult::Tie
+        );
+    }
+
+    #[test]
+    fn sp_inert_when_no_substitutions() {
+        // No eligible search → inert even though tokens are far lower
+        // (that delta is baseline variance, not the proxy).
+        assert_eq!(
+            sp_classify(Some(1000), Some(500), 1, 1, None, None, 0, 0),
+            AgentEvalResult::Inert {
+                reason: "no_eligible_search".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sp_inconclusive_when_model_bypassed_every_interception() {
+        // subs=1, escape_hatch_repeats=1 → the model repeated the broad
+        // command, so a -20% token delta can't be credited to the proxy.
+        // This is the real cloud A/B shape.
+        assert_eq!(
+            sp_classify(Some(1000), Some(800), 1, 1, None, None, 1, 1),
+            AgentEvalResult::Inconclusive {
+                reason: "model_strategy_variance".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn sp_correctness_dominates_cost() {
+        // Far cheaper but missed the gold edit → worse, never a token win.
+        assert_eq!(
+            sp_classify(Some(1000), Some(100), 1, 0, None, None, 1, 0),
+            AgentEvalResult::RiWorse {
+                reason: ResultReason::FileTargeting
+            }
+        );
+    }
+
+    #[test]
+    fn sp_verdict_labels_are_treatment_aware() {
+        let sp = AgentArm::SearchProxy;
+        assert_eq!(
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::TokenEfficiency
+            }
+            .slug_for_arm(sp),
+            "search_proxy_better:token_efficiency"
+        );
+        assert_eq!(
+            AgentEvalResult::Inert {
+                reason: "no_eligible_search".to_string()
+            }
+            .slug_for_arm(sp),
+            "search_proxy_inert:no_eligible_search"
+        );
+        assert_eq!(
+            AgentEvalResult::Inconclusive {
+                reason: "model_strategy_variance".to_string()
+            }
+            .slug_for_arm(sp),
+            "search_proxy_inconclusive:model_strategy_variance"
+        );
+        assert_eq!(
+            AgentEvalResult::Tie.slug_for_arm(sp),
+            "search_proxy_tie:no_material_delta"
+        );
+        // Legacy RI label unchanged.
+        assert_eq!(
+            AgentEvalResult::RiBetter {
+                reason: ResultReason::FileTargeting
+            }
+            .slug_for_arm(AgentArm::RepoIntelligence),
+            "ri_better:file_targeting"
+        );
     }
 
     #[test]
