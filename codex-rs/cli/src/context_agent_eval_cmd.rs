@@ -13,10 +13,13 @@ use clap::Parser;
 use codex_context_harness::AgentArm;
 use codex_context_harness::AgentEvalReport;
 use codex_context_harness::AgentRunRecord;
+use codex_context_harness::SearchProxyReportRow;
 use codex_context_harness::build_report;
 use codex_context_harness::compare_task;
 use codex_context_harness::load_agent_eval_tasks;
 use codex_context_harness::render_agent_eval_human;
+use codex_context_harness::render_search_proxy_table;
+use codex_context_harness::search_proxy_report_row;
 
 #[derive(Debug, Parser)]
 pub struct ContextAgentEvalCli {
@@ -59,71 +62,26 @@ async fn run_agent_eval_score(cmd: ContextAgentEvalScoreCommand) -> Result<()> {
     let treatment_arm = resolve_treatment_arm(&cmd, &task_ids)?;
     validate_artifacts_layout(&cmd.artifacts_dir, &task_ids, treatment_arm)?;
     let mut comparisons = Vec::new();
-    let mut treatment_records = Vec::new();
+    let mut sp_rows: Vec<SearchProxyReportRow> = Vec::new();
     for task in &tasks {
         let vanilla = load_run_record(&cmd.artifacts_dir, &task.id, AgentArm::Vanilla)?;
         let treatment = load_run_record(&cmd.artifacts_dir, &task.id, treatment_arm)?;
-        comparisons.push(compare_task(task, &vanilla, &treatment));
-        treatment_records.push(treatment);
+        let comparison = compare_task(task, &vanilla, &treatment);
+        if treatment_arm == AgentArm::SearchProxy {
+            sp_rows.push(search_proxy_report_row(task, &vanilla, &treatment, &comparison));
+        }
+        comparisons.push(comparison);
     }
     let report = build_report(comparisons);
     emit_report(&cmd, &report)?;
 
-    // Search-proxy runs carry per-arm interception metrics that the
-    // generic Main/Cost tables don't surface. Print a focused addendum
-    // (human mode only) so reviewers don't have to dig through
-    // record.json by hand. No-op for other treatment arms.
-    if cmd.human
-        && treatment_arm == AgentArm::SearchProxy
-        && let Some(addendum) = render_search_proxy_addendum(&treatment_records)
-    {
-        println!("{addendum}");
+    // Search-proxy runs carry per-arm interception metrics that the generic
+    // Main/Cost tables don't surface. Print the focused table (human mode)
+    // so reviewers don't have to dig through record.json by hand.
+    if cmd.human && treatment_arm == AgentArm::SearchProxy && !sp_rows.is_empty() {
+        println!("{}", render_search_proxy_table(&sp_rows));
     }
     Ok(())
-}
-
-/// Format a compact Search Proxy metrics block from the treatment-arm
-/// records. Returns `None` if no record reported the proxy as enabled
-/// (e.g. the feature silently no-op'd), which is itself worth flagging.
-fn render_search_proxy_addendum(records: &[AgentRunRecord]) -> Option<String> {
-    if records.is_empty() {
-        return None;
-    }
-    let mut lines = vec![String::new(), "==== Search proxy ====".to_string()];
-    let any_enabled = records.iter().any(|r| r.search_proxy_enabled);
-    if !any_enabled {
-        lines.push(
-            "WARNING: search_proxy feature not enabled on any treatment record \
-             (did `-c features.search_proxy=true` reach codex?)"
-                .to_string(),
-        );
-    }
-    for record in records {
-        let raw = record.search_proxy_raw_bytes_estimated;
-        let compact = record.search_proxy_compact_bytes;
-        let saved_pct = if raw > 0 {
-            format!("{:.0}%", 100.0 * (1.0 - (compact as f64 / raw as f64)))
-        } else {
-            "n/a".to_string()
-        };
-        lines.push(format!(
-            "{task}: enabled={enabled} subs={subs} escape_hatch_repeats={repeats} \
-             build_pass_throughs={passthrough} compact_bytes={compact} \
-             raw_bytes_est={raw} (compact saves {saved_pct} vs raw)",
-            task = record.task_id,
-            enabled = record.search_proxy_enabled,
-            subs = record.search_proxy_substitutions,
-            repeats = record.search_proxy_escape_hatch_repeats,
-            passthrough = record.search_proxy_build_pass_throughs,
-        ));
-        if !record.search_proxy_top_files.is_empty() {
-            lines.push(format!(
-                "  top_files: {}",
-                record.search_proxy_top_files.join(", ")
-            ));
-        }
-    }
-    Some(lines.join("\n"))
 }
 
 fn resolve_treatment_arm(

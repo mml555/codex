@@ -1637,6 +1637,191 @@ fn group_summary<'a>(rows: impl IntoIterator<Item = &'a AgentEvalComparison>) ->
 
 const DASH: &str = "—";
 
+/// At-a-glance state of the search proxy on one task, derived from the
+/// treatment record's interception counters. Surfaced as its own report
+/// column so Run2 (`bypassed_all`), Run4 (`active`), and Run5 (`inert`) are
+/// distinguishable without reading logs.
+pub fn search_proxy_proxy_state(record: &AgentRunRecord) -> &'static str {
+    let subs = record.search_proxy_substitutions;
+    let repeats = record.search_proxy_escape_hatch_repeats;
+    let pass_throughs = record.search_proxy_build_pass_throughs;
+    if subs == 0 {
+        // No substitution happened. Either an eligible search ran but the
+        // builder declined (pass_through_only), or nothing eligible fired.
+        if pass_throughs > 0 {
+            "pass_through_only"
+        } else {
+            "inert"
+        }
+    } else if repeats >= subs {
+        "bypassed_all"
+    } else if repeats > 0 {
+        "partial_bypass"
+    } else {
+        "active"
+    }
+}
+
+/// One row of the Search Proxy report table. Built by
+/// [`search_proxy_report_row`] from a (task, vanilla, treatment) triple +
+/// its comparison verdict; rendered by [`render_search_proxy_table`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchProxyReportRow {
+    pub task_id: String,
+    pub proxy_state: &'static str,
+    /// `Some(true)` if any proxy top-file matched a gold relevant file,
+    /// `Some(false)` if not, `None` when the proxy never substituted.
+    pub top_file_correct: Option<bool>,
+    pub substitutions: u32,
+    pub escape_hatch_repeats: u32,
+    pub compact_bytes: u64,
+    pub raw_bytes_estimated: u64,
+    pub tokens_vanilla: Option<u64>,
+    pub tokens_treatment: Option<u64>,
+    pub discover_vanilla: Option<u32>,
+    pub discover_treatment: Option<u32>,
+    pub intent_files_vanilla: usize,
+    pub intent_files_treatment: usize,
+    /// Treatment-aware verdict slug, e.g. `search_proxy_better:token_efficiency`.
+    pub result: String,
+}
+
+pub fn search_proxy_report_row(
+    task: &AgentEvalTask,
+    vanilla: &AgentRunRecord,
+    treatment: &AgentRunRecord,
+    comparison: &AgentEvalComparison,
+) -> SearchProxyReportRow {
+    let top_file_correct = if treatment.search_proxy_substitutions == 0 {
+        None
+    } else {
+        let golds: Vec<String> = task
+            .relevant_files
+            .iter()
+            .map(|f| normalize_agent_eval_path(f))
+            .collect();
+        Some(treatment.search_proxy_top_files.iter().any(|f| {
+            let nf = normalize_agent_eval_path(f);
+            golds.iter().any(|g| *g == nf)
+        }))
+    };
+    SearchProxyReportRow {
+        task_id: task.id.clone(),
+        proxy_state: search_proxy_proxy_state(treatment),
+        top_file_correct,
+        substitutions: treatment.search_proxy_substitutions,
+        escape_hatch_repeats: treatment.search_proxy_escape_hatch_repeats,
+        compact_bytes: treatment.search_proxy_compact_bytes,
+        raw_bytes_estimated: treatment.search_proxy_raw_bytes_estimated,
+        tokens_vanilla: vanilla.tokens_total,
+        tokens_treatment: treatment.tokens_total,
+        discover_vanilla: vanilla.discover_command_count,
+        discover_treatment: treatment.discover_command_count,
+        intent_files_vanilla: vanilla.intent_changed_files.len(),
+        intent_files_treatment: treatment.intent_changed_files.len(),
+        result: comparison.result.slug_for_arm(comparison.treatment_arm),
+    }
+}
+
+/// Column-aligned flat table: header, separator, then one line per row.
+fn render_flat_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+    let n = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for cells in rows {
+        for (i, cell) in cells.iter().enumerate() {
+            if i < n {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+    }
+    let render = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pad = widths.get(i).copied().unwrap_or(0);
+                let extra = pad.saturating_sub(cell.chars().count());
+                format!("{cell}{}", " ".repeat(extra))
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
+    let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    let mut out = vec![render(&header_cells), render(&separator)];
+    for cells in rows {
+        out.push(render(cells));
+    }
+    out
+}
+
+/// Render the Search Proxy report table + per-task notes for confounded
+/// states. Reviewable without log archaeology.
+pub fn render_search_proxy_table(rows: &[SearchProxyReportRow]) -> String {
+    const HEADERS: [&str; 10] = [
+        "Task",
+        "Proxy state",
+        "Top file ok?",
+        "Subs",
+        "Repeats",
+        "Compact/raw B",
+        "Tokens V/P",
+        "Discover V/P",
+        "Intent V/P",
+        "Result",
+    ];
+    let opt_u64 = |x: Option<u64>| x.map_or_else(|| "?".to_string(), |v| v.to_string());
+    let opt_u32 = |x: Option<u32>| x.map_or_else(|| "?".to_string(), |v| v.to_string());
+    let cell_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let raw = if r.raw_bytes_estimated > 0 {
+                r.raw_bytes_estimated.to_string()
+            } else {
+                "n/a".to_string()
+            };
+            vec![
+                r.task_id.clone(),
+                r.proxy_state.to_string(),
+                match r.top_file_correct {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "n/a",
+                }
+                .to_string(),
+                r.substitutions.to_string(),
+                r.escape_hatch_repeats.to_string(),
+                format!("{}/{raw}", r.compact_bytes),
+                format!("{}/{}", opt_u64(r.tokens_vanilla), opt_u64(r.tokens_treatment)),
+                format!(
+                    "{}/{}",
+                    opt_u32(r.discover_vanilla),
+                    opt_u32(r.discover_treatment)
+                ),
+                format!("{}/{}", r.intent_files_vanilla, r.intent_files_treatment),
+                r.result.clone(),
+            ]
+        })
+        .collect();
+
+    let mut out = vec![String::new(), "==== Search proxy ====".to_string()];
+    out.extend(render_flat_table(&HEADERS, &cell_rows));
+    for r in rows {
+        match r.proxy_state {
+            "inert" | "pass_through_only" => out.push(format!(
+                "  note [{}]: proxy did not substitute (no eligible search); any cost delta is confounded by unrelated verification/model behavior.",
+                r.task_id
+            )),
+            "bypassed_all" => out.push(format!(
+                "  note [{}]: model bypassed every substitution — cost is not attributable to the proxy.",
+                r.task_id
+            )),
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
 fn format_main_row(row: &AgentEvalComparison) -> [String; 9] {
     let result = row.result.slug_for_arm(row.treatment_arm);
     if !row.valid_for_comparison {
@@ -2364,6 +2549,50 @@ mod tests {
             }
             .slug_for_arm(AgentArm::RepoIntelligence),
             "ri_better:file_targeting"
+        );
+    }
+
+    #[test]
+    fn proxy_state_derivation_covers_all_states() {
+        let with = |subs, repeats, pass| AgentRunRecord {
+            search_proxy_substitutions: subs,
+            search_proxy_escape_hatch_repeats: repeats,
+            search_proxy_build_pass_throughs: pass,
+            ..synthetic_record(AgentArm::SearchProxy, "t")
+        };
+        assert_eq!(search_proxy_proxy_state(&with(0, 0, 0)), "inert");
+        assert_eq!(search_proxy_proxy_state(&with(0, 0, 2)), "pass_through_only");
+        assert_eq!(search_proxy_proxy_state(&with(2, 0, 0)), "active");
+        assert_eq!(search_proxy_proxy_state(&with(3, 3, 0)), "bypassed_all");
+        assert_eq!(search_proxy_proxy_state(&with(3, 1, 0)), "partial_bypass");
+    }
+
+    #[test]
+    fn search_proxy_table_renders_header_states_and_confounded_note() {
+        let row = SearchProxyReportRow {
+            task_id: "noharm_named_file_doc_comment".to_string(),
+            proxy_state: "inert",
+            top_file_correct: None,
+            substitutions: 0,
+            escape_hatch_repeats: 0,
+            compact_bytes: 0,
+            raw_bytes_estimated: 0,
+            tokens_vanilla: Some(1000),
+            tokens_treatment: Some(2000),
+            discover_vanilla: Some(1),
+            discover_treatment: Some(1),
+            intent_files_vanilla: 1,
+            intent_files_treatment: 1,
+            result: "search_proxy_inert:no_eligible_search".to_string(),
+        };
+        let out = render_search_proxy_table(&[row]);
+        assert!(out.contains("==== Search proxy ===="), "{out}");
+        assert!(out.contains("Proxy state"), "{out}");
+        assert!(out.contains("inert"), "{out}");
+        assert!(out.contains("1000/2000"), "tokens V/P column missing:\n{out}");
+        assert!(
+            out.contains("confounded"),
+            "inert row must carry a confounded note:\n{out}"
         );
     }
 
