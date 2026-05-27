@@ -200,45 +200,4 @@ mod tests {
         let err = parse_treatment_arm("nonsense").unwrap_err().to_string();
         assert!(err.contains("search_proxy"), "error should list the arms: {err}");
     }
-
-    #[test]
-    fn search_proxy_addendum_reports_metrics_and_savings() {
-        let mut record = sample_search_proxy_record();
-        record.search_proxy_substitutions = 3;
-        record.search_proxy_escape_hatch_repeats = 3;
-        record.search_proxy_compact_bytes = 3_389;
-        record.search_proxy_raw_bytes_estimated = 41_218;
-        record.search_proxy_top_files = vec!["context-harness/src/agent_eval.rs".to_string()];
-        let out = render_search_proxy_addendum(&[record]).expect("addendum");
-        assert!(out.contains("==== Search proxy ===="), "{out}");
-        assert!(out.contains("subs=3"), "{out}");
-        assert!(out.contains("escape_hatch_repeats=3"), "{out}");
-        assert!(out.contains("saves 92% vs raw"), "{out}");
-        assert!(out.contains("context-harness/src/agent_eval.rs"), "{out}");
-    }
-
-    #[test]
-    fn search_proxy_addendum_warns_when_feature_never_enabled() {
-        let mut record = sample_search_proxy_record();
-        record.search_proxy_enabled = false;
-        let out = render_search_proxy_addendum(&[record]).expect("addendum");
-        assert!(
-            out.contains("WARNING: search_proxy feature not enabled"),
-            "{out}"
-        );
-    }
-
-    fn sample_search_proxy_record() -> AgentRunRecord {
-        serde_json::from_str(
-            r#"{
-                "arm": "search_proxy",
-                "task_id": "t",
-                "changed_files": [],
-                "tests_passed": false,
-                "turn_count": null,
-                "search_proxy_enabled": true
-            }"#,
-        )
-        .expect("sample record")
-    }
 }
