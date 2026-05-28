@@ -8,6 +8,8 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::large_read_proxy::intercept_large_read_proxy;
+use crate::tools::handlers::search_proxy::intercept_search_proxy;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
@@ -231,6 +233,50 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             "exec_command",
         )
         .await?
+        {
+            manager.release_process_id(process_id).await;
+            return Ok(boxed_tool_output(ExecCommandToolOutput {
+                event_call_id: String::new(),
+                chunk_id: String::new(),
+                wall_time: std::time::Duration::ZERO,
+                raw_output: output.into_text().into_bytes(),
+                truncation_policy: turn.truncation_policy,
+                max_output_tokens,
+                process_id: None,
+                exit_code: None,
+                original_token_count: None,
+                hook_command: None,
+            }));
+        }
+
+        // Intercept simple `rg` invocations via the search proxy. Same gate /
+        // no-op shape as the call site in shell.rs — when Feature::SearchProxy
+        // is off this returns Ok(None) before touching any state. The synthetic
+        // output is wrapped in ExecCommandToolOutput so the model sees it
+        // through the unified_exec tool surface it actually called.
+        if let Some(output) =
+            intercept_search_proxy(&hook_command, cwd.as_path(), context.session.as_ref()).await?
+        {
+            manager.release_process_id(process_id).await;
+            return Ok(boxed_tool_output(ExecCommandToolOutput {
+                event_call_id: String::new(),
+                chunk_id: String::new(),
+                wall_time: std::time::Duration::ZERO,
+                raw_output: output.into_text().into_bytes(),
+                truncation_policy: turn.truncation_policy,
+                max_output_tokens,
+                process_id: None,
+                exit_code: None,
+                original_token_count: None,
+                hook_command: None,
+            }));
+        }
+
+        // Intercept large file reads via the large-read proxy. Same gate /
+        // no-op shape as the search proxy above.
+        if let Some(output) =
+            intercept_large_read_proxy(&hook_command, cwd.as_path(), context.session.as_ref())
+                .await?
         {
             manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {

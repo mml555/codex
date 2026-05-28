@@ -3,6 +3,8 @@ pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
 mod dynamic;
+pub(crate) mod large_read_proxy;
+pub(crate) mod search_proxy;
 pub(crate) mod extension_tools;
 mod goal;
 pub(crate) mod goal_spec;

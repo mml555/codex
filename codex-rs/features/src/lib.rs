@@ -202,6 +202,14 @@ pub enum Feature {
     RemoteCompactionV2,
     /// Enable workspace dependency support.
     WorkspaceDependencies,
+    /// Intercept simple model-initiated `rg` invocations and return
+    /// compact evidence instead of raw `rg` output. Experimental,
+    /// default-off; see `docs/reactive-mediation.md`.
+    SearchProxy,
+    /// Intercept large model-initiated file reads (`cat <file>`,
+    /// `sed -n '1,Np' <file>`) and return compact slices instead of the raw
+    /// dump. Sibling of [`Feature::SearchProxy`]; experimental, default-off.
+    LargeReadProxy,
 
     // Removed
     /// Removed compatibility flag retained as a no-op so old configs can
@@ -1212,6 +1220,18 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "workspace_dependencies",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::SearchProxy,
+        key: "search_proxy",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::LargeReadProxy,
+        key: "large_read_proxy",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
 ];
 

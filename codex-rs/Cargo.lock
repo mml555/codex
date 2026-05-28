@@ -2545,6 +2545,7 @@ dependencies = [
  "codex-git-utils",
  "codex-hooks",
  "codex-install-context",
+ "codex-large-read-proxy",
  "codex-login",
  "codex-mcp",
  "codex-memories-read",
@@ -2560,6 +2561,7 @@ dependencies = [
  "codex-rollout",
  "codex-rollout-trace",
  "codex-sandboxing",
+ "codex-search-proxy",
  "codex-shell-command",
  "codex-shell-escalation",
  "codex-state",
@@ -3058,6 +3060,14 @@ version = "0.0.0"
 dependencies = [
  "keyring",
  "tracing",
+]
+
+[[package]]
+name = "codex-large-read-proxy"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "shlex",
 ]
 
 [[package]]
@@ -3622,6 +3632,16 @@ dependencies = [
  "tracing",
  "url",
  "which 8.0.0",
+]
+
+[[package]]
+name = "codex-search-proxy"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "shlex",
 ]
 
 [[package]]
