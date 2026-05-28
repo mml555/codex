@@ -93,7 +93,15 @@ pub fn build_slices(content: &str, hints: &[String], opts: &SliceOptions) -> Vec
         }
         let start = anchor.saturating_sub(CTX_BEFORE).max(1);
         let end = (start + opts.max_lines_per_slice - 1).min(total);
-        try_push(&mut slices, &mut used_bytes, &lines, start, end, reason, opts);
+        try_push(
+            &mut slices,
+            &mut used_bytes,
+            &lines,
+            start,
+            end,
+            reason,
+            opts,
+        );
     }
 
     slices.sort_by_key(|s| s.start);

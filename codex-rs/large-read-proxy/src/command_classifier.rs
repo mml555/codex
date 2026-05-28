@@ -132,11 +132,7 @@ fn parse_sed_range(tok: &str) -> Option<(u32, u32)> {
     let body = tok.strip_suffix('p')?;
     let (a, b) = body.split_once(',')?;
     let start: u32 = a.parse().ok()?;
-    let end: u32 = if b == "$" {
-        u32::MAX
-    } else {
-        b.parse().ok()?
-    };
+    let end: u32 = if b == "$" { u32::MAX } else { b.parse().ok()? };
     if end < start {
         return None;
     }

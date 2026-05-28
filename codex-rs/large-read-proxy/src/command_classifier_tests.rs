@@ -52,7 +52,10 @@ fn sed_small_range_passes_through() {
 
 #[test]
 fn cat_with_flag_or_multiple_files_passes_through() {
-    assert_eq!(passthrough("cat -n f.rs"), PassThroughReason::UnsupportedArgs);
+    assert_eq!(
+        passthrough("cat -n f.rs"),
+        PassThroughReason::UnsupportedArgs
+    );
     assert_eq!(
         passthrough("cat a.rs b.rs"),
         PassThroughReason::UnsupportedArgs

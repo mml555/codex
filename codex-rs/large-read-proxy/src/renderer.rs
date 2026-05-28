@@ -43,9 +43,7 @@ pub fn render_large_read_response(
             "# {omitted} lines not shown (gaps between the slices above).\n"
         ));
     }
-    out.push_str(
-        "# Re-run the identical command only if you need a region not shown above.\n",
-    );
+    out.push_str("# Re-run the identical command only if you need a region not shown above.\n");
 
     out
 }

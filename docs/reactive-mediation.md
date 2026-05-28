@@ -17,7 +17,9 @@ tool-output cost** without harming task outcomes.
   query), and returns up to a few sample match lines in `rg`-native
   `path:line:col:text` form. Raw output is not sent. Repeating the exact
   same command bypasses the proxy and returns raw output (escape hatch).
-  Requires the system `rg` binary on PATH.
+  Requires the system `rg` binary on PATH. The internal `rg` runs under a
+  wall-clock timeout (default 5s); if it expires the proxy passes through —
+  the model's own command runs normally, so the turn is never blocked.
 
 - **Large Read Proxy** (`features.large_read_proxy`) — when the model
   issues `cat <large file>` or `sed -n '1,Np'` with a wide span on a file

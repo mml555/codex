@@ -5,9 +5,7 @@ use super::rg_json::parse_rg_json;
 
 /// Build an `rg --json` line for a `begin` event.
 fn begin(path: &str) -> String {
-    format!(
-        r#"{{"type":"begin","data":{{"path":{{"text":{path:?}}}}}}}"#
-    )
+    format!(r#"{{"type":"begin","data":{{"path":{{"text":{path:?}}}}}}}"#)
 }
 
 /// Build an `rg --json` line for a `match` event.

@@ -52,7 +52,9 @@ fn build_slices_uses_hints_when_provided() {
         &SliceOptions::default(),
     );
     assert!(
-        slices.iter().any(|s| s.reason.contains("match: struct Beta")),
+        slices
+            .iter()
+            .any(|s| s.reason.contains("match: struct Beta")),
         "expected a hint-match slice: {slices:?}"
     );
 }

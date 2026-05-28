@@ -58,9 +58,7 @@ pub fn render_compact_evidence(_classified: &ClassifiedRg, evidence: &CompactEvi
             "# {omitted_files} more file(s) and {omitted_hits} more match(es) not shown.\n"
         ));
     }
-    out.push_str(
-        "# Re-run the identical command only if you need the matches not shown above.\n",
-    );
+    out.push_str("# Re-run the identical command only if you need the matches not shown above.\n");
 
     out
 }

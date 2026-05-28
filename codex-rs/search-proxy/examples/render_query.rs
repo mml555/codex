@@ -27,11 +27,7 @@ fn main() {
         eprintln!("usage: render_query -- '<rg pattern>' [search_root]");
         std::process::exit(2);
     }
-    let raw = format!(
-        r#"rg -n "{}" -S {}"#,
-        query.replace('"', r#"\""#),
-        root
-    );
+    let raw = format!(r#"rg -n "{}" -S {}"#, query.replace('"', r#"\""#), root);
     println!("raw: {raw}");
     let classified = match classify_command(&raw) {
         ClassifyOutcome::Eligible(c) => c,
