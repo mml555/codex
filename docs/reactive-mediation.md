@@ -6,8 +6,11 @@ output (`rg`, `cat`/`sed` on large files) with compact, ranked evidence the
 model can use directly. The goal is to reduce **fresh, model-visible
 tool-output cost** without harming task outcomes.
 
-> **Status:** v1 validated for search/read workflows. Default-off, opt-in.
-> Detailed engineering history: `codex-rs/REACTIVE_MEDIATION_FINDINGS.md`.
+> **Status:** default-off, opt-in. Validated on a small internal suite of
+> search/read coding tasks (reduced delivered tool-output bytes and
+> cost-weighted token cost with no edit regressions); kept default-off
+> pending broader validation. See `docs/reactive-mediation-review.md` for
+> the reviewer's map.
 
 ## What it does
 
@@ -56,10 +59,8 @@ codex exec -c features.search_proxy=true -c features.large_read_proxy=true ...
 Enabling only one is supported but partial — the model's search→read
 workflow is mediated only on the enabled phase. `codex doctor`
 explicitly flags one-enabled configs as "composed mode not enabled" so
-this is visible. (A single-flag `features.reactive_mediation = true`
-umbrella is **not** offered yet; the existing feature-alias mechanism is
-1:1 and adding a fan-out would be a larger change than the
-internal-opt-in target justifies.)
+this is visible. There is intentionally no single umbrella flag; the two
+proxies are independent and gated separately.
 
 ## What you'll see when it's working
 
@@ -102,23 +103,23 @@ availability is actually verified — Search Proxy depends on it).
   internal search; if `codex doctor`'s `runtime.search` row is failing,
   disable Search Proxy until it's fixed.
 
-## What's NOT proven yet
+## Known limitations
 
-- Large Read Proxy as a standalone general feature — frontier models
+- **Large Read Proxy is most useful in composition.** Frontier models
   often self-target reads on well-specified tasks, so LRP standalone is
-  frequently inert. Its biggest value is currently in composition with
-  Search Proxy.
-- Verification Policy (broad-test interception) — mechanism is in tree
-  but not enabled in this configuration.
-- Quality improvement — only cost has been measured; correctness has
-  been preserved across the validation suite but not improved.
-- Broader task coverage — validated on a small fixed suite. Expand
-  deliberately.
+  frequently inert; its value shows when Search Proxy localizes a file the
+  model then over-reads.
+- **Cost, not quality.** Validation measured tool-output cost; edits were
+  preserved, not improved. No quality claim is made.
+- **Narrow validation surface.** Validated on a small fixed suite of
+  search/read tasks — hence default-off. Broaden deliberately before
+  considering default-on.
+- **Ranking is best-effort.** Search Proxy's owner ranking is heuristic;
+  low-confidence results are rendered non-directively ("do NOT trust this
+  path") and the model is steered to the match lines, never forced onto a
+  single guessed file.
 
 ## See also
 
-- `codex-rs/REACTIVE_MEDIATION_FINDINGS.md` — full validation history.
-- `codex-rs/REACTIVE_MEDIATION_EVAL_SUITE.md` — fixed eval suite v1.
-- `codex-rs/search-proxy/SEARCH_PROXY_FINDINGS.md` — per-primitive detail.
-- `codex-rs/search-proxy/BYPASS_ANALYSIS.md` — the bypass-trust analysis
-  that motivated the v2 compact format.
+- `docs/reactive-mediation-review.md` — reviewer's map (diff surface, hot
+  paths, safety model, test matrix).
