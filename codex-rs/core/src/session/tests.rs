@@ -4685,6 +4685,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         ),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        search_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+        large_read_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+        proxy_telemetry: Mutex::new(Default::default()),
     };
 
     let plugin_outcome = services
@@ -6528,6 +6531,9 @@ where
         ),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(),
         environment_manager: Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        search_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+        large_read_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+        proxy_telemetry: Mutex::new(Default::default()),
     };
 
     let plugin_outcome = services
@@ -10555,4 +10561,161 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Reactive-mediation proxy safety tests (Phase E — upstream hardening).
+//
+// Upstream invariant: "conservative by default — when the feature is OFF, or
+// when the input is uncertain, pass through and run the model's command
+// verbatim." The classifier/builder pass-through shapes (pipes, redirects,
+// chaining, unknown flags, small/binary files, rg errors/timeouts) are unit-
+// tested inside the `codex-search-proxy` / `codex-large-read-proxy` crates.
+// These tests cover the CORE HANDLER call sites that those crate tests
+// cannot reach: the feature gate, the per-session escape-hatch registry, and
+// the file-read pass-through branches.
+// ===========================================================================
+
+#[tokio::test]
+async fn search_proxy_is_inert_when_feature_disabled() {
+    // Default test session has BOTH proxies off (default_enabled = false).
+    let (session, _ctx) = make_session_and_context().await;
+    let cwd = std::env::current_dir().expect("cwd");
+    // A command that WOULD be eligible if the feature were enabled.
+    let out = crate::tools::handlers::search_proxy::intercept_search_proxy(
+        "rg AgentEvalResult",
+        cwd.as_path(),
+        &session,
+    )
+    .await
+    .expect("handler must not error");
+    assert!(
+        out.is_none(),
+        "disabled search proxy must pass through (Ok(None))"
+    );
+    let tel = session.services.proxy_telemetry.lock().await;
+    // The handler marks itself enabled only AFTER the gate; staying false
+    // proves no classification / no internal rg ran.
+    assert!(
+        !tel.search_proxy_enabled,
+        "disabled proxy must not run any work past the feature gate"
+    );
+    assert_eq!(tel.search_proxy_substitutions, 0);
+    assert!(
+        session
+            .services
+            .search_proxy_intercepts
+            .lock()
+            .await
+            .is_empty(),
+        "disabled proxy must not mutate the intercept registry"
+    );
+}
+
+#[tokio::test]
+async fn large_read_proxy_is_inert_when_feature_disabled() {
+    let (session, _ctx) = make_session_and_context().await;
+    let cwd = std::env::current_dir().expect("cwd");
+    let out = crate::tools::handlers::large_read_proxy::intercept_large_read_proxy(
+        "cat src/lib.rs",
+        cwd.as_path(),
+        &session,
+    )
+    .await
+    .expect("handler must not error");
+    assert!(out.is_none(), "disabled large-read proxy must pass through");
+    let tel = session.services.proxy_telemetry.lock().await;
+    assert!(
+        !tel.large_read_proxy_enabled,
+        "disabled proxy must not run any work past the feature gate"
+    );
+}
+
+#[tokio::test]
+async fn search_proxy_repeat_command_bypasses_to_raw() {
+    // Escape hatch: a command already substituted this session must pass
+    // through on the exact repeat so the model can retrieve raw rg output.
+    // Pre-seed the registry with the normalized form (deterministic; no
+    // dependency on real rg producing a substitutable first result).
+    let session = make_session_with_config(|config| {
+        let _ = config.features.enable(Feature::SearchProxy);
+    })
+    .await
+    .expect("session");
+    let normalized = match codex_search_proxy::classify_command("rg foo") {
+        codex_search_proxy::ClassifyOutcome::Eligible(c) => c.normalized,
+        other => panic!("`rg foo` should classify Eligible, got {other:?}"),
+    };
+    session
+        .services
+        .search_proxy_intercepts
+        .lock()
+        .await
+        .insert(normalized);
+    let cwd = std::env::current_dir().expect("cwd");
+    let out = crate::tools::handlers::search_proxy::intercept_search_proxy(
+        "rg foo",
+        cwd.as_path(),
+        session.as_ref(),
+    )
+    .await
+    .expect("handler must not error");
+    assert!(
+        out.is_none(),
+        "repeat of an already-substituted command must bypass to raw output"
+    );
+    assert_eq!(
+        session
+            .services
+            .proxy_telemetry
+            .lock()
+            .await
+            .search_proxy_escape_hatch_repeats,
+        1,
+        "the bypass must be counted as an escape-hatch repeat"
+    );
+}
+
+#[tokio::test]
+async fn large_read_proxy_passes_through_missing_file() {
+    let session = make_session_with_config(|config| {
+        let _ = config.features.enable(Feature::LargeReadProxy);
+    })
+    .await
+    .expect("session");
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Classifies as an eligible `cat <file>`, but the file does not exist →
+    // the handler's read-error branch must pass through, not error.
+    let out = crate::tools::handlers::large_read_proxy::intercept_large_read_proxy(
+        "cat does_not_exist_42.rs",
+        dir.path(),
+        session.as_ref(),
+    )
+    .await
+    .expect("handler must not error");
+    assert!(out.is_none(), "missing target file must pass through");
+}
+
+#[tokio::test]
+async fn large_read_proxy_passes_through_binary_file() {
+    let session = make_session_with_config(|config| {
+        let _ = config.features.enable(Feature::LargeReadProxy);
+    })
+    .await
+    .expect("session");
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Non-UTF-8 bytes → the handler's binary branch must pass through.
+    std::fs::write(
+        dir.path().join("blob.bin"),
+        [0xFFu8, 0xFE, 0x00, 0x01, 0xFF],
+    )
+    .expect("write binary fixture");
+    let out = crate::tools::handlers::large_read_proxy::intercept_large_read_proxy(
+        "cat blob.bin",
+        dir.path(),
+        session.as_ref(),
+    )
+    .await
+    .expect("handler must not error");
+    assert!(out.is_none(), "binary (non-UTF-8) file must pass through");
 }

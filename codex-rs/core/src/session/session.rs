@@ -1045,6 +1045,9 @@ impl Session {
                 ),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(),
                 environment_manager,
+                search_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+                large_read_proxy_intercepts: Mutex::new(std::collections::HashSet::new()),
+                proxy_telemetry: Mutex::new(Default::default()),
             };
             services
                 .model_client

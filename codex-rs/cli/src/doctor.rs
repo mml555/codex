@@ -39,6 +39,7 @@ use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
+use codex_features::Feature;
 use codex_install_context::CodexPackageLayout;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
@@ -427,6 +428,12 @@ async fn build_report(
                 background_server_check,
                 reachability_check,
             ]);
+            // Reactive-mediation proxy status (search_proxy / large_read_proxy).
+            // Cheap (reads feature flags only); run sequentially to avoid the
+            // parallel join! tuple above.
+            checks.push(run_sync_check("reactive-mediation", progress.clone(), || {
+                reactive_mediation_check(config)
+            }));
         }
         Err(err) => {
             let reachability_plan = default_reachability_plan();
@@ -1053,6 +1060,77 @@ where
         return Err(stderr);
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn reactive_mediation_check(config: &Config) -> DoctorCheck {
+    let features = config.features.get();
+    let sp = features.enabled(Feature::SearchProxy);
+    let lrp = features.enabled(Feature::LargeReadProxy);
+    let mut details = vec![
+        format!("features.search_proxy: {sp}"),
+        format!("features.large_read_proxy: {lrp}"),
+        format!("composed mode (both enabled): {}", sp && lrp),
+    ];
+    if !sp && !lrp {
+        details.push(
+            "reactive mediation: disabled (both proxies default off — opt in via \
+             features.search_proxy and/or features.large_read_proxy)"
+                .to_string(),
+        );
+        return DoctorCheck::new(
+            "reactive-mediation",
+            "reactive-mediation",
+            CheckStatus::Ok,
+            "reactive mediation disabled (default)",
+        )
+        .details(details);
+    }
+    if sp {
+        details.push(
+            "search proxy depends on the `rg` binary — inspect the `runtime.search` \
+             check above to confirm it is available"
+                .to_string(),
+        );
+    }
+    if lrp {
+        details
+            .push("large-read proxy reads target files directly; no external dependency".to_string());
+    }
+    // The composed (both-on) path is the only configuration that mediates
+    // the full search→read workflow; running only one proxy still mediates
+    // its own phase but leaves the other untouched. Surface that asymmetry
+    // so an opted-in operator knows whether they're on the validated path.
+    if sp != lrp {
+        details.push(
+            "note: only one proxy is enabled. The validated composed-mode path \
+             enables BOTH features.search_proxy AND features.large_read_proxy \
+             so the model's search→read workflow is mediated end-to-end."
+                .to_string(),
+        );
+    }
+    let summary = match (sp, lrp) {
+        (true, true) => "reactive mediation: composed mode (SP + LRP)",
+        (true, false) => "reactive mediation: search proxy only (composed mode not enabled)",
+        (false, true) => "reactive mediation: large read proxy only (composed mode not enabled)",
+        (false, false) => unreachable!(),
+    };
+    // Warning if SP enabled (reminds operator to check the search row) OR
+    // if only one of the two is enabled (composed mode not active).
+    let status = if sp || (sp != lrp) {
+        CheckStatus::Warning
+    } else {
+        CheckStatus::Ok
+    };
+    let mut check = DoctorCheck::new("reactive-mediation", "reactive-mediation", status, summary)
+        .details(details);
+    if sp {
+        check = check.remediation("Verify `runtime.search` reports OK; SP needs ripgrep to fire.");
+    } else if lrp {
+        check = check.remediation(
+            "Consider enabling features.search_proxy for the validated composed mode.",
+        );
+    }
+    check
 }
 
 fn config_check(config: &Config) -> DoctorCheck {

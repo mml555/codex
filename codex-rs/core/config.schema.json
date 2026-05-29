@@ -485,6 +485,9 @@
             "js_repl_tools_only": {
               "type": "boolean"
             },
+            "large_read_proxy": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -555,6 +558,9 @@
               "type": "boolean"
             },
             "runtime_metrics": {
+              "type": "boolean"
+            },
+            "search_proxy": {
               "type": "boolean"
             },
             "search_tool": {
@@ -4579,6 +4585,9 @@
         "js_repl_tools_only": {
           "type": "boolean"
         },
+        "large_read_proxy": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -4649,6 +4658,9 @@
           "type": "boolean"
         },
         "runtime_metrics": {
+          "type": "boolean"
+        },
+        "search_proxy": {
           "type": "boolean"
         },
         "search_tool": {

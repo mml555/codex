@@ -48,6 +48,7 @@ codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
 codex-install-context = { workspace = true }
+codex-large-read-proxy = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-plugin = { workspace = true }
@@ -58,6 +59,7 @@ codex-rollout = { workspace = true }
 codex-rollout-trace = { workspace = true }
 codex-rmcp-client = { workspace = true }
 codex-sandboxing = { workspace = true }
+codex-search-proxy = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-thread-store = { workspace = true }
