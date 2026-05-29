@@ -1064,6 +1064,42 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Status for the reactive-mediation doctor row given the two flag states.
+/// Composed mode (both on) is the validated/recommended path → Ok; fully off
+/// → Ok (the caller handles that with its own summary); exactly one proxy on
+/// → Warning ("composed mode not enabled"). Pure so it can be unit-tested
+/// without constructing a `Config`.
+fn reactive_mediation_status(search_proxy: bool, large_read_proxy: bool) -> CheckStatus {
+    if search_proxy != large_read_proxy {
+        CheckStatus::Warning
+    } else {
+        CheckStatus::Ok
+    }
+}
+
+#[cfg(test)]
+mod reactive_mediation_status_tests {
+    use super::CheckStatus;
+    use super::reactive_mediation_status;
+
+    #[test]
+    fn composed_mode_is_ok_not_warning() {
+        // The recommended, validated configuration must not warn.
+        assert_eq!(reactive_mediation_status(true, true), CheckStatus::Ok);
+    }
+
+    #[test]
+    fn single_proxy_warns_composed_not_enabled() {
+        assert_eq!(reactive_mediation_status(true, false), CheckStatus::Warning);
+        assert_eq!(reactive_mediation_status(false, true), CheckStatus::Warning);
+    }
+
+    #[test]
+    fn both_off_is_ok() {
+        assert_eq!(reactive_mediation_status(false, false), CheckStatus::Ok);
+    }
+}
+
 fn reactive_mediation_check(config: &Config) -> DoctorCheck {
     let features = config.features.get();
     let sp = features.enabled(Feature::SearchProxy);
@@ -1117,13 +1153,7 @@ fn reactive_mediation_check(config: &Config) -> DoctorCheck {
         (false, true) => "reactive mediation: large read proxy only (composed mode not enabled)",
         (false, false) => unreachable!(),
     };
-    // Warning if SP enabled (reminds operator to check the search row) OR
-    // if only one of the two is enabled (composed mode not active).
-    let status = if sp || (sp != lrp) {
-        CheckStatus::Warning
-    } else {
-        CheckStatus::Ok
-    };
+    let status = reactive_mediation_status(sp, lrp);
     let mut check = DoctorCheck::new("reactive-mediation", "reactive-mediation", status, summary)
         .details(details);
     if sp {

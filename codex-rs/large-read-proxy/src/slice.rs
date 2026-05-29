@@ -110,7 +110,7 @@ pub fn build_slices(
             break;
         }
         let start = anchor.saturating_sub(CTX_BEFORE).max(1);
-        let end = (start + opts.max_lines_per_slice - 1).min(total);
+        let end = (start + opts.max_lines_per_slice.saturating_sub(1)).min(total);
         try_push(
             &mut slices,
             &mut used_bytes,
@@ -152,7 +152,7 @@ fn ranged_slices(
     let mut used_bytes = 0usize;
     let mut cursor = start;
     while slices.len() < opts.max_slices && cursor <= end {
-        let slice_end = (cursor + opts.max_lines_per_slice - 1).min(end);
+        let slice_end = (cursor + opts.max_lines_per_slice.saturating_sub(1)).min(end);
         let before = slices.len();
         try_push(
             &mut slices,

@@ -79,6 +79,13 @@ pub(crate) async fn intercept_search_proxy(
     // the model can retrieve raw rg output by repeating the call.
     // We only need a quick presence check — the registry is per-Session
     // and the value is the normalized command string.
+    //
+    // The check and the later insert are not atomic, so two *concurrent*
+    // identical intercepts can both substitute (and both insert). That is
+    // benign — both arms return compact evidence, and a model that wants raw
+    // output simply repeats on a later turn, by which point the entry exists.
+    // We deliberately don't hold the lock across the rg run to avoid
+    // serializing unrelated searches.
     {
         let registry = session.services.search_proxy_intercepts.lock().await;
         if registry.contains(&classified.normalized) {

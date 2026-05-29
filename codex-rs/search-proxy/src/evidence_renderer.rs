@@ -1,7 +1,7 @@
 //! Render a [`CompactEvidence`] as a compacted, **rg-native** result —
 //! the payload the proxy returns in place of `rg`'s raw output.
 //!
-//! Format v2 (see `BYPASS_ANALYSIS.md`). The v1 prose format
+//! Format v2. The v1 prose format
 //! ("Search proxy intercepted: … Reason: likely owner … Repeat the
 //! exact same rg command to bypass") read like a provisional *hint*,
 //! and in two cloud A/Bs the model re-ran (`escape_hatch_repeat`)

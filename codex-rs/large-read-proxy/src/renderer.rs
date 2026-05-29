@@ -19,11 +19,27 @@ pub fn render_large_read_response(
     total_lines: u32,
 ) -> String {
     let shown_lines: u32 = slices.iter().map(Slice::line_count).sum();
-    let omitted = total_lines.saturating_sub(shown_lines);
+    // For a `sed` range read, "shown of total" should be measured against the
+    // requested window, not the whole file — and the omitted lines are the
+    // rest of that window, not "gaps between slices" (the slices are
+    // contiguous from the range start). For `cat`, it's the whole file.
+    let (denominator, omission_note) = match classified.requested_range {
+        Some((start, end)) => {
+            let span_start = start.max(1);
+            let span_end = end.min(total_lines);
+            let span = span_end.saturating_sub(span_start).saturating_add(1);
+            (span, "more lines in the requested range not shown")
+        }
+        None => (
+            total_lines,
+            "lines not shown (gaps between the slices above)",
+        ),
+    };
+    let omitted = denominator.saturating_sub(shown_lines);
 
     let mut out = String::new();
     out.push_str(&format!(
-        "[large-read proxy] compact view of {} ({shown_lines} of {total_lines} lines shown)\n",
+        "[large-read proxy] compact view of {} ({shown_lines} of {denominator} lines shown)\n",
         classified.path
     ));
 
@@ -36,9 +52,7 @@ pub fn render_large_read_response(
     }
 
     if omitted > 0 {
-        out.push_str(&format!(
-            "# {omitted} lines not shown (gaps between the slices above).\n"
-        ));
+        out.push_str(&format!("# {omitted} {omission_note}.\n"));
     }
     out.push_str("# Re-run the identical command only if you need a region not shown above.\n");
 
