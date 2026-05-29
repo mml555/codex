@@ -106,7 +106,7 @@ pub fn build_large_read_response(
             lines: total_lines,
         });
     }
-    let slices = build_slices(content, hints, opts);
+    let slices = build_slices(content, hints, classified.requested_range, opts);
     if slices.is_empty() {
         return LargeReadOutcome::PassThrough(BuildPassThroughReason::NoSlices);
     }

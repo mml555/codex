@@ -374,15 +374,30 @@ fn glob_filter_short() {
 }
 
 #[test]
-fn files_only_flag() {
-    let r = expect_eligible("rg -l query");
-    assert!(r.flags.files_only);
+fn files_only_flag_passes_through() {
+    // `-l` / `--files-with-matches` emits filenames, not match lines — the
+    // proxy can't compact that without changing semantics, so pass through.
+    assert_eq!(
+        expect_pass_through("rg -l query"),
+        PassThroughReason::OutputModeUnsupported
+    );
+    assert_eq!(
+        expect_pass_through("rg --files-with-matches query"),
+        PassThroughReason::OutputModeUnsupported
+    );
 }
 
 #[test]
-fn count_only_flag() {
-    let r = expect_eligible("rg -c query");
-    assert!(r.flags.count_only);
+fn count_only_flag_passes_through() {
+    // `-c` / `--count` emits per-file counts, not match lines — pass through.
+    assert_eq!(
+        expect_pass_through("rg -c query"),
+        PassThroughReason::OutputModeUnsupported
+    );
+    assert_eq!(
+        expect_pass_through("rg --count query"),
+        PassThroughReason::OutputModeUnsupported
+    );
 }
 
 #[test]

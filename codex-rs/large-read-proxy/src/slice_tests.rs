@@ -29,7 +29,7 @@ fn classified(cmd: &str) -> crate::ClassifiedRead {
 #[test]
 fn build_slices_includes_header_and_public_defs() {
     let content = big_rust_file();
-    let slices = build_slices(&content, &[], &SliceOptions::default());
+    let slices = build_slices(&content, &[], None, &SliceOptions::default());
     assert!(!slices.is_empty());
     assert!(slices.len() <= 3, "capped at max_slices: {slices:?}");
     assert_eq!(slices[0].start, 1, "first slice is the header");
@@ -49,6 +49,7 @@ fn build_slices_uses_hints_when_provided() {
     let slices = build_slices(
         &content,
         &["struct Beta".to_string()],
+        None,
         &SliceOptions::default(),
     );
     assert!(
@@ -101,6 +102,45 @@ fn rendered_slices_contain_actual_line_numbered_content() {
         );
     } else {
         panic!("expected Substitute");
+    }
+}
+
+#[test]
+fn sed_range_slices_come_from_requested_range_not_header() {
+    // Regression: a `sed -n '<start>,<end>p'` read explicitly asks for a
+    // window; the compact must come FROM that window, never the file header
+    // / unrelated defs (which would be misleading output for the command).
+    let content = big_rust_file(); // ~259 lines
+    let c = classified("sed -n '50,260p' foo.rs"); // span 211 >= MIN_SED_RANGE_LINES
+    match build_large_read_response(&c, &content, &[], &SliceOptions::default()) {
+        LargeReadOutcome::Substitute { slices, .. } => {
+            assert!(!slices.is_empty());
+            assert_eq!(
+                slices[0].start, 50,
+                "ranged read must start at the requested line, not the header: {slices:?}"
+            );
+            assert!(
+                slices.iter().all(|s| s.start >= 50),
+                "no slice may precede the requested range: {slices:?}"
+            );
+            assert!(
+                slices.iter().all(|s| s.reason.contains("requested lines")),
+                "ranged slices must be labelled as the requested range: {slices:?}"
+            );
+        }
+        other => panic!("expected Substitute, got {other:?}"),
+    }
+}
+
+#[test]
+fn sed_range_past_eof_passes_through() {
+    // A range that begins past EOF would make `sed` print nothing; don't
+    // substitute — let the raw command run.
+    let content = big_rust_file();
+    let c = classified("sed -n '9000,9300p' foo.rs");
+    match build_large_read_response(&c, &content, &[], &SliceOptions::default()) {
+        LargeReadOutcome::PassThrough(BuildPassThroughReason::NoSlices) => {}
+        other => panic!("expected PassThrough(NoSlices) for past-EOF range, got {other:?}"),
     }
 }
 

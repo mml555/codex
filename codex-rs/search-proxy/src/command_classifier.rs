@@ -36,6 +36,10 @@ pub enum PassThroughReason {
     /// `rg` invocation with no positional query (e.g. `rg --files`).
     /// The MVP only handles content searches.
     NoQuery,
+    /// `rg` invoked in an output mode the proxy can't faithfully compact
+    /// (`-l`/`--files-with-matches`, `-c`/`--count`) — these change the
+    /// output shape (filenames / counts), not just its volume.
+    OutputModeUnsupported,
     /// Outer wrapper was not parseable, command failed shlex, or
     /// other structural problems.
     UnsupportedShape,
@@ -48,6 +52,7 @@ impl fmt::Display for PassThroughReason {
             PassThroughReason::ShellMetacharacter => "shell_metacharacter",
             PassThroughReason::UnknownFlag => "unknown_flag",
             PassThroughReason::NoQuery => "no_query",
+            PassThroughReason::OutputModeUnsupported => "output_mode_unsupported",
             PassThroughReason::UnsupportedShape => "unsupported_shape",
         };
         f.write_str(s)
@@ -337,6 +342,16 @@ fn classify_rg_tokens(args: &[String]) -> ClassifyOutcome {
 
     if positional.is_empty() {
         return ClassifyOutcome::PassThrough(PassThroughReason::NoQuery);
+    }
+
+    // `-l`/`--files-with-matches` and `-c`/`--count` change rg's OUTPUT SHAPE
+    // (filenames-only / per-file counts) rather than emitting match lines.
+    // The proxy only compacts match-line output — it runs its own rg without
+    // forwarding these flags and the renderer always emits match lines, so
+    // substituting here would change the command's semantics, not just
+    // compact it. Pass through and let the model's own command run.
+    if flags.files_only || flags.count_only {
+        return ClassifyOutcome::PassThrough(PassThroughReason::OutputModeUnsupported);
     }
 
     let query = positional.remove(0);

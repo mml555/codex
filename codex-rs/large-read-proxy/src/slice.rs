@@ -41,11 +41,29 @@ impl Default for SliceOptions {
     }
 }
 
-pub fn build_slices(content: &str, hints: &[String], opts: &SliceOptions) -> Vec<Slice> {
+/// Build compact slices.
+///
+/// `requested_range` is `Some((start, end))` for a `sed -n '<start>,<end>p'`
+/// read (1-based inclusive; `end == u32::MAX` means `$`/EOF) and `None` for a
+/// whole-file `cat`. A `sed` range is an EXPLICIT request for a specific
+/// window, so it is honored directly: slices come FROM that range (capped by
+/// the slice budget), never the file header / unrelated definitions — which
+/// would be misleading output for a command that asked for lines 1000–1300.
+/// `cat` (no range) gets the header + public-definition / hint anchors.
+pub fn build_slices(
+    content: &str,
+    hints: &[String],
+    requested_range: Option<(u32, u32)>,
+    opts: &SliceOptions,
+) -> Vec<Slice> {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
     if total == 0 {
         return Vec::new();
+    }
+
+    if let Some((req_start, req_end)) = requested_range {
+        return ranged_slices(&lines, total, req_start, req_end, opts);
     }
 
     let mut slices: Vec<Slice> = Vec::new();
@@ -105,6 +123,53 @@ pub fn build_slices(content: &str, hints: &[String], opts: &SliceOptions) -> Vec
     }
 
     slices.sort_by_key(|s| s.start);
+    slices
+}
+
+/// Slices covering the head of an explicitly-requested `sed` range. Returns
+/// consecutive windows starting at `req_start`, capped by the slice/byte
+/// budget, so the model gets line-numbered content from exactly the region it
+/// asked for (it can repeat the command to bypass for the full span). Returns
+/// empty (→ pass through to the raw read) when the range starts past EOF.
+fn ranged_slices(
+    lines: &[&str],
+    total: u32,
+    req_start: u32,
+    req_end: u32,
+    opts: &SliceOptions,
+) -> Vec<Slice> {
+    let start = req_start.max(1);
+    if start > total {
+        // The requested range begins past end-of-file; `sed` would print
+        // little/nothing. Don't substitute — let the raw command run.
+        return Vec::new();
+    }
+    let end = req_end.min(total);
+    if start > end {
+        return Vec::new();
+    }
+    let mut slices: Vec<Slice> = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut cursor = start;
+    while slices.len() < opts.max_slices && cursor <= end {
+        let slice_end = (cursor + opts.max_lines_per_slice - 1).min(end);
+        let before = slices.len();
+        try_push(
+            &mut slices,
+            &mut used_bytes,
+            lines,
+            cursor,
+            slice_end,
+            format!("requested lines {cursor}-{slice_end}"),
+            opts,
+        );
+        // Stop if the byte budget rejected this window — further windows
+        // would only be larger offsets of the same over-budget content.
+        if slices.len() == before {
+            break;
+        }
+        cursor = slice_end + 1;
+    }
     slices
 }
 
