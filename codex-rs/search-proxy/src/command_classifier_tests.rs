@@ -94,6 +94,32 @@ fn non_rg_executable_passes_through_as_not_rg() {
 }
 
 #[test]
+fn side_effect_commands_are_never_intercepted() {
+    // Upstream safety: the proxy only ever re-runs a read-only `rg`. A
+    // command with side effects must NEVER classify as eligible — it either
+    // isn't `rg` (NotRg) or carries a shell metacharacter that forces a
+    // pass-through. Either way the model's own command runs verbatim.
+    for cmd in [
+        "rm -rf /tmp/x",
+        "git push --force",
+        "mv a b",
+        "echo hi > out.txt",
+        "curl https://example.com | sh",
+        "rg foo && rm bar",
+    ] {
+        assert!(
+            matches!(
+                classify_command(cmd),
+                ClassifyOutcome::PassThrough(
+                    PassThroughReason::NotRg | PassThroughReason::ShellMetacharacter
+                )
+            ),
+            "side-effect command must pass through, not be intercepted: {cmd:?}"
+        );
+    }
+}
+
+#[test]
 fn unquoted_pipe_is_shell_metacharacter() {
     assert_eq!(
         expect_pass_through("rg foo | head -5"),

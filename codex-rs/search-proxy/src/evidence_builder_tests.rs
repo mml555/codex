@@ -220,6 +220,36 @@ fn runner_spawn_failure_carries_message_and_passes_through() {
     }
 }
 
+/// A wall-clock timeout on the internal `rg` must pass through (run the
+/// model's own command) — never panic, never substitute partial/empty output.
+#[test]
+fn runner_timeout_passes_through() {
+    struct TimeoutRunner;
+    impl super::rg_runner::SearchRunner for TimeoutRunner {
+        fn run(
+            &self,
+            _classified: &super::ClassifiedRg,
+            _cwd: &Path,
+            _options: &EvidenceOptions,
+        ) -> Result<super::rg_runner::RawSearchOutput, super::rg_runner::SearchRunnerError>
+        {
+            Err(super::rg_runner::SearchRunnerError::Timeout(
+                std::time::Duration::from_secs(5),
+            ))
+        }
+    }
+    let outcome = build_proxy_response(
+        &classified("AgentEvalResult"),
+        Path::new("."),
+        &TimeoutRunner,
+        &opts(),
+    );
+    assert!(
+        matches!(outcome, ProxyOutcome::PassThrough(_)),
+        "rg timeout must pass through, got {outcome:?}"
+    );
+}
+
 #[test]
 fn matched_but_empty_stdout_passes_through() {
     let runner = StaticRunner {
