@@ -473,7 +473,6 @@ fn normalized_distinguishes_different_max_counts() {
     assert_ne!(a.normalized, b.normalized);
 }
 
-#[test]
 /// C4 stress: classifying the same simple `rg` shape 10k times must not
 /// drift in semantics and must not allocate unboundedly. The point isn't
 /// throughput — it's that the classifier is a pure, stateless function
@@ -522,6 +521,7 @@ fn regex_with_escaped_backslashes_is_eligible() {
     assert_eq!(r.target_paths, vec!["core/src".to_string()]);
 }
 
+#[test]
 fn run8_actual_command_is_eligible_and_normalizes_stably() {
     // Verbatim form of the first rg command Run 8's vanilla arm fired,
     // after wrapping. Verifies the wrapper strip + quote-aware

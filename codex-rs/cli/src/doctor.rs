@@ -431,9 +431,11 @@ async fn build_report(
             // Reactive-mediation proxy status (search_proxy / large_read_proxy).
             // Cheap (reads feature flags only); run sequentially to avoid the
             // parallel join! tuple above.
-            checks.push(run_sync_check("reactive-mediation", progress.clone(), || {
-                reactive_mediation_check(config)
-            }));
+            checks.push(run_sync_check(
+                "reactive-mediation",
+                progress.clone(),
+                || reactive_mediation_check(config),
+            ));
         }
         Err(err) => {
             let reachability_plan = default_reachability_plan();
@@ -1093,8 +1095,9 @@ fn reactive_mediation_check(config: &Config) -> DoctorCheck {
         );
     }
     if lrp {
-        details
-            .push("large-read proxy reads target files directly; no external dependency".to_string());
+        details.push(
+            "large-read proxy reads target files directly; no external dependency".to_string(),
+        );
     }
     // The composed (both-on) path is the only configuration that mediates
     // the full search→read workflow; running only one proxy still mediates

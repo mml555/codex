@@ -1,8 +1,7 @@
 //! Render the compact-slice payload the proxy returns in place of a large
 //! raw file dump.
 //!
-//! Format v2 (ported from the search-proxy v2 lessons, see
-//! `search-proxy/BYPASS_ANALYSIS.md`). v1 emitted only line RANGES + reasons
+//! Format v2: v1 emitted only line RANGES + reasons
 //! ("lines 60-89 — definition: ...") — a pointer, not content — wrapped in
 //! "No raw file output was returned. Repeat the exact same command to
 //! bypass". That reads as a provisional hint with the rerun handed to the
@@ -31,10 +30,8 @@ pub fn render_large_read_response(
     for s in slices {
         out.push_str(&format!("# lines {}-{} — {}\n", s.start, s.end, s.reason));
         // Emit the real content, line-numbered so positions are unambiguous.
-        let mut lineno = s.start;
-        for line in s.text.split('\n') {
+        for (lineno, line) in (s.start..).zip(s.text.split('\n')) {
             out.push_str(&format!("{lineno}: {line}\n"));
-            lineno += 1;
         }
     }
 

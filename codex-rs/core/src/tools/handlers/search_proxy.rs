@@ -99,9 +99,30 @@ pub(crate) async fn intercept_search_proxy(
         }
     }
 
-    let runner = RipgrepRunner::default();
-    let options = EvidenceOptions::default();
-    let outcome = build_proxy_response(&classified, cwd, &runner, &options);
+    // `build_proxy_response` shells out to `rg` (a synchronous subprocess with
+    // a wall-clock timeout, up to a few seconds). Run it on the blocking pool
+    // so it never stalls a tokio worker thread. If the blocking task panics,
+    // fail safe and pass through.
+    let cwd_owned = cwd.to_path_buf();
+    let classified_for_run = classified.clone();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        let runner = RipgrepRunner::default();
+        let options = EvidenceOptions::default();
+        build_proxy_response(&classified_for_run, &cwd_owned, &runner, &options)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(join_err) => {
+            tracing::warn!(
+                target: "search_proxy",
+                event = "runner_join_error",
+                error = %join_err,
+                "search proxy rg task failed to join; passing through"
+            );
+            return Ok(None);
+        }
+    };
 
     match outcome {
         ProxyOutcome::Substitute {

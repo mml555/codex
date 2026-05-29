@@ -174,7 +174,7 @@ fn build_response_passes_through_empty_content() {
 fn build_response_passes_through_no_slices_when_options_yield_none() {
     let c = classified("cat foo.rs");
     // 200 blank lines past MIN_FILE_LINES; no public defs, no test module.
-    let content: String = std::iter::repeat("\n").take(200).collect();
+    let content: String = "\n".repeat(200);
     let opts = SliceOptions {
         // Cap at 0 slices so try_push always rejects; exercises the
         // NoSlices branch without depending on content quirks.

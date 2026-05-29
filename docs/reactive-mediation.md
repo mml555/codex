@@ -75,6 +75,7 @@ stderr describing what the proxies did:
 ```
 
 The line distinguishes three states:
+
 - **inert** — feature enabled but no eligible search/read occurred.
 - **N substituted / N bypassed / N pass-through** — the proxy fired.
   `bypassed` means the model re-ran the exact same command; `pass-through`
