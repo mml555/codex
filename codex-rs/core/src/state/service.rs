@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::SkillsManager;
@@ -81,4 +82,178 @@ pub(crate) struct SessionServices {
     /// Shared process-level environment registry. Sessions carry an `Arc` handle so they can pass
     /// the same manager through child-thread spawn paths without reconstructing it.
     pub(crate) environment_manager: Arc<EnvironmentManager>,
+
+    /// Set of `ClassifiedRg::normalized` strings the search-proxy
+    /// hook has already substituted in this session. Used as the
+    /// repeat-command escape hatch: if the model re-sends the same
+    /// rg invocation, the second call is passed through to raw rg.
+    /// Only populated when `Feature::SearchProxy` is enabled.
+    pub(crate) search_proxy_intercepts: Mutex<HashSet<String>>,
+
+    /// Set of `ClassifiedRead::normalized` strings the large-read-proxy
+    /// hook has already substituted in this session. Repeat-command escape
+    /// hatch: a re-sent `cat`/`sed` read is passed through to raw output.
+    /// Only populated when `Feature::LargeReadProxy` is enabled.
+    pub(crate) large_read_proxy_intercepts: Mutex<HashSet<String>>,
+
+    /// Per-session running counters for the reactive-mediation proxies.
+    /// Updated by [`crate::tools::handlers::search_proxy::intercept_search_proxy`]
+    /// and [`crate::tools::handlers::large_read_proxy::intercept_large_read_proxy`]
+    /// each time they fire; consumed at session end to emit a human-readable
+    /// telemetry summary ("did proxy fire? what did it save?" — Track C1).
+    pub(crate) proxy_telemetry: Mutex<ProxyTelemetry>,
+}
+
+/// Telemetry accumulator for the search-proxy and large-read-proxy.
+/// Mirrors the tracing event fields (`event = "substitute" | ...`) so the
+/// session-end summary can describe what the operator saw without a
+/// separate event-stream consumer. Counters are u32 (commands per session
+/// fits) and byte sums are u64. All fields default to 0.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyTelemetry {
+    pub(crate) search_proxy_enabled: bool,
+    pub(crate) search_proxy_substitutions: u32,
+    pub(crate) search_proxy_escape_hatch_repeats: u32,
+    pub(crate) search_proxy_build_pass_throughs: u32,
+    pub(crate) search_proxy_compact_bytes: u64,
+    pub(crate) search_proxy_raw_bytes: u64,
+    pub(crate) large_read_proxy_enabled: bool,
+    pub(crate) large_read_proxy_substitutions: u32,
+    pub(crate) large_read_proxy_escape_hatch_repeats: u32,
+    pub(crate) large_read_proxy_build_pass_throughs: u32,
+    pub(crate) large_read_proxy_compact_bytes: u64,
+    pub(crate) large_read_proxy_raw_bytes: u64,
+}
+
+impl ProxyTelemetry {
+    /// True if either proxy fired (substituted, pass-through, or bypassed)
+    /// in this session.
+    pub(crate) fn any_event(&self) -> bool {
+        self.search_proxy_substitutions
+            + self.search_proxy_escape_hatch_repeats
+            + self.search_proxy_build_pass_throughs
+            + self.large_read_proxy_substitutions
+            + self.large_read_proxy_escape_hatch_repeats
+            + self.large_read_proxy_build_pass_throughs
+            > 0
+    }
+
+    /// Human-readable end-of-session summary. Returns `None` when no proxy
+    /// was enabled — opting out should mean zero noise. When a proxy was
+    /// enabled but no event fired, returns a brief "inert" line so the
+    /// opted-in operator gets confirmation the feature was wired correctly.
+    pub(crate) fn summary(&self) -> Option<String> {
+        if !self.search_proxy_enabled && !self.large_read_proxy_enabled {
+            return None;
+        }
+        let mut lines = Vec::new();
+        lines.push("[reactive mediation] session summary:".to_string());
+        if self.search_proxy_enabled {
+            let saved = self
+                .search_proxy_raw_bytes
+                .saturating_sub(self.search_proxy_compact_bytes);
+            if self.search_proxy_substitutions
+                + self.search_proxy_escape_hatch_repeats
+                + self.search_proxy_build_pass_throughs
+                == 0
+            {
+                lines.push("  search-proxy: inert (no eligible rg occurred)".to_string());
+            } else {
+                lines.push(format!(
+                    "  search-proxy: {} substituted, {} bypassed (model re-ran), {} pass-through; saved ~{} (compact {} vs raw {})",
+                    self.search_proxy_substitutions,
+                    self.search_proxy_escape_hatch_repeats,
+                    self.search_proxy_build_pass_throughs,
+                    format_bytes(saved),
+                    format_bytes(self.search_proxy_compact_bytes),
+                    format_bytes(self.search_proxy_raw_bytes),
+                ));
+            }
+        }
+        if self.large_read_proxy_enabled {
+            let saved = self
+                .large_read_proxy_raw_bytes
+                .saturating_sub(self.large_read_proxy_compact_bytes);
+            if self.large_read_proxy_substitutions
+                + self.large_read_proxy_escape_hatch_repeats
+                + self.large_read_proxy_build_pass_throughs
+                == 0
+            {
+                lines.push("  large-read-proxy: inert (no eligible cat/sed occurred)".to_string());
+            } else {
+                lines.push(format!(
+                    "  large-read-proxy: {} substituted, {} bypassed (model re-ran), {} pass-through; saved ~{} (compact {} vs raw {})",
+                    self.large_read_proxy_substitutions,
+                    self.large_read_proxy_escape_hatch_repeats,
+                    self.large_read_proxy_build_pass_throughs,
+                    format_bytes(saved),
+                    format_bytes(self.large_read_proxy_compact_bytes),
+                    format_bytes(self.large_read_proxy_raw_bytes),
+                ));
+            }
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+/// Format a byte count as a short human-readable string.
+fn format_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
+#[cfg(test)]
+mod proxy_telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn summary_none_when_no_proxy_enabled() {
+        let t = ProxyTelemetry::default();
+        assert!(t.summary().is_none());
+    }
+
+    #[test]
+    fn summary_inert_when_enabled_but_no_events() {
+        let t = ProxyTelemetry {
+            search_proxy_enabled: true,
+            large_read_proxy_enabled: true,
+            ..Default::default()
+        };
+        let s = t.summary().unwrap();
+        assert!(s.contains("[reactive mediation] session summary:"));
+        assert!(s.contains("search-proxy: inert"));
+        assert!(s.contains("large-read-proxy: inert"));
+    }
+
+    #[test]
+    fn summary_reports_substitutions_and_savings_in_human_units() {
+        let t = ProxyTelemetry {
+            search_proxy_enabled: true,
+            search_proxy_substitutions: 3,
+            search_proxy_escape_hatch_repeats: 1,
+            search_proxy_compact_bytes: 2_048,
+            search_proxy_raw_bytes: 200_000,
+            large_read_proxy_enabled: false,
+            ..Default::default()
+        };
+        let s = t.summary().unwrap();
+        assert!(s.contains("search-proxy: 3 substituted, 1 bypassed"));
+        // raw 200kB → compact 2kB ≈ 193 KB saved
+        assert!(s.contains("KB"));
+        // LRP not enabled → not mentioned.
+        assert!(!s.contains("large-read-proxy"));
+    }
+
+    #[test]
+    fn any_event_detects_partial_activity() {
+        let mut t = ProxyTelemetry::default();
+        assert!(!t.any_event());
+        t.search_proxy_build_pass_throughs = 1;
+        assert!(t.any_event());
+    }
 }

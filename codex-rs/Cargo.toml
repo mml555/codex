@@ -72,9 +72,11 @@ members = [
     "rollout",
     "rollout-trace",
     "rmcp-client",
+    "large-read-proxy",
     "responses-api-proxy",
     "response-debug-context",
     "sandboxing",
+    "search-proxy",
     "stdio-to-uds",
     "otel",
     "tui",
@@ -177,6 +179,8 @@ codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
+codex-large-read-proxy = { path = "large-read-proxy" }
+codex-search-proxy = { path = "search-proxy" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }

@@ -758,6 +758,19 @@ impl Session {
         {
             warn!("failed to apply goal runtime turn-finished event: {err}");
         }
+        // Emit the reactive-mediation telemetry summary BEFORE TurnComplete
+        // so the line lands in the operator's stderr right at the turn
+        // boundary. `summary()` returns None when no proxy was enabled (zero
+        // noise for non-opted-in operators). Held briefly under the
+        // proxy_telemetry mutex; no I/O.
+        if let Some(summary) = self.services.proxy_telemetry.lock().await.summary() {
+            tracing::info!(
+                target: "reactive_mediation",
+                event = "session_summary",
+                turn_id = %turn_context.sub_id,
+                "{summary}"
+            );
+        }
         let event = EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: turn_context.sub_id.clone(),
             last_agent_message,
