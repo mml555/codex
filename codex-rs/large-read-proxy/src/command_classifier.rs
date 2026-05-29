@@ -30,7 +30,7 @@ pub enum PassThroughReason {
     SmallRange,
     /// `cat`/`sed` with flags or multiple files we don't reason about.
     UnsupportedArgs,
-    /// Empty / unparseable.
+    /// Empty / unparsable.
     UnsupportedShape,
 }
 

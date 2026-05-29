@@ -221,7 +221,7 @@ fn run_with_timeout(
     let stdout_bytes = match rx.recv() {
         Ok(Ok(buf)) => buf,
         // Read error, panicked reader, or dropped sender: treat as no
-        // output. The builder passes through on empty/unparseable output,
+        // output. The builder passes through on empty/unparsable output,
         // which is the correct fail-safe.
         _ => Vec::new(),
     };
